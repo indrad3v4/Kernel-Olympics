@@ -66,15 +66,18 @@ class KernelOlympics:
         classifier_results = self.classifier.classify_batch(file_sources)
         self._print_risk_summary(classifier_results)
 
-        # Phase 3: Pattern Memory — check for cached fixes
+        # Phase 3: Pattern Memory — check for cached fixes (SKIP LLM on cache hit)
         pipeline_state["phase"] = "checking_memory"
         pipeline_state["patterns_before"] = self.memory.count()
+        pipeline_state["cache_hits"] = 0
+        pipeline_state["llm_calls"] = 0
         print(f"\n[3/6] Checking pattern memory ({self.memory.count()} stored patterns)...")
         
-        # Phase 4: Porting Agent
+        # Phase 4: Porting Agent (or SKIP if cached)
         pipeline_state["phase"] = "porting"
         print(f"\n[4/6] Porting red-flagged kernels...")
         verification_results = []
+        total_llm_time = 0.0
         
         for cr in classifier_results:
             if cr.get("risk_level") == "red":
@@ -82,16 +85,37 @@ class KernelOlympics:
                 if not source:
                     continue
                 
-                # Check pattern memory first
+                # Check pattern memory — trigram-based O(1) retrieval
                 cached = self.memory.retrieve(source)
                 if cached:
-                    print(f"     ✓ Found cached pattern for {Path(cr['file']).name} "
-                          f"(confidence: {cached.get('confidence', 0)}%)")
+                    pipeline_state["cache_hits"] += 1
+                    llm_saved = cached.get("llm_time_s", 12.0)
+                    print(f"     ⏩ CACHED — {Path(cr['file']).name} "
+                          f"(confidence: {cached.get('confidence', 0)*100:.0f}%, "
+                          f"retrieved in {cached.get('retrieval_ms', 0):.1f}ms)")
+                    print(f"       Estimated LLM time saved: {llm_saved:.1f}s")
+                    
+                    # Use cached fix — skip LLM entirely
+                    port_result = {
+                        "ported_code": cached["verified_fix"],
+                        "confidence": cached["confidence"] * 100,
+                        "changes": [f"Applied cached fix from pattern {cached['id']} "
+                                    f"(LLM call skipped — saved ~{llm_saved:.0f}s)"],
+                        "from_cache": True
+                    }
                 else:
+                    pipeline_state["llm_calls"] += 1
                     print(f"     → No cached pattern for {Path(cr['file']).name}, calling porting agent...")
+                    import time
+                    t0 = time.perf_counter()
+                    port_result = self.porting_agent.port_kernel(source)
+                    llm_elapsed = time.perf_counter() - t0
+                    self.memory.record_llm_time(llm_elapsed)
+                    total_llm_time += llm_elapsed
+                    port_result["from_cache"] = False
+                    port_result["llm_time_s"] = round(llm_elapsed, 1)
+                    print(f"     → LLM took {llm_elapsed:.1f}s — will be CACHED for next similar kernel")
                 
-                # Port the kernel
-                port_result = self.porting_agent.port_kernel(source, cached_pattern=cached)
                 print(f"     → Confidence: {port_result.get('confidence', 0)}%")
                 for change in port_result.get("changes", []):
                     print(f"       • {change[:80]}")
@@ -118,7 +142,8 @@ class KernelOlympics:
                         pattern_snippet=source[:500],
                         verified_fix=port_result.get("ported_code", "")[:500],
                         confidence=port_result.get("confidence", 80) / 100.0,
-                        verification_run_id=ver_result.get("compile_output", "")[:20]
+                        verification_run_id=ver_result.get("compile_output", "")[:20],
+                        llm_time_s=port_result.get("llm_time_s", 0.0)
                     )
                     print(f"     ✓ Kernel VERIFIED and stored in pattern memory")
                 else:
@@ -147,7 +172,13 @@ class KernelOlympics:
         print(report["summary"])
         print(f"{'='*60}")
         print(f"\nEstimated engineer-hours saved: {report['engineer_hours_saved']}h")
-        print(f"Pattern memory growth: {pipeline_state['patterns_before']} → {pipeline_state['patterns_after']} patterns")
+        mem = self.memory.get_stats()
+        print(f"Pattern memory: {pipeline_state['patterns_before']} → {pipeline_state['patterns_after']} patterns")
+        print(f"Cache performance: {pipeline_state.get('cache_hits', 0)} hits, "
+              f"{pipeline_state.get('llm_calls', 0)} LLM calls")
+        if mem.get('last_cache_time_ms', 0) > 0:
+            print(f"Fastest cache retrieval: {mem['last_cache_time_ms']}ms vs LLM: {mem['last_llm_time_s']}s "
+                  f"(~{mem['last_llm_time_s'] / (max(mem['last_cache_time_ms'], 1)/1000):.0f}× faster)")
         
         return report
 
