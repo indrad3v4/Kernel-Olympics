@@ -1,0 +1,47 @@
+name: Deploy to AMD Cloud
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AMD_CLOUD_SSH_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.AMD_CLOUD_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Copy code to AMD Cloud
+        run: |
+          rsync -avz --delete --exclude='.git' \
+            ./ ${{ secrets.AMD_CLOUD_USER }}@${{ secrets.AMD_CLOUD_HOST }}:${{ secrets.AMD_CLOUD_WORK_DIR }}/
+
+      - name: Install dependencies on AMD Cloud
+        run: |
+          ssh ${{ secrets.AMD_CLOUD_USER }}@${{ secrets.AMD_CLOUD_HOST }} \
+            "cd ${{ secrets.AMD_CLOUD_WORK_DIR }} && \
+             pip install -r requirements.txt 2>&1 | tail -3"
+
+      - name: Run full pipeline on AMD GPU
+        run: |
+          ssh ${{ secrets.AMD_CLOUD_USER }}@${{ secrets.AMD_CLOUD_HOST }} \
+            "cd ${{ secrets.AMD_CLOUD_WORK_DIR }} && \
+             python3 -m src.main \
+               --input sample_kernels/cuda/warp_reduce.cu \
+               --output portability_report.json 2>&1"
+
+      - name: Fetch report
+        run: |
+          scp ${{ secrets.AMD_CLOUD_USER }}@${{ secrets.AMD_CLOUD_HOST }}:${{ secrets.AMD_CLOUD_WORK_DIR }}/portability_report.json ./latest_report.json
+
+      - name: Upload report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: portability-report
+          path: latest_report.json
