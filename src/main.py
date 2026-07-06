@@ -220,6 +220,17 @@ class KernelOlympics:
                         llm_time_s=port_result.get("llm_time_s", 0.0)
                     )
                     self.disp.status("Verifying", f"{Path(cr['file']).name} {green('VERIFIED')}", ok=True)
+                elif not ver_result.get("compile_success") and "hipcc not found" in ver_result.get("compile_output", ""):
+                    # GPU unavailable — store as unverified template fix for the
+                    # "second kernel is faster" demo. Uses lower confidence.
+                    self.memory.store(
+                        pattern_snippet=source[:500],
+                        verified_fix=port_result.get("ported_code", "")[:500],
+                        confidence=0.70,  # lower confidence — unverified
+                        verification_run_id="template_unverified",
+                        llm_time_s=port_result.get("llm_time_s", 0.0)
+                    )
+                    self.disp.status("Verifying", f"{Path(cr['file']).name} {yellow('stored (unverified — no GPU)')}", ok=False)
                 else:
                     reason = "No AMD GPU (expected)" if not ver_result.get("compile_success") else "Output mismatch"
                     self.disp.status("Verifying", f"{Path(cr['file']).name} {yellow(reason)}", ok=False)

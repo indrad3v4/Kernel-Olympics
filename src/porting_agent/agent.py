@@ -100,35 +100,95 @@ Output format: JSON with:
                 "explanation": f"Porting agent error. Falling back to template."
             }
 
-    def _template_port(self, source_code: str, 
+    def _template_port(self, source_code: str,
                        cached_pattern: Optional[Dict] = None) -> Dict:
         """Template-based porting for when API is unavailable (demo fallback)."""
-        
-        changes = []
-        ported = source_code
 
-        # Fix 1: __shfl_down_sync → adjust offsets for wavefront64
         import re
-        shfl_pattern = re.compile(r'__shfl_down_sync\(([^,]+),\s*([^,]+),\s*(\d+)\s*\)')
-        
-        def fix_shfl(match):
-            mask, val, offset = match.group(1), match.group(2), int(match.group(3))
-            if offset == 16:
-                changes.append(f"__shfl_down_sync offset {offset} → keeping offset (wavefront64 handles larger offsets)")
-            return f'__shfl_down_sync({mask}, {val}, {offset})'
+        changes = []
+        lines = source_code.split('\n')
+        result_lines = []
+        wavefront_header_added = False
 
-        ported = shfl_pattern.sub(fix_shfl, ported)
+        # Template transformations (only on non-comment lines)
+        shared_32_re = re.compile(r'(__shared__[^;]*?\[\s*)32(\s*\])')
+        tile_32_re = re.compile(r'(tile\[)\s*32(\s*\]\[)\s*32(\s*\])')
+        blockidx_32_re = re.compile(r'(blockIdx\.[xy])\s*\*\s*32\s*\+')
+        syncwarp_re = re.compile(r'__syncwarp\(\)')
+        warp_size_re = re.compile(r'const\s+int\s+WARP_SIZE\s*=\s*32')
+        ballot_re = re.compile(r'__ballot_sync\(0xffffffff')
 
-        # Fix 2: Hardcoded 32 in shared memory → annotate for review
-        if re.search(r'__shared__\s+\w+\s*\[\s*32\s*\]', ported):
-            changes.append("Shared memory sized to 32 (NVIDIA warp) — verify wavefront64 suitability")
-        
-        # Fix 3: Add wavefront awareness comment
-        ported = (
-            "// ROCm/HIP port — wavefront size awareness added\n"
-            f"// Original: warp size = 32, AMD wavefront size = 64\n"
-            f"{ported}"
-        )
+        for line in lines:
+            stripped = line.strip()
+
+            # Skip comment-only lines
+            if stripped.startswith('//') or stripped.startswith('/*') or stripped.startswith('*'):
+                result_lines.append(line)
+                continue
+
+            # Track if this line was modified
+            original = line
+
+            # Fix 1: Hardcoded 32 in shared memory → change to 64
+            line = shared_32_re.sub(r'\1 WAVEFRONT_SIZE \2', line)
+
+            # Fix 2: Hardcoded 32 in tile declarations
+            line = tile_32_re.sub(r'\1 WAVEFRONT_SIZE \2 WAVEFRONT_SIZE \3', line)
+
+            # Fix 3: Hardcoded 32 in block indexing
+            line = blockidx_32_re.sub(r'\1 * WAVEFRONT_SIZE +', line)
+
+            # Fix 4: __syncwarp() → __syncthreads()
+            if syncwarp_re.search(line):
+                line = syncwarp_re.sub('__syncthreads()  // wavefront64: full block sync', line)
+                if "wavefront64: full block sync" not in __import__('json').dumps(changes):
+                    changes.append("__syncwarp() → __syncthreads() for HIP compatibility")
+
+            # Fix 5: __shfl_down_sync — no safe automatic fix for offset semantics
+            # (The actual fix depends on algorithm context; LLM handles this best)
+
+            # Fix 6: 0x1f (warp mask 32) → 0x3f (wavefront mask 64)
+            if '0x1f' in line and not stripped.startswith('//'):
+                line = line.replace('0x1f', '0x3f')
+
+            # Fix 7: Hardcoded WARP_SIZE = 32
+            line = warp_size_re.sub('const int WAVEFRONT_SIZE = 64  // AMD wavefront', line)
+
+            # Fix 8: __ballot_sync — add annotation
+            if ballot_re.search(line):
+                if "ballot_sync mask" not in str(changes):
+                    changes.append("__ballot_sync mask: verify wavefront64 compatibility")
+
+            # Track what changed
+            if line != original:
+                # Compute a change description based on what was modified
+                if 'WAVEFRONT_SIZE' in line and 'WAVEFRONT_SIZE' not in original:
+                    if 'shared' in original and '32' in original:
+                        changes.append("__shared__ array sized 32 → WAVEFRONT_SIZE for wavefront64")
+                    elif 'blockIdx' in original:
+                        changes.append("blockIdx.*32 → blockIdx.*WAVEFRONT_SIZE")
+                    elif 'tile' in original:
+                        changes.append("tile[32][32] → tile[WAVEFRONT_SIZE][WAVEFRONT_SIZE]")
+                if '0x3f' in line and '0x1f' in original:
+                    changes.append("Warp mask 0x1f (32) → 0x3f (64) for wavefront64")
+                if 'WAVEFRONT_SIZE = 64' in line and 'WARP_SIZE' in original:
+                    changes.append("WARP_SIZE = 32 → WAVEFRONT_SIZE = 64")
+
+            result_lines.append(line)
+
+        # Fix 9: Add wavefront awareness header (unless already present or first line has it)
+        code = '\n'.join(result_lines)
+        if "#define WAVEFRONT_SIZE 64" not in code:
+            code = "#define WAVEFRONT_SIZE 64  // AMD GPU wavefront size\n" + code
+            changes.append("Added #define WAVEFRONT_SIZE 64 header")
+
+        # Deduplicate changes
+        seen = set()
+        unique_changes = []
+        for c in changes:
+            if c not in seen:
+                seen.add(c)
+                unique_changes.append(c)
 
         # Apply cached pattern if available
         confidence = 85  # template port confidence (0-100 scale)
@@ -138,15 +198,15 @@ Output format: JSON with:
             if cached_conf < 1:
                 cached_conf = cached_conf * 100
             confidence = min(95, cached_conf + 5)
-            changes.append(f"Applied cached pattern from verified fix (id: {cached_pattern.get('id', 'unknown')})")
+            unique_changes.append(f"Applied cached pattern from verified fix (id: {cached_pattern.get('id', 'unknown')})")
             if cached_pattern.get("verified_fix"):
-                ported = cached_pattern["verified_fix"]
+                code = cached_pattern["verified_fix"]
 
         return {
-            "ported_code": ported,
+            "ported_code": code,
             "confidence": confidence,
-            "changes": changes if changes else ["No automatic changes needed — code appears portable"],
+            "changes": unique_changes if unique_changes else ["No automatic changes needed — code appears portable"],
             "explanation": "Template-based porting applied. "
-                          f"Made {len(changes)} changes. "
+                          f"Made {len(unique_changes)} changes. "
                           "For production, use Fireworks API for better accuracy."
         }

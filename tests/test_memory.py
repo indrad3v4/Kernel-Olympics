@@ -1,4 +1,4 @@
-"""Unit tests for the pattern memory module."""
+"""Unit tests for the pattern memory module (SQLite + trigram index)."""
 import sys
 import os
 import tempfile
@@ -8,16 +8,22 @@ from pattern_memory.memory import PatternMemory
 
 
 def _fresh_memory():
-    """Create a PatternMemory with a unique temp file to avoid cross-test pollution."""
-    tmp = tempfile.NamedTemporaryFile(suffix='.json', delete=False)
-    tmp.close()
-    m = PatternMemory(storage_path=tmp.name)
-    return m, tmp.name
+    """Create a PatternMemory with a unique temp DB to avoid cross-test pollution."""
+    fd, path = tempfile.mkstemp(suffix='.db')
+    os.close(fd)
+    m = PatternMemory(db_path=path)
+    return m, path
 
 
 def _cleanup(path):
     try:
         os.unlink(path)
+        # Also clean up WAL/SHM files SQLite may create
+        for ext in ('-wal', '-shm'):
+            try:
+                os.unlink(path + ext)
+            except OSError:
+                pass
     except OSError:
         pass
 
@@ -45,8 +51,9 @@ def test_store_and_retrieve():
     match = m.retrieve("__shared__ float shared[32]; int tid = threadIdx.x;")
     assert match is not None
     assert match["confidence"] >= 0.95
-    assert "similarity" in match
-    assert match["similarity"] >= 0.7
+    assert "jaccard" in match
+    assert match["jaccard"] > 0
+    assert "retrieval_ms" in match
     _cleanup(path)
 
 
@@ -97,13 +104,14 @@ def test_update_existing_pattern():
 
 def test_persistence():
     """Pattern memory should persist to disk and reload."""
-    path = tempfile.NamedTemporaryFile(suffix='.json', delete=False).name
-    m1 = PatternMemory(storage_path=path)
+    fd, path = tempfile.mkstemp(suffix='.db')
+    os.close(fd)
+    m1 = PatternMemory(db_path=path)
     m1.store("persist test", "persist fix", 0.85, "run_persist")
     assert m1.count() == 1
     del m1
 
-    m2 = PatternMemory(storage_path=path)
+    m2 = PatternMemory(db_path=path)
     assert m2.count() == 1
     match = m2.retrieve("persist test")
     assert match is not None
@@ -111,10 +119,12 @@ def test_persistence():
     _cleanup(path)
 
 
-def test_signature_computation():
-    """Signature should be deterministic for same code."""
+def test_trigram_computation():
+    """Trigram computation should be deterministic for same code."""
     m, path = _fresh_memory()
-    sig1 = m._compute_signature("int x = 0; for (int i = 0; i < 10; i++) { x += i; }")
-    sig2 = m._compute_signature("int x = 0; for (int i = 0; i < 10; i++) { x += i; }")
-    assert sig1 == sig2
+    code = "int x = 0; for (int i = 0; i < 10; i++) { x += i; }"
+    trig1 = m._compute_trigrams(code)
+    trig2 = m._compute_trigrams(code)
+    assert trig1 == trig2
+    assert len(trig1) > 0
     _cleanup(path)

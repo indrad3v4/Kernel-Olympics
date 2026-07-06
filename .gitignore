@@ -8,3 +8,5 @@ build/
 data/pattern_memory.json
 *.db
 *.log
+portability_report.json
+data/

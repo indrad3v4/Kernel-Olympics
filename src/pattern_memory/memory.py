@@ -133,11 +133,15 @@ class PatternMemory:
 
     def get_stats(self) -> Dict:
         total = self._hits + self._misses
+        total_retrieved = self._db_execute(
+            "SELECT COALESCE(SUM(times_retrieved), 0) FROM patterns"
+        ).fetchone()[0]
         return {
             "total_patterns": self.count(),
             "cache_hits": self._hits,
             "cache_misses": self._misses,
             "hit_rate": round(self._hits / total, 3) if total > 0 else 0,
+            "total_retrievals": total_retrieved,
             "last_cache_time_ms": round(self._last_cache_time, 1),
             "last_llm_time_s": round(self._last_llm_time, 1),
             "avg_confidence": self._db_execute(

@@ -22,7 +22,7 @@ def test_template_port_adds_header():
     agent = PortingAgent(api_key="test")
     warp_source = open("sample_kernels/cuda/warp_reduce.cu").read()
     result = agent.port_kernel(warp_source)
-    assert "ROCm/HIP port" in result["ported_code"]
+    assert "WAVEFRONT_SIZE" in result["ported_code"]
     assert "wavefront" in result["ported_code"] or "wavefront" in str(result["changes"])
 
 
