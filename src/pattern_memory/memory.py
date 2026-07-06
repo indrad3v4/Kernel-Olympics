@@ -142,9 +142,9 @@ class PatternMemory:
 
     def _load(self):
         if self.storage_path.exists():
-            with open(self.storage_path) as f:
-                data = json.load(f)
+            content = self.storage_path.read_text()
+            if content.strip():
+                data = json.loads(content)
                 self.patterns = data.get("patterns", [])
-                # Update times_retrieved from load
                 for p in self.patterns:
                     p["times_retrieved"] = p.get("times_retrieved", 0)

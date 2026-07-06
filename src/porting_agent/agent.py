@@ -131,9 +131,13 @@ Output format: JSON with:
         )
 
         # Apply cached pattern if available
-        confidence = 85  # template port confidence
+        confidence = 85  # template port confidence (0-100 scale)
         if cached_pattern:
-            confidence = min(95, cached_pattern.get("confidence", 85) + 5)
+            cached_conf = cached_pattern.get("confidence", 85)
+            # Normalize if stored as 0-1 scale
+            if cached_conf < 1:
+                cached_conf = cached_conf * 100
+            confidence = min(95, cached_conf + 5)
             changes.append(f"Applied cached pattern from verified fix (id: {cached_pattern.get('id', 'unknown')})")
             if cached_pattern.get("verified_fix"):
                 ported = cached_pattern["verified_fix"]

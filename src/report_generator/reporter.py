@@ -24,6 +24,9 @@ class ReportGenerator:
                  hours_per_fix: float = 4.0) -> Dict:
         """Generate a complete portability report."""
         
+        # Store hours_per_fix for template access
+        self.hours_per_fix = hours_per_fix
+
         # Calculate statistics
         total_files = len(scan_results)
         red_count = sum(1 for r in classifier_results if r.get("risk_level") == "red")
@@ -93,7 +96,7 @@ class ReportGenerator:
             parts.append(f"Auto-Fix Results:")
             parts.append(f"  • {verified} kernel(s) successfully ported and verified")
             parts.append(f"  • Estimated engineer-hours saved: {hours_saved:.0f}h")
-            parts.append(f"    (based on {self.hours_per_fix_assumption}h per manually-fixed red-flag kernel)")
+            parts.append(f"    (based on {self.hours_per_fix}h per manually-fixed red-flag kernel)")
             parts.append(f"")
         
         if memory:
