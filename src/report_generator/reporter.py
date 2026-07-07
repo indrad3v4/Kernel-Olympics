@@ -15,9 +15,10 @@ from datetime import datetime
 class ReportGenerator:
     """Generates portability reports using Gemma on local ROCm."""
 
-    def __init__(self, use_gemma: bool = False):
-        self.use_gemma = use_gemma and self._check_gemma_available()
-        self.gemma_model = "gemma-2-2b-it"  # lightweight, runs on local ROCm
+    def __init__(self, use_gemma: bool = True):
+        self.api_key = os.environ.get("FIREWORKS_API_KEY", "")
+        self.gemma_model = "accounts/fireworks/models/gemma-3-27b-it"
+        self.use_gemma = use_gemma and bool(self.api_key)
 
     def generate(self, scan_results: List[Dict], classifier_results: List[Dict],
                  verification_results: List[Dict], memory_stats: Dict,
@@ -109,21 +110,60 @@ class ReportGenerator:
         return "\n".join(parts)
 
     def _gemma_summary(self, scan_results, classifier_results, verification_results) -> str:
-        """Use Gemma on local ROCm to generate a narrative summary."""
-        # TODO: Implement when Gemma is available on AMD ROCm
+        """Use Gemma 3 via Fireworks API to generate a narrative summary."""
+        import requests, json
+        
+        # Build prompt from pipeline results
+        red = [r for r in classifier_results if r.get("risk_level") == "red"]
+        findings = []
+        for r in classifier_results:
+            findings.extend(r.get("findings", []))
+        
+        prompt = (
+            f"You are a GPU kernel porting expert. "
+            f"Write a 3-paragraph portability report summary:\n\n"
+            f"Files analyzed: {len(scan_results)}\n"
+            f"High-risk kernels: {len(red)}\n"
+            f"Danger patterns found: {len(findings)}\n"
+            f"Verifications passed: {sum(1 for v in verification_results if v.get('passed'))}\n\n"
+            f"Key patterns detected:\n"
+        )
+        for f in findings[:10]:
+            prompt += f"- [{f.get('severity','info')}] Line {f.get('line','?')}: {f.get('pattern','?')}\n"
+        prompt += "\nWrite a concise, professional portability report summary. Keep it under 200 words."
+        
+        try:
+            resp = requests.post(
+                "https://api.fireworks.ai/inference/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": self.gemma_model,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 400,
+                    "temperature": 0.3
+                },
+                timeout=15
+            )
+            if resp.ok:
+                return resp.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            pass  # fallback to template
+        
         return self._template_summary(
-            sum(1 for r in classifier_results if r.get("risk_level") == "red"),
-            sum(1 for r in classifier_results if r.get("risk_level") == "yellow"),
-            sum(1 for r in classifier_results if r.get("risk_level") == "green"),
+            len(red),
+            len([r for r in classifier_results if r.get("risk_level") == "yellow"]),
+            len([r for r in classifier_results if r.get("risk_level") == "green"]),
             sum(1 for v in verification_results if v.get("passed")),
             0,
             {}
         )
 
     def _check_gemma_available(self) -> bool:
-        """Check if Gemma is available locally."""
-        # TODO: Check for ROCm + Gemma installation
-        return False
+        """Check if Gemma is available via Fireworks API key."""
+        return bool(self.api_key)
 
 
 if __name__ == "__main__":
