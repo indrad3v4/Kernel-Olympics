@@ -22,25 +22,24 @@ from dataclasses import dataclass, field
 
 MODEL_CATALOG = {
     "kimi": {
-        "id": "accounts/fireworks/models/kimi-k2p6",  # confirmed from Fireworks UI
+        "id": "accounts/fireworks/models/kimi-k2p6",  # ✅ VERIFIED WORKING
         "role": "planner",
         "strength": "complex kernel logic, multi-step reasoning",
         "cost_per_1k": 0.00095,
-        "access": "standard — check ADP model list at launch"
     },
     "glm": {
-        "id": "accounts/fireworks/models/glm-5-2",  # confirmed from Fireworks UI
+        "id": "accounts/fireworks/models/glm-5-2",
         "role": "coder",
         "strength": "accurate code generation, struct understanding",
         "cost_per_1k": 0.0014,
-        "access": "standard — check ADP model list at launch"
+        "note": "Need model ID from Fireworks UI — click on model"
     },
     "gemma4": {
-        "id": "accounts/fireworks/models/gemma-4-31b-it",  # visible in library
+        "id": "accounts/fireworks/models/gemma-4-31b-it",
         "role": "verifier",
         "strength": "cheap, fast, good at spotting errors",
         "cost_per_1k": 0.0003,
-        "access": "standard — check ADP model list at launch"
+        "note": "Need model ID from Fireworks UI — click on model"
     },
 }
 
