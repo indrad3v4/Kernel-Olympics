@@ -56,8 +56,8 @@ def test_verify_diff_empty():
 def test_generate_harness():
     """Test harness should be valid C++ with hip includes."""
     agent = VerificationAgent()
-    harness = agent._generate_harness("my_kernel", "")
+    harness = agent._generate_harness("my_kernel", "", "__global__ void warp_reduce_kernel() {}")
     assert "hip/hip_runtime.h" in harness
-    assert "test_kernel" in harness
+    assert "warp_reduce_kernel" in harness
     assert "hipMalloc" in harness
     assert "hipMemcpy" in harness

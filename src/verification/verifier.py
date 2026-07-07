@@ -103,7 +103,7 @@ class VerificationAgent:
         if self._hipcc_available:
             try:
                 result = subprocess.run(
-                    ["hipcc", "-o", str(output_bin), str(harness_file),
+                    [self._hipcc_path, "-o", str(output_bin), str(harness_file),
                      "-std=c++17", "-O2", "--offload-arch=gfx942"],
                     capture_output=True, text=True, timeout=60,
                     cwd=str(build_dir)
@@ -204,9 +204,19 @@ int main() {{
 """
 
     def _check_hipcc(self) -> bool:
-        """Check if hipcc is available on this system."""
-        try:
-            result = subprocess.run(["which", "hipcc"], capture_output=True, text=True, timeout=5)
-            return result.returncode == 0
-        except FileNotFoundError:
-            return False
+        """Check if hipcc is available on this system (any known path)."""
+        candidates = ["hipcc", "/opt/rocm/bin/hipcc", "/opt/rocm/lib/llvm/bin/hipcc"]
+        for cmd in candidates:
+            try:
+                result = subprocess.run([cmd, "--version"], capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    self._hipcc_path = cmd
+                    return True
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                continue
+        for path_dir in os.environ.get("PATH", "").split(":"):
+            candidate = Path(path_dir) / "hipcc"
+            if candidate.exists():
+                self._hipcc_path = str(candidate)
+                return True
+        return False
