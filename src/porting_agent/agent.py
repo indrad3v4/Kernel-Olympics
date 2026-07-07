@@ -114,12 +114,17 @@ Output format: JSON with:
         shared_32_re = re.compile(r'(__shared__[^;]*?\[\s*)32(\s*\])')
         tile_32_re = re.compile(r'(tile\[)\s*32(\s*\]\[)\s*32(\s*\])')
         blockidx_32_re = re.compile(r'(blockIdx\.[xy])\s*\*\s*32\s*\+')
-        syncwarp_re = re.compile(r'__syncwarp\(\)')
+        syncwarp_re = re.compile(r'__syncwarp\(\s*\)')
         warp_size_re = re.compile(r'(?:const\s+)?int\s+WARP_SIZE\s*=\s*32')
         warp_size_define_re = re.compile(r'#define\s+WARP_SIZE\s+32\b')
         ballot_re = re.compile(r'__ballot_sync\(0xffffffff')
         shfl_xor_re = re.compile(r'__shfl_xor_sync\s*\(')
         threadidx_32_re = re.compile(r'(threadIdx\.[xy]\s*\*\s*)32(\b)')
+        define_tile_re = re.compile(r'#define\s+TILE_SIZE\s+32\b')
+        warp_mask_re = re.compile(r'(?:const\s+)?int\s+WARP_MASK\s*=\s*0x1[fF]\b')
+        tid_warp_mask_re = re.compile(r'(tid\s*&\s*)0x1[fF](\s*\)?\s*==\s*0\b)')
+        blockidx_tile_re = re.compile(r'(blockIdx\.[xy]\s*\*\s*)TILE_SIZE')
+        shfl_down_re = re.compile(r'__shfl_down_sync\s*\(')
 
         for line in lines:
             stripped = line.strip()
@@ -178,6 +183,30 @@ Output format: JSON with:
             # Fix 8c: threadIdx.* 32 pattern (pointer arithmetic, e.g., &shared[threadIdx.y * 32])
             line = threadidx_32_re.sub(r'\1 WAVEFRONT_SIZE ', line)
 
+            # Fix 8d: #define TILE_SIZE 32 → #define TILE_SIZE WAVEFRONT_SIZE
+            if define_tile_re.search(line):
+                line = define_tile_re.sub('#define TILE_SIZE WAVEFRONT_SIZE  // AMD wavefront', line)
+                if "#define TILE_SIZE WAVEFRONT_SIZE" not in ' '.join(changes):
+                    changes.append("#define TILE_SIZE 32 → #define TILE_SIZE WAVEFRONT_SIZE")
+
+            # Fix 8e: int WARP_MASK = 0x1f → int WAVEFRONT_MASK = 0x3f
+            if warp_mask_re.search(line):
+                line = warp_mask_re.sub('int WAVEFRONT_MASK = 0x3f  // wavefront64 mask', line)
+                if "WARP_MASK → WAVEFRONT_MASK" not in str(changes):
+                    changes.append("WARP_MASK 0x1f (32) → WAVEFRONT_MASK 0x3f (64)")
+
+            # Fix 8f: tid & 0x1f == 0 → tid & 0x3f == 0 (warp mask check)
+            line = tid_warp_mask_re.sub(r'\1 0x3f\2  // wavefront64', line)
+
+            # Fix 8g: blockIdx.* * TILE_SIZE → blockIdx.* * WAVEFRONT_SIZE
+            line = blockidx_tile_re.sub(r'\1 WAVEFRONT_SIZE', line)
+
+            # Fix 8h: __shfl_down_sync — annotate the offset issue
+            if shfl_down_re.search(line):
+                if "shfl_down" not in str(changes):
+                    changes.append("__shfl_down_sync: verify offsets work with wavefront64 (64 lanes, offset must be power of two)")
+
+
             # Track what changed
             if line != original:
                 # Compute a change description based on what was modified
@@ -194,6 +223,12 @@ Output format: JSON with:
                     changes.append("Warp mask 0x1f (32) → 0x3f (64) for wavefront64")
                 if 'WAVEFRONT_SIZE = 64' in line and 'WARP_SIZE' in original:
                     changes.append("WARP_SIZE = 32 → WAVEFRONT_SIZE = 64")
+                if 'TILE_SIZE WAVEFRONT_SIZE' in line and 'TILE_SIZE 32' in original:
+                    changes.append("#define TILE_SIZE 32 → #define TILE_SIZE WAVEFRONT_SIZE")
+                if 'WAVEFRONT_MASK' in line and 'WARP_MASK' in original:
+                    changes.append("WARP_MASK → WAVEFRONT_MASK")
+                if '0x3f' in line and '0x1f' in original and '#define' not in original and 'WARP_MASK' not in original:
+                    changes.append("tid & 0x1f → tid & 0x3f for wavefront64")
 
             result_lines.append(line)
 

@@ -9,4 +9,5 @@ data/pattern_memory.json
 *.db
 *.log
 portability_report.json
+demo_report.json
 data/

@@ -59,6 +59,16 @@ def test_classify_red_kernel_histogram():
     assert len(result["findings"]) >= 3
 
 
+def test_conv2d_kernel_classify_red():
+    """conv2d.cu should be classified RED (shfl_xor, warp mask, #define TILE_SIZE 32)."""
+    conv_source = open("sample_kernels/cuda/conv2d.cu").read()
+    c = RiskClassifier()
+    result = c.classify(conv_source, "conv2d.cu")
+    assert result["risk_level"] == "red", f"Expected RED, got {result['risk_level']}"
+    # Should catch: __shfl_xor_sync (#define TILE_SIZE is not a pattern check, but __shfl_xor is)
+    assert len(result["findings"]) >= 3
+
+
 def test_findings_have_context():
     """Each finding should include surrounding source context."""
     warp_source = open("sample_kernels/cuda/warp_reduce.cu").read()

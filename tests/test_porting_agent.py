@@ -68,7 +68,7 @@ def test_template_port_histogram_kernel():
     # Should fix __ballot_sync mask
     assert "ballot_sync" in changes
     # Should have patch count >= 5
-    assert len(result["changes"]) >= 5, f"Expected ≥5 changes, got {len(result['changes'])}: {result['changes']}"
+    assert len(result["changes"]) >= 5, f"Expected >=5 changes, got {len(result['changes'])}: {result['changes']}"
 
 
 def test_template_port_transpose_kernel():
@@ -99,3 +99,21 @@ def test_porting_result_format():
     assert isinstance(result["confidence"], (int, float))
     assert isinstance(result["changes"], list)
     assert isinstance(result["explanation"], str)
+
+
+def test_template_port_conv2d_kernel():
+    """conv2d.cu has #define TILE_SIZE 32, int WARP_MASK = 0x1f, __shfl_xor_sync,
+    __syncwarp(), and blockIdx.* * TILE_SIZE patterns."""
+    agent = PortingAgent(api_key="test")
+    conv_source = open("sample_kernels/cuda/conv2d.cu").read()
+    result = agent.port_kernel(conv_source)
+    changes = " ".join(result["changes"])
+    code = result["ported_code"]
+    # Should have WAVEFRONT_SIZE header
+    assert "#define WAVEFRONT_SIZE 64" in code
+    # Should have 4+ changes
+    assert len(result["changes"]) >= 4, f"Expected >=4 changes, got {len(result['changes'])}: {result['changes']}"
+    # Should detect __shfl_xor_sync
+    assert "shfl_xor" in changes
+    # Should detect __syncwarp
+    assert "syncwarp" in changes.lower() or "syncthreads" in changes.lower()
