@@ -1,3 +1,5 @@
+#agent.py
+
 """
 Porting Agent — uses Fireworks API to fix CUDA→ROCm porting issues.
 
@@ -30,12 +32,6 @@ KEY RULES:
 5. __syncwarp() → use __syncthreads() for HIP compatibility
 6. Use __ballot_sync (HIP) instead of CUDA warp-vote functions
 7. Keep the same algorithm structure — only change what's needed for portability
-8. __activemask() → use __ballot_sync(0xffffffff, 1) for active lane mask on HIP
-9. __all_sync/__any_sync — these take a mask argument; verify it works with 64 lanes
-10. __match_all_sync — no direct HIP equivalent; redesign as sequential check
-11. threadIdx.x >> 5 computes warp index (32 lanes) → should be >> 6 for wavefront64
-12. Lane identification: if (lane_id < 32) → if (lane_id < 64) for wavefront boundary
-13. __shfl_sync (basic shuffle) — mask and lane count must be adjusted for wavefront64
 
 Output format: JSON with:
 - "ported_code": the full ported kernel
@@ -44,7 +40,7 @@ Output format: JSON with:
 - "explanation": short explanation of the fix
 """
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "accounts/fireworks/models/llama-v3p1-8b-instruct"):
+    def __init__(self, api_key: Optional[str] = None, model: str = "accounts/fireworks/models/llama-v3p3-70b-instruct"):
         self.api_key = api_key or os.getenv("FIREWORKS_API_KEY", "")
         self.model = model
         self.api_base = "https://api.fireworks.ai/inference/v1"
@@ -131,13 +127,6 @@ Output format: JSON with:
         tid_warp_mask_re = re.compile(r'(tid\s*&\s*)0x1[fF](\s*\)?\s*==\s*0\b)')
         blockidx_tile_re = re.compile(r'(blockIdx\.[xy]\s*\*\s*)TILE_SIZE')
         shfl_down_re = re.compile(r'__shfl_down_sync\s*\(')
-        activemask_re = re.compile(r'__activemask\s*\(')
-        all_sync_re = re.compile(r'__all_sync\s*\(')
-        any_sync_re = re.compile(r'__any_sync\s*\(')
-        match_all_re = re.compile(r'__match_all_sync\s*\(')
-        warp_lane_shift_re = re.compile(r'(threadIdx\.[xy]\s*>>\s*)5(?!\d)')
-        lane_id_32_re = re.compile(r'(lane_id|laneIdx)\s*[<]\s*32\b')
-        warp_divergent_32_re = re.compile(r'(if\s*\(\s*(?:threadIdx\.[xy]|tid|lane_id|laneIdx)\s*[<]\s*)32(\s*\))')
 
         for line in lines:
             stripped = line.strip()
@@ -218,37 +207,6 @@ Output format: JSON with:
             if shfl_down_re.search(line):
                 if "shfl_down" not in str(changes):
                     changes.append("__shfl_down_sync: verify offsets work with wavefront64 (64 lanes, offset must be power of two)")
-
-            # Fix 9: __activemask() → __ballot_sync(0xffffffff, 1) on HIP
-            if activemask_re.search(line):
-                line = activemask_re.sub('__ballot_sync(0xffffffff  // wavefront64 active mask', line)
-                if "activemask" not in str(changes):
-                    changes.append("__activemask() → __ballot_sync(0xffffffff, 1) for HIP compatibility")
-
-            # Fix 10: __all_sync / __any_sync — annotate for wavefront64
-            if all_sync_re.search(line):
-                if "all_sync" not in str(changes):
-                    changes.append("__all_sync: verify predicate works with wavefront64 (64 lanes)")
-            if any_sync_re.search(line):
-                if "any_sync" not in str(changes):
-                    changes.append("__any_sync: verify predicate works with wavefront64 (64 lanes)")
-
-            # Fix 11: __match_all_sync — annotate (no direct HIP equivalent)
-            if match_all_re.search(line):
-                if "match_all" not in str(changes):
-                    changes.append("__match_all_sync: no direct HIP equivalent — may need algorithm redesign")
-
-            # Fix 12: threadIdx.x >> 5 (warp index) → >> 6 for wavefront64
-            line = warp_lane_shift_re.sub(r'\1 6  // wavefront64: 64 lanes', line)
-
-            # Fix 13: lane_id < 32 → lane_id < 64 (wavefront boundary)
-            if lane_id_32_re.search(line):
-                line = line.replace('< 32', '< WAVEFRONT_SIZE', 1)
-                if "lane_id < 32" not in str(changes):
-                    changes.append("lane_id < 32 → lane_id < WAVEFRONT_SIZE for wavefront64")
-
-            # Fix 14: threadIdx.x/tid < 32 → < WAVEFRONT_SIZE (warp divergence boundary)
-            line = warp_divergent_32_re.sub(r'\1 WAVEFRONT_SIZE \2', line)
 
 
             # Track what changed
