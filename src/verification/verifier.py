@@ -75,6 +75,18 @@ class VerificationAgent:
             result["compile_output"] = compile_out[:1000] if compile_out else ""
 
             if not compile_ok:
+                # Save ported kernel for manual compilation on AMD GPU
+                manual_dir = Path.cwd() / "ported_kernels"
+                manual_dir.mkdir(parents=True, exist_ok=True)
+                manual_path = manual_dir / f"{kernel_name}.hip.cpp"
+                try:
+                    import shutil
+                    shutil.copy2(harness_file, manual_path)
+                    compile_out += f"\n\n⚠️ Ported kernel saved to: {manual_path}\n"
+                    compile_out += f"   Compile manually: hipcc -o /tmp/{kernel_name} {manual_path} -std=c++17 -O2\n"
+                    compile_out += f"   Run: /tmp/{kernel_name}"
+                except Exception:
+                    pass
                 result["passed"] = False
                 return result
 
