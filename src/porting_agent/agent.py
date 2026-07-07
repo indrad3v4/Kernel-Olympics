@@ -44,10 +44,20 @@ Output format: JSON with:
 - "explanation": short explanation of the fix
 """
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "accounts/fireworks/models/llama-v3p1-8b-instruct"):
+    FALLBACK_MODELS = [
+        "accounts/fireworks/models/kimi-k2p6",          # 1st: Kimi (works ✅)
+        "accounts/fireworks/models/glm-5p2",             # 2nd: GLM (works ✅)
+        "accounts/fireworks/models/llama-v3p3-70b-instruct",  # 3rd: Llama (may work)
+    ]
+
+    def __init__(self, api_key: Optional[str] = None, model: str = "accounts/fireworks/models/kimi-k2p6",
+                 deepseek_key: str = "", deepseek_model: str = "deepseek-reasoner"):
         self.api_key = api_key or os.getenv("FIREWORKS_API_KEY", "")
         self.model = model
+        self.deepseek_key = deepseek_key or os.getenv("DEEPSEEK_API_KEY", "")
+        self.deepseek_model = deepseek_model
         self.api_base = "https://api.fireworks.ai/inference/v1"
+        self.deepseek_base = "https://api.deepseek.com/v1"
 
     def port_kernel(self, source_code: str, context: str = "",
                     cached_pattern: Optional[Dict] = None) -> Dict:
@@ -73,39 +83,69 @@ Output format: JSON with:
         if not self.api_key or self.api_key == "test":
             return self._template_port(source_code, cached_pattern)
 
-        try:
-            import urllib.request
-            import json as _json
-            data = _json.dumps({
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": self.SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt}
-                ],
-                "temperature": 0.1,
-                "max_tokens": 2048,
-                "response_format": {"type": "json_object"}
-            }).encode()
-            req = urllib.request.Request(
-                f"{self.api_base}/chat/completions",
-                data=data,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json"
-                }
-            )
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                result = _json.loads(resp.read())
-            content = result["choices"][0]["message"]["content"]
-            return _json.loads(content)
-            
-        except Exception as e:
-            return {
-                "ported_code": f"// Porting failed: {str(e)}\n{source_code}",
-                "confidence": 0,
-                "changes": [f"Error: {str(e)}"],
-                "explanation": f"Porting agent error. Falling back to template."
-            }
+        models_to_try = [self.model] + [m for m in self.FALLBACK_MODELS if m != self.model]
+
+        for model in models_to_try:
+            try:
+                import urllib.request
+                import json as _json
+                data = _json.dumps({
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": self.SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 2048,
+                    "response_format": {"type": "json_object"}
+                }).encode()
+                req = urllib.request.Request(
+                    f"{self.api_base}/chat/completions",
+                    data=data,
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json"
+                    }
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    result = _json.loads(resp.read())
+                content = result["choices"][0]["message"]["content"]
+                return _json.loads(content)
+            except Exception:
+                continue  # Try next model
+
+        # Last resort: try DeepSeek (your Hermes main provider)
+        if self.deepseek_key:
+            try:
+                import urllib.request
+                import json as _json
+                data = _json.dumps({
+                    "model": self.deepseek_model,
+                    "messages": [
+                        {"role": "system", "content": self.SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 2048,
+                    "response_format": {"type": "json_object"}
+                }).encode()
+                req = urllib.request.Request(
+                    f"{self.deepseek_base}/chat/completions",
+                    data=data,
+                    headers={
+                        "Authorization": f"Bearer {self.deepseek_key}",
+                        "Content-Type": "application/json"
+                    }
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    result = _json.loads(resp.read())
+                content = result["choices"][0]["message"]["content"]
+                return _json.loads(content)
+            except Exception:
+                pass  # Fall through to template
+
+        # All models failed — use template fallback
+        return self._template_port(source_code, cached_pattern)
 
     def _template_port(self, source_code: str,
                        cached_pattern: Optional[Dict] = None) -> Dict:

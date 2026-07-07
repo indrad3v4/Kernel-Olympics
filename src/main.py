@@ -127,7 +127,10 @@ class KernelOlympics:
         self.scanner = Scanner()
         self.classifier = RiskClassifier()
         self.memory = PatternMemory()
-        self.porting_agent = PortingAgent()
+        self.porting_agent = PortingAgent(
+            deepseek_key=os.getenv("DEEPSEEK_API_KEY", ""),
+            deepseek_model=os.getenv("DEEPSEEK_MODEL", "deepseek-reasoner")
+        )
         self.verifier = VerificationAgent()
         self.reporter = ReportGenerator()
         self.disp = Display()
