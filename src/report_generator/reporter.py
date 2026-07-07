@@ -17,7 +17,11 @@ class ReportGenerator:
 
     def __init__(self, use_gemma: bool = True):
         self.api_key = os.environ.get("FIREWORKS_API_KEY", "")
-        self.gemma_model = "accounts/fireworks/models/gemma-3-27b-it"
+        # Try latest Gemma 4 first, fall back to Gemma 3 if 404
+        self.gemma_model = os.environ.get(
+            "GEMMA_MODEL",
+            "accounts/fireworks/models/gemma-4-31b-it"
+        )
         self.use_gemma = use_gemma and bool(self.api_key)
 
     def generate(self, scan_results: List[Dict], classifier_results: List[Dict],
