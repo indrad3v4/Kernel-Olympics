@@ -22,13 +22,13 @@ from dataclasses import dataclass, field
 
 MODEL_CATALOG = {
     "kimi": {
-        "id": "accounts/fireworks/models/kimi-k2-5",
+        "id": "accounts/fireworks/models/kimi-k2-7b-it",  # or kimi/k2-7b — check at launch
         "role": "planner",
         "strength": "complex kernel logic, multi-step reasoning",
         "cost_per_1k": 0.002,
     },
     "glm": {
-        "id": "accounts/fireworks/models/glm-4-42b-it",
+        "id": "accounts/fireworks/models/glm-5-4b-it",  # or glm-5-4b-chat
         "role": "coder",
         "strength": "accurate code generation, struct understanding",
         "cost_per_1k": 0.001,
