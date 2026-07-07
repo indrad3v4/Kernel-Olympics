@@ -38,6 +38,7 @@ from scanner.scanner import Scanner
 from risk_classifier.classifier import RiskClassifier
 from pattern_memory.memory import PatternMemory
 from porting_agent.agent import PortingAgent
+from router import ModelRouter
 from verification.verifier import VerificationAgent
 from report_generator.reporter import ReportGenerator
 
@@ -131,6 +132,7 @@ class KernelOlympics:
             deepseek_key=os.getenv("DEEPSEEK_API_KEY", ""),
             deepseek_model=os.getenv("DEEPSEEK_MODEL", "deepseek-reasoner")
         )
+        self.router = ModelRouter()
         self.verifier = VerificationAgent()
         self.reporter = ReportGenerator()
         self.disp = Display()
@@ -205,10 +207,15 @@ class KernelOlympics:
                 else:
                     pipeline_state["llm_calls"] += 1
                     self.disp.llm_call()
-                    self.disp.file_done(Path(cr['file']).name, "LLM call...", ok=False)
+                    self.disp.file_done(Path(cr['file']).name, "3-model pipeline...", ok=False)
+                    self.disp.status("Porting", f"Kimi(planner) → GLM(coder) → Gemma(verifier)")
                     t0 = time.perf_counter()
-                    port_result = self.porting_agent.port_kernel(source)
+                    port_result = self.router.route(source, cr.get("findings", []))
                     llm_elapsed = time.perf_counter() - t0
+                    if not port_result.get("ported_code"):
+                        # Router failed — fallback to porting agent
+                        port_result = self.porting_agent.port_kernel(source)
+                        llm_elapsed = time.perf_counter() - t0
                     self.memory.record_llm_time(llm_elapsed)
                     total_llm_time += llm_elapsed
                     port_result["from_cache"] = False
