@@ -122,18 +122,19 @@ class VerificationAgent:
                 return False, str(e)
         else:
             # hipcc not found via paths — save ported kernel for manual compilation
-            # (HF workspace provides hipcc only in interactive shell, not subprocesses)
-            manual_path = build_dir / f"{kernel_name}.hip.cpp"
+            # Save to persistent location (not temp dir which gets cleaned up)
+            manual_dir = Path("/workspace/Kernel-Olympics/ported_kernels")
+            manual_dir.mkdir(parents=True, exist_ok=True)
+            manual_path = manual_dir / f"{kernel_name}.hip.cpp"
             try:
-                # Copy the harness file so user can manually compile
                 import shutil
                 shutil.copy2(harness_file, manual_path)
             except Exception:
                 pass
             msg = (
                 f"hipcc not found in subprocess. Ported kernel saved to {manual_path}.\n"
-                f"To compile manually: hipcc -o {kernel_name} {manual_path} -std=c++17 -O2\n"
-                f"Then run: ./{kernel_name}"
+                f"To compile manually: hipcc -o /tmp/{kernel_name} {manual_path} -std=c++17 -O2\n"
+                f"Then run: /tmp/{kernel_name}"
             )
             return False, msg
 
