@@ -60,9 +60,9 @@ python3 src/main.py --input sample_kernels/cuda/warp_reduce.cu
 | Kernel Engineering | Bromine185 |
 | ML Pipeline | Aahil-Riyaz |
 | CI/CD & Testing | meteorite67 |
-| Infrastructure | Icodemun44 |
+| Infrastructure | icodemun44 |
 | QA | _dD |
-| Full Stack | cation |
+| Full Stack | icodemun44 |
 
 **Built in 5 days for AMD Developer Hackathon ACT II — Track 3 (Unicorn).**
 
