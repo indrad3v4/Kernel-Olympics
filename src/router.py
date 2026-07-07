@@ -84,6 +84,25 @@ class ModelRouter:
         self.total_cost = 0.0
         self.call_log: List[Dict] = []
 
+    @staticmethod
+    def _extract_code(text: str) -> str:
+        """Extract code from LLM output (may include markdown or explanation)."""
+        import re
+        # Try to extract code from markdown code blocks
+        blocks = re.findall(r'```(?:cuda|hip|cpp|python)?\n(.*?)```', text, re.DOTALL)
+        if blocks:
+            return blocks[0].strip()
+        # Try to extract from __global__ to end
+        match = re.search(r'__global__\s+void.*', text, re.DOTALL)
+        if match:
+            return match.group(0).strip()
+        # Try to extract from #include
+        match = re.search(r'#include.*', text, re.DOTALL)
+        if match:
+            return match.group(0).strip()
+        # Fallback: return as-is (might be code without markers)
+        return text.strip()
+
     def route(self, kernel_source: str, patterns: List[Dict]) -> Dict:
         """Route kernel through best models based on detected patterns.
 
@@ -123,7 +142,8 @@ class ModelRouter:
                 f"```cuda\n{kernel_source[:2000]}\n```\n\n"
                 f"Output ONLY the ported kernel code, no explanation.")
             if code.success:
-                result["ported_code"] = code.output
+                extracted = self._extract_code(code.output)
+                result["ported_code"] = extracted
                 result["changes"].append(f"[glm] Generated ported kernel")
                 result["confidence"] += 0.4
 
