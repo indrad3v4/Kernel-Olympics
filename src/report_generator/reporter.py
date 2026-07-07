@@ -115,7 +115,8 @@ class ReportGenerator:
 
     def _gemma_summary(self, scan_results, classifier_results, verification_results) -> str:
         """Use Gemma 3 via Fireworks API to generate a narrative summary."""
-        import requests, json
+        import urllib.request
+        import json as _json
         
         # Build prompt from pipeline results
         red = [r for r in classifier_results if r.get("risk_level") == "red"]
@@ -137,23 +138,24 @@ class ReportGenerator:
         prompt += "\nWrite a concise, professional portability report summary. Keep it under 200 words."
         
         try:
-            resp = requests.post(
+            data = _json.dumps({
+                "model": self.gemma_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 400,
+                "temperature": 0.3
+            }).encode()
+            req = urllib.request.Request(
                 "https://api.fireworks.ai/inference/v1/chat/completions",
+                data=data,
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json"
-                },
-                json={
-                    "model": self.gemma_model,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 400,
-                    "temperature": 0.3
-                },
-                timeout=15
+                }
             )
-            if resp.ok:
-                return resp.json()["choices"][0]["message"]["content"]
-        except Exception as e:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                result = _json.loads(resp.read())
+                return result["choices"][0]["message"]["content"]
+        except Exception:
             pass  # fallback to template
         
         return self._template_summary(

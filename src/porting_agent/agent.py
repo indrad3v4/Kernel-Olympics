@@ -74,29 +74,30 @@ Output format: JSON with:
             return self._template_port(source_code, cached_pattern)
 
         try:
-            import requests
-            response = requests.post(
+            import urllib.request
+            import json as _json
+            data = _json.dumps({
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": self.SYSTEM_PROMPT},
+                    {"role": "user", "content": user_prompt}
+                ],
+                "temperature": 0.1,
+                "max_tokens": 2048,
+                "response_format": {"type": "json_object"}
+            }).encode()
+            req = urllib.request.Request(
                 f"{self.api_base}/chat/completions",
+                data=data,
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json"
-                },
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": self.SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    "temperature": 0.1,
-                    "max_tokens": 2048,
-                    "response_format": {"type": "json_object"}
-                },
-                timeout=60
+                }
             )
-            response.raise_for_status()
-            result = response.json()
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                result = _json.loads(resp.read())
             content = result["choices"][0]["message"]["content"]
-            return json.loads(content)
+            return _json.loads(content)
             
         except Exception as e:
             return {

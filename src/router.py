@@ -13,7 +13,7 @@ TRIZ: Use risk classifier output as routing resource (no extra LLM call to decid
 import json
 import os
 import time
-import requests
+import urllib.request
 from typing import Dict, List, Optional, Callable
 from dataclasses import dataclass, field
 
@@ -153,22 +153,22 @@ class ModelRouter:
 
         # Try Fireworks API first
         try:
-            resp = requests.post(
+            data_bytes = json.dumps({
+                "model": model_id,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 1024,
+                "temperature": 0.2,
+            }).encode()
+            req = urllib.request.Request(
                 f"{self.base_url}/chat/completions",
+                data=data_bytes,
                 headers={
                     "Authorization": f"Bearer {self.api_key}",
                     "Content-Type": "application/json"
-                },
-                json={
-                    "model": model_id,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 1024,
-                    "temperature": 0.2,
-                },
-                timeout=15
+                }
             )
-            if resp.ok:
-                data = resp.json()
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read())
                 content = data["choices"][0]["message"]["content"]
                 tokens = data.get("usage", {}).get("total_tokens", 0)
                 cost = tokens / 1000 * MODEL_CATALOG[model_key]["cost_per_1k"]
@@ -180,17 +180,19 @@ class ModelRouter:
 
         # Fallback: try local vLLM endpoint (for Gemma on AMD GPU)
         try:
-            local_resp = requests.post(
+            data_bytes = json.dumps({
+                "model": model_id,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 512,
+            }).encode()
+            local_req = urllib.request.Request(
                 "http://localhost:8000/v1/chat/completions",
-                json={
-                    "model": model_id,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 512,
-                },
-                timeout=30
+                data=data_bytes,
+                headers={"Content-Type": "application/json"}
             )
-            if local_resp.ok:
-                content = local_resp.json()["choices"][0]["message"]["content"]
+            with urllib.request.urlopen(local_req, timeout=30) as resp:
+                data = json.loads(resp.read())
+                content = data["choices"][0]["message"]["content"]
                 cost = 0  # local = free
                 self.call_log.append({"model": model_key, "source": "local-vllm", "cost": cost})
                 return AgentResult(model_key, True, content, 0.85, 0, round((time.perf_counter()-t0)*1000, 1))
