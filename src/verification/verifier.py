@@ -102,12 +102,21 @@ class VerificationAgent:
 
         if self._hipcc_available:
             try:
-                result = subprocess.run(
-                    [self._hipcc_path, "-o", str(output_bin), str(harness_file),
-                     "-std=c++17", "-O2", "--offload-arch=gfx942"],
-                    capture_output=True, text=True, timeout=60,
-                    cwd=str(build_dir)
-                )
+                # hipcc may be a shell wrapper — use shell=True if path is just "hipcc"
+                if self._hipcc_path == "hipcc":
+                    cmd_line = f"hipcc -o {output_bin} {harness_file} -std=c++17 -O2 --offload-arch=gfx942"
+                    result = subprocess.run(
+                        cmd_line, shell=True,
+                        capture_output=True, text=True, timeout=60,
+                        cwd=str(build_dir)
+                    )
+                else:
+                    result = subprocess.run(
+                        [self._hipcc_path, "-o", str(output_bin), str(harness_file),
+                         "-std=c++17", "-O2", "--offload-arch=gfx942"],
+                        capture_output=True, text=True, timeout=60,
+                        cwd=str(build_dir)
+                    )
                 return result.returncode == 0, result.stdout + result.stderr
             except (subprocess.TimeoutExpired, FileNotFoundError) as e:
                 return False, str(e)
@@ -209,6 +218,7 @@ int main() {{
 
     def _check_hipcc(self) -> bool:
         """Check if hipcc is available on this system (any known path)."""
+        # Try direct path first (for real binaries)
         candidates = ["hipcc", "/opt/rocm/bin/hipcc", "/opt/rocm/lib/llvm/bin/hipcc",
                        "/opt/rocm-7.2.1/bin/hipcc", "/opt/rocm-7.2.1/lib/llvm/bin/hipcc",
                        "/usr/bin/hipcc"]
@@ -220,11 +230,24 @@ int main() {{
                     return True
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 continue
-        for path_dir in os.environ.get("PATH", "").split(":"):
-            candidate = Path(path_dir) / "hipcc"
-            if candidate.exists():
-                self._hipcc_path = str(candidate)
+        # Try via shell (for shell wrappers like ROCm's hipcc)
+        try:
+            result = subprocess.run("which hipcc 2>/dev/null || command -v hipcc 2>/dev/null",
+                                    shell=True, capture_output=True, text=True, timeout=5)
+            if result.stdout.strip():
+                self._hipcc_path = result.stdout.strip()
                 return True
+        except subprocess.TimeoutExpired:
+            pass
+        # Try shell=True execution
+        try:
+            result = subprocess.run("hipcc --version", shell=True,
+                                    capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                self._hipcc_path = "hipcc"
+                return True
+        except subprocess.TimeoutExpired:
+            pass
         # Last resort: glob /opt/rocm* for hipcc
         import glob
         for match in glob.glob("/opt/rocm*/**/hipcc", recursive=True):
