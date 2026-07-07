@@ -162,8 +162,8 @@ Output format: JSON with:
         import re
         # Fix: 0xffffffff (32-bit mask) → 0xffffffffffffffffULL (64-bit) in __shfl_*_sync calls
         code = re.sub(
-            r'(?<=__shfl_\w+_sync\()0x[fF]{8}(?=\s*,)',
-            '0xffffffffffffffffULL',
+            r'(__shfl_\w+_sync\()0x[fF]{8}(,)',
+            r'\g<1>0xffffffffffffffffULL\g<2>',
             code
         )
         return code
@@ -282,7 +282,7 @@ Output format: JSON with:
                     changes.append("__shfl_down_sync: verify offsets work with wavefront64 (64 lanes, offset must be power of two)")
             
             # Fix 8i: 32-bit mask → 64-bit mask for AMD wavefront64
-            mask_line = re.sub(r'(?<=__shfl_\w+_sync\()0x[fF]{8}(?=\s*,)', '0xffffffffffffffffULL', line)
+            mask_line = re.sub(r'(__shfl_\w+_sync\()0x[fF]{8}(,)', r'\g<1>0xffffffffffffffffULL\g<2>', line)
             if mask_line != line:
                 line = mask_line
                 if "mask_64bit" not in str(changes):
