@@ -38,7 +38,7 @@ MODEL_CATALOG = {
         "role": "verifier",
         "strength": "cheap, fast, good at spotting errors",
         "cost_per_1k": 0.0003,
-        "note": "Need model ID from Fireworks UI — click on model"
+        "access": "dedicated deployment only — use local vLLM on AMD GPU instead",
     },
 }
 
@@ -151,6 +151,7 @@ class ModelRouter:
         model_id = MODEL_CATALOG[model_key]["id"]
         t0 = time.perf_counter()
 
+        # Try Fireworks API first
         try:
             resp = requests.post(
                 f"{self.base_url}/chat/completions",
@@ -164,28 +165,39 @@ class ModelRouter:
                     "max_tokens": 1024,
                     "temperature": 0.2,
                 },
-                timeout=30
+                timeout=15
             )
-            elapsed = (time.perf_counter() - t0) * 1000
-
             if resp.ok:
                 data = resp.json()
                 content = data["choices"][0]["message"]["content"]
                 tokens = data.get("usage", {}).get("total_tokens", 0)
                 cost = tokens / 1000 * MODEL_CATALOG[model_key]["cost_per_1k"]
                 self.total_cost += cost
-                self.call_log.append({
-                    "model": model_key, "tokens": tokens,
-                    "cost": cost, "elapsed_ms": round(elapsed, 1)
-                })
-                return AgentResult(model_key, True, content, 0.7, tokens, round(elapsed, 1))
-            else:
-                # Model not available — skip gracefully
-                return AgentResult(model_key, False,
-                    f"Model unavailable (HTTP {resp.status_code})", 0)
+                self.call_log.append({"model": model_key, "tokens": tokens, "cost": cost})
+                return AgentResult(model_key, True, content, 0.7, tokens, round((time.perf_counter()-t0)*1000, 1))
+        except Exception:
+            pass
 
-        except Exception as e:
-            return AgentResult(model_key, False, str(e), 0)
+        # Fallback: try local vLLM endpoint (for Gemma on AMD GPU)
+        try:
+            local_resp = requests.post(
+                "http://localhost:8000/v1/chat/completions",
+                json={
+                    "model": model_id,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 512,
+                },
+                timeout=30
+            )
+            if local_resp.ok:
+                content = local_resp.json()["choices"][0]["message"]["content"]
+                cost = 0  # local = free
+                self.call_log.append({"model": model_key, "source": "local-vllm", "cost": cost})
+                return AgentResult(model_key, True, content, 0.85, 0, round((time.perf_counter()-t0)*1000, 1))
+        except Exception:
+            pass
+
+        return AgentResult(model_key, False, f"Model {model_id} unavailable", 0)
 
     def get_stats(self) -> Dict:
         calls = len(self.call_log)
