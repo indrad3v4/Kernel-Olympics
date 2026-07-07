@@ -127,6 +127,22 @@ def test_classify_batch():
     assert "red" in levels  # warp_reduce is RED
 
 
+def test_softmax_kernel_classify_red():
+    """softmax.cu should be classified RED (all 9 patterns triggered: activemask, all_any_sync, match_all_sync, warp_lane_shift, shfl_down_sync, shfl_xor_sync, warp_size_constant, syncwarp)."""
+    softmax_source = open("sample_kernels/cuda/softmax.cu").read()
+    c = RiskClassifier()
+    result = c.classify(softmax_source, "softmax.cu")
+    assert result["risk_level"] == "red", f"Expected RED, got {result['risk_level']}"
+    # Should catch activemask, all_any_sync, match_all_sync, warp_lane_shift, shfl patterns
+    assert len(result["findings"]) >= 8, f"Expected >=8 findings, got {len(result['findings'])}"
+    # Verify newer pattern detectors fire
+    pattern_names = {f['pattern'] for f in result['findings']}
+    assert 'activemask' in pattern_names, "activemask pattern should fire"
+    assert 'all_any_sync' in pattern_names, "all_any_sync pattern should fire"
+    assert 'match_all_sync' in pattern_names, "match_all_sync pattern should fire"
+    assert 'warp_lane_shift' in pattern_names, "warp_lane_shift pattern should fire"
+
+
 def test_reset_counters():
     """reset_counters should clear state."""
     c = RiskClassifier()
