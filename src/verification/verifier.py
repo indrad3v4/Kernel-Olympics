@@ -169,6 +169,10 @@ class VerificationAgent:
 
     def _generate_harness(self, kernel_name: str, test_input: str, ported_kernel_source: str) -> str:
         """Generate a test harness that wraps the REAL ported kernel."""
+        # Auto-detect kernel function name from ported source
+        import re
+        match = re.search(r'__global__\s+void\s+(\w+)\s*\(', ported_kernel_source)
+        actual_kernel = match.group(1) if match else f"{kernel_name}_kernel"
         return f"""
 #include <iostream>
 #include <vector>
@@ -188,7 +192,7 @@ int main() {{
 
     hipMemcpy(d_input, input.data(), N * sizeof(float), hipMemcpyHostToDevice);
 
-    warp_reduce_kernel<<<4, 64>>>(d_input, d_output, N);
+    {actual_kernel}<<<4, 64>>>(d_input, d_output, N);
     hipDeviceSynchronize();
 
     hipMemcpy(output.data(), d_output, 4 * sizeof(float), hipMemcpyDeviceToHost);
