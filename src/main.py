@@ -255,7 +255,7 @@ class KernelOlympics:
                     )
                     self.disp.status("Verifying", f"{Path(cr['file']).name} {yellow('stored (unverified — no GPU)')}", ok=False)
                 else:
-                    reason = "No AMD GPU (expected)" if not ver_result.get("compile_success") else "Output mismatch"
+                    reason = "Not compiled — saved for manual hipcc" if not ver_result.get("compile_success") else "Output mismatch"
                     self.disp.status("Verifying", f"{Path(cr['file']).name} {yellow(reason)}", ok=False)
             else:
                 self.disp.file_done(Path(cr['file']).name, f"{cr.get('risk_level')} — no porting needed", ok=True)

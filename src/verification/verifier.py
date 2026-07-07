@@ -119,7 +119,20 @@ class VerificationAgent:
                     )
                 return result.returncode == 0, result.stdout + result.stderr
             except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-                return False, str(e)
+                # Save ported kernel for manual compilation
+                manual_dir = Path("/workspace/Kernel-Olympics/ported_kernels")
+                manual_dir.mkdir(parents=True, exist_ok=True)
+                manual_path = manual_dir / f"{kernel_name}.hip.cpp"
+                try:
+                    import shutil
+                    shutil.copy2(harness_file, manual_path)
+                except Exception:
+                    pass
+                return False, (
+                    f"hipcc compilation failed. Ported kernel saved to {manual_path}.\n"
+                    f"To compile manually: hipcc -o /tmp/{kernel_name} {manual_path} -std=c++17 -O2\n"
+                    f"Then run: /tmp/{kernel_name}"
+                )
         else:
             # hipcc not found via paths — save ported kernel for manual compilation
             # Save to persistent location (not temp dir which gets cleaned up)
