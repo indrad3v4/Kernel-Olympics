@@ -43,6 +43,7 @@ git clone https://github.com/indrad3v4/Kernel-Olympics.git
 cd Kernel-Olympics
 pip install -r requirements.txt
 python3 src/main.py --input sample_kernels/cuda/warp_reduce.cu
+python3 src/main.py --input sample_kernels/cuda/new_kernel.cu
 ```
 
 ## Why This Matters
