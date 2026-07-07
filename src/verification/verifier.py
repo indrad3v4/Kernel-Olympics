@@ -121,13 +121,21 @@ class VerificationAgent:
             except (subprocess.TimeoutExpired, FileNotFoundError) as e:
                 return False, str(e)
         else:
-            # hipcc not available — return a descriptive message
-            return False, (
-                "hipcc not found locally. This is expected — compilation happens "
-                "on AMD Developer Cloud GPU instance.\n"
-                "In production: ssh to AMD instance → compile with hipcc → return result.\n"
-                "For demo: we provide a pre-recorded compilation + execution log."
+            # hipcc not found via paths — save ported kernel for manual compilation
+            # (HF workspace provides hipcc only in interactive shell, not subprocesses)
+            manual_path = build_dir / f"{kernel_name}.hip.cpp"
+            try:
+                # Copy the harness file so user can manually compile
+                import shutil
+                shutil.copy2(harness_file, manual_path)
+            except Exception:
+                pass
+            msg = (
+                f"hipcc not found in subprocess. Ported kernel saved to {manual_path}.\n"
+                f"To compile manually: hipcc -o {kernel_name} {manual_path} -std=c++17 -O2\n"
+                f"Then run: ./{kernel_name}"
             )
+            return False, msg
 
     def _run(self, build_dir: Path, kernel_name: str) -> tuple:
         """Run the compiled HIP kernel."""
