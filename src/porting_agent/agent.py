@@ -111,7 +111,11 @@ Output format: JSON with:
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     result = _json.loads(resp.read())
                 content = result["choices"][0]["message"]["content"]
-                return _json.loads(content)
+                parsed = _json.loads(content)
+                # Post-process: fix AMD-specific issues in ported code
+                if "ported_code" in parsed:
+                    parsed["ported_code"] = self._fix_ported_code(parsed["ported_code"])
+                return parsed
             except Exception:
                 continue  # Try next model
 
@@ -147,6 +151,22 @@ Output format: JSON with:
 
         # All models failed — use template fallback
         return self._template_port(source_code, cached_pattern)
+
+    @staticmethod
+    def _fix_ported_code(code: str) -> str:
+        """Post-process ported code to fix common AMD-specific issues.
+        
+        Fixes:
+        - 32-bit __shfl mask → 64-bit for wavefront64
+        """
+        import re
+        # Fix: 0xffffffff (32-bit mask) → 0xffffffffffffffffULL (64-bit) in __shfl_*_sync calls
+        code = re.sub(
+            r'(?<=__shfl_\w+_sync\()0x[fF]{8}(?=\s*,)',
+            '0xffffffffffffffffULL',
+            code
+        )
+        return code
 
     def _template_port(self, source_code: str,
                        cached_pattern: Optional[Dict] = None) -> Dict:
@@ -260,6 +280,13 @@ Output format: JSON with:
             if shfl_down_re.search(line):
                 if "shfl_down" not in str(changes):
                     changes.append("__shfl_down_sync: verify offsets work with wavefront64 (64 lanes, offset must be power of two)")
+            
+            # Fix 8i: 32-bit mask → 64-bit mask for AMD wavefront64
+            mask_line = re.sub(r'(?<=__shfl_\w+_sync\()0x[fF]{8}(?=\s*,)', '0xffffffffffffffffULL', line)
+            if mask_line != line:
+                line = mask_line
+                if "mask_64bit" not in str(changes):
+                    changes.append("__shfl_*_sync: mask 0xffffffff → 0xffffffffffffffffULL (64-bit for wavefront64)")
 
             # Fix 9: __activemask() → __ballot_sync(0xffffffff, 1) on HIP
             if activemask_re.search(line):
