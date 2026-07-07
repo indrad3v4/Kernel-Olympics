@@ -115,8 +115,11 @@ Output format: JSON with:
         tile_32_re = re.compile(r'(tile\[)\s*32(\s*\]\[)\s*32(\s*\])')
         blockidx_32_re = re.compile(r'(blockIdx\.[xy])\s*\*\s*32\s*\+')
         syncwarp_re = re.compile(r'__syncwarp\(\)')
-        warp_size_re = re.compile(r'const\s+int\s+WARP_SIZE\s*=\s*32')
+        warp_size_re = re.compile(r'(?:const\s+)?int\s+WARP_SIZE\s*=\s*32')
+        warp_size_define_re = re.compile(r'#define\s+WARP_SIZE\s+32\b')
         ballot_re = re.compile(r'__ballot_sync\(0xffffffff')
+        shfl_xor_re = re.compile(r'__shfl_xor_sync\s*\(')
+        threadidx_32_re = re.compile(r'(threadIdx\.[xy]\s*\*\s*)32(\b)')
 
         for line in lines:
             stripped = line.strip()
@@ -151,13 +154,29 @@ Output format: JSON with:
             if '0x1f' in line and not stripped.startswith('//'):
                 line = line.replace('0x1f', '0x3f')
 
-            # Fix 7: Hardcoded WARP_SIZE = 32
+            # Fix 7: Hardcoded WARP_SIZE = 32 (with or without const)
             line = warp_size_re.sub('const int WAVEFRONT_SIZE = 64  // AMD wavefront', line)
+            
+            # Fix 7b: #define WARP_SIZE 32 (preprocessor macro style)
+            if '#define WARP_SIZE' in line and warp_size_define_re.search(line):
+                line = warp_size_define_re.sub('#define WAVEFRONT_SIZE 64  // AMD wavefront', line)
+                if '#define WAVEFRONT_SIZE 64' not in ' '.join(changes):
+                    changes.append("#define WARP_SIZE 32 → #define WAVEFRONT_SIZE 64")
 
-            # Fix 8: __ballot_sync — add annotation
+            # Fix 8: __ballot_sync — fix mask and annotate
             if ballot_re.search(line):
+                line = ballot_re.sub('__ballot_sync(0x3f  // wavefront64 mask 64 lanes', line)
                 if "ballot_sync mask" not in str(changes):
-                    changes.append("__ballot_sync mask: verify wavefront64 compatibility")
+                    changes.append("__ballot_sync mask 0x1f→0x3f for wavefront64")
+            
+            # Fix 8b: __shfl_xor_sync — annotate as wavefront-dependent
+            if shfl_xor_re.search(line):
+                # Safest auto-fix: add comment; actual offset fix is algorithm-dependent
+                if "shfl_xor" not in str(changes):
+                    changes.append("__shfl_xor_sync: verify XOR offsets work with wavefront64 (64 lanes, not 32)")
+            
+            # Fix 8c: threadIdx.* 32 pattern (pointer arithmetic, e.g., &shared[threadIdx.y * 32])
+            line = threadidx_32_re.sub(r'\1 WAVEFRONT_SIZE ', line)
 
             # Track what changed
             if line != original:
@@ -169,6 +188,8 @@ Output format: JSON with:
                         changes.append("blockIdx.*32 → blockIdx.*WAVEFRONT_SIZE")
                     elif 'tile' in original:
                         changes.append("tile[32][32] → tile[WAVEFRONT_SIZE][WAVEFRONT_SIZE]")
+                    elif 'threadIdx' in original and '* 32' in original:
+                        changes.append("threadIdx.*32 → threadIdx.*WAVEFRONT_SIZE in pointer arithmetic")
                 if '0x3f' in line and '0x1f' in original:
                     changes.append("Warp mask 0x1f (32) → 0x3f (64) for wavefront64")
                 if 'WAVEFRONT_SIZE = 64' in line and 'WARP_SIZE' in original:
