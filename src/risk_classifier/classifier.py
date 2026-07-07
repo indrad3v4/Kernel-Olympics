@@ -44,6 +44,26 @@ DANGER_PATTERNS = [
         r"__syncwarp\s*\(",
         "__syncwarp() — semantics differ between CUDA and HIP; use __syncthreads() instead"
     ),
+    (
+        "activemask",
+        r"__activemask\s*\(",
+        "__activemask() — CUDA-specific; use __ballot_sync(0xffffffff, 1) for HIP"
+    ),
+    (
+        "all_any_sync",
+        r"__(?:all|any)_sync\s*\(",
+        "__all_sync/__any_sync — warp-level vote functions need adaptation for wavefront64 (64 lanes)"
+    ),
+    (
+        "match_all_sync",
+        r"__match_all_sync\s*\(",
+        "__match_all_sync — no direct HIP equivalent; may need algorithm redesign for wavefront64"
+    ),
+    (
+        "warp_lane_shift",
+        r"threadIdx\.[xy]\s*>>\s*5\b",
+        "threadIdx.x >> 5 computes warp index assuming 32-lane warps — use >> 6 for wavefront64"
+    ),
 ]
 
 
@@ -111,8 +131,8 @@ class RiskClassifier:
 
     def _severity(self, pattern_name: str) -> str:
         """Determine severity of a pattern match."""
-        high_severity = {"shfl_down_sync", "shfl_xor_sync"}
-        medium_severity = {"warp_size_constant", "shared_mem_warp_tiling"}
+        high_severity = {"shfl_down_sync", "shfl_xor_sync", "match_all_sync"}
+        medium_severity = {"warp_size_constant", "shared_mem_warp_tiling", "all_any_sync", "activemask", "warp_lane_shift"}
         if pattern_name in high_severity:
             return "high"
         elif pattern_name in medium_severity:

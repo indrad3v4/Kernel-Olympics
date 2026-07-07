@@ -23,7 +23,7 @@ from pathlib import Path
 
 REPO_URL = "https://github.com/indrad3v4/Kernel-Olympics.git"
 WORK_DIR = Path("/workspace/kernel-olympics")
-FIREWORKS_KEY = "fw_6EUF4TWNXFn6Gwvekwgnpt"
+FIREWORKS_KEY = os.environ.get("FIREWORKS_API_KEY", "")  # Set via environment variable!
 
 def run(cmd, cwd=None):
     print(f"  $ {cmd}")
