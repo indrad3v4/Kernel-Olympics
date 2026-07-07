@@ -129,7 +129,7 @@ class KernelOlympics:
         scan_results = self.scanner.scan_batch(input_paths)
         for r in scan_results:
             cov = r.get('hipify_coverage_pct', 0)
-            ok = cov > 50
+            ok = cov > 80 #50 is a little low, I wouldn't trust an AI written kernel
             self.disp.file_done(Path(r['file']).name, f"coverage: {cov}%", ok=ok)
         self.disp.status("Scanning", f"{len(scan_results)} files scanned", ok=True)
 
