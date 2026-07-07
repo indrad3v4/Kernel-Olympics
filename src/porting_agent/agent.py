@@ -111,11 +111,22 @@ Output format: JSON with:
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     result = _json.loads(resp.read())
                 content = result["choices"][0]["message"]["content"]
-                parsed = _json.loads(content)
-                # Post-process: fix AMD-specific issues in ported code
-                if "ported_code" in parsed:
-                    parsed["ported_code"] = self._fix_ported_code(parsed["ported_code"])
-                return parsed
+                try:
+                    parsed = _json.loads(content)
+                    if "ported_code" in parsed:
+                        parsed["ported_code"] = self._fix_ported_code(parsed["ported_code"])
+                    return parsed
+                except _json.JSONDecodeError:
+                    # LLM returned text, not JSON — extract code, use template fallback
+                    code_text = self._extract_code_from_text(content)
+                    if code_text:
+                        return {
+                            "ported_code": self._fix_ported_code(code_text),
+                            "confidence": 70,
+                            "changes": ["LLM returned text — extracted code block"],
+                            "explanation": "Code extracted from LLM text output"
+                        }
+                    raise
             except Exception:
                 continue  # Try next model
 
@@ -145,12 +156,48 @@ Output format: JSON with:
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     result = _json.loads(resp.read())
                 content = result["choices"][0]["message"]["content"]
-                return _json.loads(content)
+                try:
+                    parsed = _json.loads(content)
+                    if "ported_code" in parsed:
+                        parsed["ported_code"] = self._fix_ported_code(parsed["ported_code"])
+                    return parsed
+                except _json.JSONDecodeError:
+                    code_text = self._extract_code_from_text(content)
+                    if code_text:
+                        return {
+                            "ported_code": self._fix_ported_code(code_text),
+                            "confidence": 70,
+                            "changes": ["DeepSeek returned text — extracted code"],
+                            "explanation": "Code extracted from DeepSeek text output"
+                        }
+                    raise
             except Exception:
                 pass  # Fall through to template
 
         # All models failed — use template fallback
-        return self._template_port(source_code, cached_pattern)
+        result = self._template_port(source_code, cached_pattern)
+        if "ported_code" in result:
+            result["ported_code"] = self._fix_ported_code(result["ported_code"])
+        return result
+
+    @staticmethod
+    def _extract_code_from_text(text: str) -> str:
+        """Extract HIP/CUDA code from LLM text output (non-JSON responses)."""
+        import re
+        # Try markdown code blocks with any language
+        blocks = re.findall(r'```(?:\w+)?\n(.*?)```', text, re.DOTALL)
+        if blocks:
+            # Pick the longest block (usually the real code)
+            return max(blocks, key=len).strip()
+        # Try to find __global__ kernel definition
+        match = re.search(r'(__global__\s+void\s+\w+\s*\(.*?)(?=\n\n|\Z)', text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        # Try to find from #include to end
+        match = re.search(r'(#include\s+<.*)', text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return ""
 
     @staticmethod
     def _fix_ported_code(code: str) -> str:
