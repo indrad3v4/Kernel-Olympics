@@ -50,3 +50,4 @@ sample_kernels/
 ├── hip/                # Expected/output HIP kernels
 └── reference/          # Known-good CUDA outputs for diff
 ```
+# CI/CD test trigger
