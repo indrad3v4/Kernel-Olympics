@@ -57,13 +57,11 @@ python3 src/main.py --input sample_kernels/cuda/new_kernel.cu
 | Role | Member |
 |------|--------|
 | AI Architect | [indradev_](https://github.com/indrad3v4) |
-| AMD/ROCm Engineering | Satoru |
+| AMD/ROCm Engineering | Aahil-Riyaz |
 | Kernel Engineering | Bromine185 |
-| ML Pipeline | Aahil-Riyaz |
 | CI/CD & Testing | meteorite67 |
-| Infrastructure | icodemun44 |
+| Infrastructure | Icodemun44 |
 | QA | _dD |
-| Full Stack | icodemun44 |
 
 **Built in 5 days for AMD Developer Hackathon ACT II — Track 3 (Unicorn).**
 
