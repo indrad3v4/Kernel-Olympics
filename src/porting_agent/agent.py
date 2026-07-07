@@ -45,9 +45,10 @@ Output format: JSON with:
 """
 
     FALLBACK_MODELS = [
-        "accounts/fireworks/models/kimi-k2p6",          # 1st: Kimi (works ✅)
-        "accounts/fireworks/models/glm-5p2",             # 2nd: GLM (works ✅)
-        "accounts/fireworks/models/llama-v3p3-70b-instruct",  # 3rd: Llama (may work)
+        "accounts/fireworks/models/kimi-k2p6",                   # 1st: Kimi (works ✅)
+        "accounts/fireworks/models/glm-5p2",                      # 2nd: GLM (works ✅)
+        "accounts/fireworks/models/deepseek-v4-pro",              # 3rd: DeepSeek (works ✅)
+        "accounts/fireworks/models/llama-v3p3-70b-instruct",      # 4th: Llama (may work)
     ]
 
     def __init__(self, api_key: Optional[str] = None, model: str = "accounts/fireworks/models/kimi-k2p6",
