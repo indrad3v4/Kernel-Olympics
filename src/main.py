@@ -150,7 +150,8 @@ class KernelOlympics:
                 levels = ", ".join(f"[{f['severity']}] L{f['line']}: {f['pattern']}" for f in findings[:3])
                 self.disp.file_done(Path(cr['file']).name, levels, ok=cr.get("risk_level") != "red")
         self.disp.status("Classifying", f"RED: {len(red)}  YELLOW: {len(ylw)}  GREEN: {len(classifier_results)-len(red)-len(ylw)}")
-
+#since there is a potential correlation between coverage and the ris k atribution, maybe we can try to make the risk assesment dynamic later on if we get some good runs. 
+        
         # Phase 3: Pattern Memory
         self.disp.phase("Memory Cache", "🧠")
         pipeline_state["patterns_before"] = self.memory.count()
