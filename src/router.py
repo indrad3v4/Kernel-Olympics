@@ -28,11 +28,10 @@ MODEL_CATALOG = {
         "cost_per_1k": 0.00095,
     },
     "glm": {
-        "id": "accounts/fireworks/models/glm-5-2",
+        "id": "accounts/fireworks/models/glm-5p2",  # ✅ VERIFIED WORKING
         "role": "coder",
         "strength": "accurate code generation, struct understanding",
         "cost_per_1k": 0.0014,
-        "note": "Need model ID from Fireworks UI — click on model"
     },
     "gemma4": {
         "id": "accounts/fireworks/models/gemma-4-31b-it",
