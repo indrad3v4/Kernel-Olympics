@@ -125,6 +125,8 @@ Output format: JSON with:
         tid_warp_mask_re = re.compile(r'(tid\s*&\s*)0x1[fF](\s*\)?\s*==\s*0\b)')
         blockidx_tile_re = re.compile(r'(blockIdx\.[xy]\s*\*\s*)TILE_SIZE')
         shfl_down_re = re.compile(r'__shfl_down_sync\s*\(')
+        shfl_up_re = re.compile(r'__shfl_up_sync\s*\(')
+        activemask_re = re.compile(r'__activemask\s*\(\s*\)')
 
         for line in lines:
             stripped = line.strip()
@@ -206,6 +208,15 @@ Output format: JSON with:
                 if "shfl_down" not in str(changes):
                     changes.append("__shfl_down_sync: verify offsets work with wavefront64 (64 lanes, offset must be power of two)")
 
+            # Fix 8i: __shfl_up_sync — same offset danger as shfl_down, annotate
+            if shfl_up_re.search(line):
+                if "shfl_up" not in str(changes):
+                    changes.append("__shfl_up_sync: verify offsets work with wavefront64 (64 lanes, offset must be power of two)")
+
+            # Fix 8j: __activemask() — 32-bit mask can't represent all 64 wavefront lanes, annotate
+            if activemask_re.search(line):
+                if "activemask" not in str(changes):
+                    changes.append("__activemask(): 32-bit mask cannot represent all 64 wavefront lanes — verify downstream lane-mask logic")
 
             # Track what changed
             if line != original:

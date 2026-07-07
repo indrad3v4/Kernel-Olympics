@@ -10,6 +10,8 @@ P2: __shfl_down_sync with offset > 1 (assumes 32-lane warp)
 P3: __shfl_xor_sync (butterfly) patterns
 P4: warp-size-dependent shared memory tiling
 P5: __syncwarp() usage (semantics differ on AMD)
+P6: __shfl_up_sync (upward lane shift, assumes 32-lane warp)
+P7: __activemask() (32-bit lane mask, can't represent 64-lane wavefront)
 """
 
 import re
@@ -43,6 +45,18 @@ DANGER_PATTERNS = [
         "syncwarp",
         r"__syncwarp\s*\(",
         "__syncwarp() — semantics differ between CUDA and HIP; use __syncthreads() instead"
+    ),
+    (
+        "shfl_up_sync",
+        r"__shfl_up_sync\s*\(",
+        "__shfl_up_sync (upward lane shift) — warp-size-dependent offset, "
+        "will silently shift from the wrong lane on wavefront64"
+    ),
+    (
+        "activemask",
+        r"__activemask\s*\(\s*\)",
+        "__activemask() returns a 32-bit lane mask — cannot represent all 64 lanes "
+        "of an AMD wavefront, so lanes 32-63 are silently dropped from the mask"
     ),
 ]
 
@@ -111,8 +125,8 @@ class RiskClassifier:
 
     def _severity(self, pattern_name: str) -> str:
         """Determine severity of a pattern match."""
-        high_severity = {"shfl_down_sync", "shfl_xor_sync"}
-        medium_severity = {"warp_size_constant", "shared_mem_warp_tiling"}
+        high_severity = {"shfl_down_sync", "shfl_xor_sync", "shfl_up_sync"}
+        medium_severity = {"warp_size_constant", "shared_mem_warp_tiling", "activemask"}
         if pattern_name in high_severity:
             return "high"
         elif pattern_name in medium_severity:

@@ -7,10 +7,10 @@ from risk_classifier.classifier import RiskClassifier, DANGER_PATTERNS
 
 
 def test_classifier_init():
-    """Classifier should initialize with 5 patterns loaded."""
+    """Classifier should initialize with 7 patterns loaded."""
     c = RiskClassifier()
-    assert len(c.patterns) == 5
-    assert len(c.pattern_counters) == 5
+    assert len(c.patterns) == 7
+    assert len(c.pattern_counters) == 7
     assert c.total_scans == 0
 
 
@@ -37,7 +37,7 @@ def test_classify_red_kernel_warp():
     result = c.classify(warp_source, "warp_reduce.cu")
     assert result["risk_level"] == "red", f"Expected RED, got {result['risk_level']}"
     assert len(result["findings"]) >= 3
-    assert result["total_patterns_checked"] == 5
+    assert result["total_patterns_checked"] == 7
 
 
 def test_classify_yellow_kernel_transpose():
@@ -83,13 +83,75 @@ def test_findings_have_context():
 
 
 def test_severity_mapping():
-    """High severity: shfl_down_sync, shfl_xor_sync. Medium: warp_size, shared_mem."""
+    """High severity: shfl_down_sync, shfl_xor_sync, shfl_up_sync. Medium: warp_size, shared_mem, activemask."""
     c = RiskClassifier()
     assert c._severity("shfl_down_sync") == "high"
     assert c._severity("shfl_xor_sync") == "high"
+    assert c._severity("shfl_up_sync") == "high"
     assert c._severity("warp_size_constant") == "medium"
     assert c._severity("shared_mem_warp_tiling") == "medium"
+    assert c._severity("activemask") == "medium"
     assert c._severity("syncwarp") == "low"
+
+
+def test_classify_shfl_up_sync():
+    """__shfl_up_sync should be detected as a high-severity finding."""
+    code = """
+__global__ void scan_kernel(float* data) {
+    int lane = threadIdx.x % 32;
+    float val = data[threadIdx.x];
+    float n = __shfl_up_sync(0xffffffff, val, 1);
+    if (lane >= 1) val += n;
+    data[threadIdx.x] = val;
+}
+"""
+    c = RiskClassifier()
+    result = c.classify(code, "scan.cu")
+    patterns_found = {f["pattern"] for f in result["findings"]}
+    assert "shfl_up_sync" in patterns_found
+    up_findings = [f for f in result["findings"] if f["pattern"] == "shfl_up_sync"]
+    assert up_findings[0]["severity"] == "high"
+    assert result["risk_level"] == "red"
+
+
+def test_classify_activemask():
+    """__activemask() should be detected as a medium-severity finding."""
+    code = """
+__global__ void mask_kernel(float* data) {
+    unsigned mask = __activemask();
+    data[threadIdx.x] = (float)mask;
+}
+"""
+    c = RiskClassifier()
+    result = c.classify(code, "mask.cu")
+    patterns_found = {f["pattern"] for f in result["findings"]}
+    assert "activemask" in patterns_found
+    mask_findings = [f for f in result["findings"] if f["pattern"] == "activemask"]
+    assert mask_findings[0]["severity"] == "medium"
+
+
+def test_activemask_does_not_false_positive_on_similar_names():
+    """A function that merely contains 'mask' in its name shouldn't trigger activemask."""
+    code = """
+__global__ void compute_mask_value(int* mask_array) {
+    mask_array[threadIdx.x] = threadIdx.x;
+}
+"""
+    c = RiskClassifier()
+    result = c.classify(code, "safe_mask.cu")
+    patterns_found = {f["pattern"] for f in result["findings"]}
+    assert "activemask" not in patterns_found
+
+
+def test_new_kernel_sample_classify_red():
+    """new_kernel.cu should be classified RED (shfl_up_sync + activemask)."""
+    source = open("sample_kernels/cuda/new_kernel.cu").read()
+    c = RiskClassifier()
+    result = c.classify(source, "new_kernel.cu")
+    assert result["risk_level"] == "red", f"Expected RED, got {result['risk_level']}"
+    patterns_found = {f["pattern"] for f in result["findings"]}
+    assert "shfl_up_sync" in patterns_found
+    assert "activemask" in patterns_found
 
 
 def test_pattern_counter_tracking():
