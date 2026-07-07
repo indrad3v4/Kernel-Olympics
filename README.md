@@ -57,7 +57,7 @@ python3 src/main.py --input sample_kernels/cuda/new_kernel.cu
 | Role | Member |
 |------|--------|
 | AI Architect | [indradev_](https://github.com/indrad3v4) |
-| AMD/ROCm Engineering | Aahil-Riyaz |
+| AMD/ROCm Engineering | Aahil-Riyaz (Satoru) |
 | Kernel Engineering | Bromine185 |
 | CI/CD & Testing | meteorite67 |
 | Infrastructure | Icodemun44 |
