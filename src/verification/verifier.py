@@ -120,7 +120,7 @@ class VerificationAgent:
                 return result.returncode == 0, result.stdout + result.stderr
             except (subprocess.TimeoutExpired, FileNotFoundError) as e:
                 # Save ported kernel for manual compilation
-                manual_dir = Path("/workspace/Kernel-Olympics/ported_kernels")
+                manual_dir = Path.cwd() / "ported_kernels"
                 manual_dir.mkdir(parents=True, exist_ok=True)
                 manual_path = manual_dir / f"{kernel_name}.hip.cpp"
                 try:
@@ -136,7 +136,7 @@ class VerificationAgent:
         else:
             # hipcc not found via paths — save ported kernel for manual compilation
             # Save to persistent location (not temp dir which gets cleaned up)
-            manual_dir = Path("/workspace/Kernel-Olympics/ported_kernels")
+            manual_dir = Path.cwd() / "ported_kernels"
             manual_dir.mkdir(parents=True, exist_ok=True)
             manual_path = manual_dir / f"{kernel_name}.hip.cpp"
             try:
