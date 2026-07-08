@@ -117,6 +117,30 @@ class PatternMemory:
 
         return pattern_id
 
+    def store_negative(self, pattern_snippet: str, error_message: str = "",
+                       llm_time_s: Optional[float] = None) -> None:
+        """Record a failed verification. Deprioritizes this pattern in retrieve()."""
+        pattern_id = hashlib.sha256(pattern_snippet.encode()).hexdigest()[:12]
+        existing = self._cur.execute(
+            "SELECT failure_count FROM patterns WHERE pattern_id = ?",
+            (pattern_id,)
+        ).fetchone()
+        if existing:
+            self._cur.execute(
+                "UPDATE patterns SET failure_count = failure_count + 1, updated_at = ? WHERE pattern_id = ?",
+                (time.time(), pattern_id)
+            )
+        else:
+            self._cur.execute(
+                """INSERT OR IGNORE INTO patterns
+                   (pattern_id, snippet_hash, pattern_snippet, verified_fix, confidence,
+                    failure_count, created_at, updated_at)
+                   VALUES (?, ?, ?, '', 0.0, 1, ?, ?)""",
+                (pattern_id, hashlib.sha256(pattern_snippet.encode()).hexdigest(),
+                 pattern_snippet[:500], time.time(), time.time())
+            )
+        self._conn.commit()
+
     def retrieve(self, query_snippet: str, threshold: float = 0.25,
                  signature: Optional[str] = None) -> Optional[Dict]:
         """Fast trigram-based retrieval with optional exact-signature short-circuit.
@@ -247,6 +271,7 @@ class PatternMemory:
                 snippet TEXT,
                 verified_fix TEXT,
                 confidence REAL,
+                failure_count INTEGER DEFAULT 0,
                 llm_time_s REAL DEFAULT 0,
                 times_retrieved INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
