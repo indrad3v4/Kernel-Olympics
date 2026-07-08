@@ -4,9 +4,9 @@
 
 <div align="center">
 
-[![AMD Compatible](docs/amd-compatible.svg)](https://github.com/indrad3v4/Kernel-Olympics)
-[![CI](https://github.com/indrad3v4/Kernel-Olympics/actions/workflows/ci.yml/badge.svg)](https://github.com/indrad3v4/Kernel-Olympics/actions)
-[![License: MIT](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
+[![AMD Compatible](https://img.shields.io/badge/AMD-COMPATIBLE%20✓-ed1c24?style=flat&logo=amd)](https://github.com/indrad3v4/Kernel-Olympics)
+[![CI](https://github.com/indrad3v4/Kernel-Olympics/actions/workflows/ci.yml/badge.svg?style=flat)](https://github.com/indrad3v4/Kernel-Olympics/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-purple.svg?style=flat)](LICENSE)
 
 </div>
 
