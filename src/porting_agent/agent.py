@@ -292,12 +292,12 @@ Put ONLY the ```json ... ``` block in your response — no surrounding prose.
         blocks = re.findall(r'```\n(.*?)```', text, re.DOTALL)
         if blocks:
             return PortingAgent._strip_prose_lines(max(blocks, key=len).strip())
-        # Try to find __global__ kernel definition
-        match = re.search(r'(__global__\s+void\s+\w+\s*\(.*?)(?=\n\n|\Z)', text, re.DOTALL)
+        # Try to find from #include to end (BEFORE __global__ — includes headers)
+        match = re.search(r'(#include\s+<.*)', text, re.DOTALL)
         if match:
             return PortingAgent._strip_prose_lines(match.group(1).strip())
-        # Try to find from #include to end, then strip prose
-        match = re.search(r'(#include\s+<.*)', text, re.DOTALL)
+        # Try to find __global__ kernel definition (fallback)
+        match = re.search(r'(__global__\s+void\s+\w+\s*\(.*?)(?=\n\n|\Z)', text, re.DOTALL)
         if match:
             return PortingAgent._strip_prose_lines(match.group(1).strip())
         # Look for __device__ function definitions
