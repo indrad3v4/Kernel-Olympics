@@ -568,27 +568,19 @@ int main() {{
 
     def _check_hipcc(self) -> bool:
         """Check if hipcc is available on this system (any known path)."""
-        candidates = ["hipcc", "/opt/rocm/bin/hipcc", "/opt/rocm/lib/llvm/bin/hipcc",
-                       "/opt/rocm-7.2.1/bin/hipcc", "/opt/rocm-7.2.1/lib/llvm/bin/hipcc",
-                       "/usr/bin/hipcc"]
-        for cmd in candidates:
+        # First: try direct subprocess (fastest)
+        for cmd in ["hipcc", "/opt/rocm/bin/hipcc", "/opt/rocm/lib/llvm/bin/hipcc",
+                     "/opt/rocm-7.2.1/bin/hipcc", "/opt/rocm-7.2.1/lib/llvm/bin/hipcc",
+                     "/usr/bin/hipcc"]:
             try:
                 result = subprocess.run([cmd, "--version"], capture_output=True, text=True, timeout=5)
                 if result.returncode == 0:
                     self._hipcc_path = cmd
                     return True
-            except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-                print(f"║ ⚠️ hipcc candidate '{cmd}' not available: {e}")
+            except (FileNotFoundError, subprocess.TimeoutExpired):
                 continue
-        try:
-            result = subprocess.run("which hipcc 2>/dev/null || command -v hipcc 2>/dev/null",
-                                    shell=True, capture_output=True, text=True, timeout=5)
-            if result.stdout.strip():
-                self._hipcc_path = result.stdout.strip()
-                return True
-        except subprocess.TimeoutExpired:
-            print("║ ⚠️ 'which hipcc' timed out — continuing")
-            pass
+
+        # Second: try with shell=True (handles Jupyter's PATH)
         try:
             result = subprocess.run("hipcc --version", shell=True,
                                     capture_output=True, text=True, timeout=5)
@@ -596,8 +588,19 @@ int main() {{
                 self._hipcc_path = "hipcc"
                 return True
         except subprocess.TimeoutExpired:
-            print("║ ⚠️ 'hipcc --version' (shell) timed out — continuing")
             pass
+
+        # Third: search via shell PATH
+        try:
+            result = subprocess.run("command -v hipcc 2>/dev/null || which hipcc 2>/dev/null",
+                                    shell=True, capture_output=True, text=True, timeout=5)
+            if result.stdout.strip():
+                self._hipcc_path = result.stdout.strip()
+                return True
+        except subprocess.TimeoutExpired:
+            pass
+
+        # Fourth: glob search
         import glob
         for match in glob.glob("/opt/rocm*/**/hipcc", recursive=True):
             self._hipcc_path = match
