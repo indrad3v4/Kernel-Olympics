@@ -172,7 +172,8 @@ Output format: JSON with:
                 )
                 timeout = 60 if model == models_to_try[0] else 15
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    result = _json.loads(resp.read())
+                    raw_body = resp.read()
+                    result = _json.loads(raw_body)
                 content = result["choices"][0]["message"]["content"]
                 try:
                     parsed = _json.loads(content)
@@ -190,8 +191,12 @@ Output format: JSON with:
                             "explanation": "Code extracted from LLM text output"
                         }
                     raise
+            except urllib.request.HTTPError as e:
+                err_body = e.read().decode(errors='replace')[:200]
+                print(f"║ ⏱️ Model {model} returned HTTP {e.code}: {err_body}")
+                continue
             except Exception as e:
-                print(f"║ ⏱️ Model {model} failed in <5s: {e}")
+                print(f"║ ⏱️ Model {model} failed: {str(e)[:120]}")
                 continue  # Try next model
 
         # All Fireworks models timed out → skip DeepSeek, go straight to template
