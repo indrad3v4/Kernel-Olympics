@@ -64,6 +64,11 @@ DANGER_PATTERNS = [
         r"threadIdx\.[xy]\s*>>\s*5\b",
         "threadIdx.x >> 5 computes warp index assuming 32-lane warps — use >> 6 for wavefront64"
     ),
+    (
+        "shfl_up_sync",
+        r"__shfl_up_sync\s*\(",
+        "__shfl_up_sync (upward shuffle) — assumes 32-lane warp, offsets silently wrong on wavefront64"
+    ),
 ]
 
 
@@ -131,7 +136,7 @@ class RiskClassifier:
 
     def _severity(self, pattern_name: str) -> str:
         """Determine severity of a pattern match."""
-        high_severity = {"shfl_down_sync", "shfl_xor_sync", "match_all_sync"}
+        high_severity = {"shfl_down_sync", "shfl_xor_sync", "shfl_up_sync", "match_all_sync"}
         medium_severity = {"warp_size_constant", "shared_mem_warp_tiling", "all_any_sync", "activemask", "warp_lane_shift"}
         if pattern_name in high_severity:
             return "high"

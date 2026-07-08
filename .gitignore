@@ -1,13 +1,20 @@
-.env
+# Build artifacts
+ported_kernels/
+data/
 __pycache__/
 *.pyc
-.venv/
 *.egg-info/
-dist/
-build/
-data/pattern_memory.json
-*.db
-*.log
-portability_report.json
-demo_report.json
-data/
+
+# Reports
+*.json
+!sample_kernels/reference/*_output.txt
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,73 @@
+version: "3.9"
+
+services:
+  # ── Core Pipeline (no GPU) ──
+  pipeline:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kernel-olympics:latest
+    command: ["--input", "sample_kernels/cuda/warp_reduce.cu"]
+    volumes:
+      - ./portability_report.json:/app/portability_report.json
+      - ./ported_kernels:/app/ported_kernels
+    environment:
+      - FIREWORKS_API_KEY=${FIREWORKS_API_KEY:-}
+      - PYTHONPATH=/app/src
+
+  # ── Demo: second kernel speedup ──
+  demo:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kernel-olympics:latest
+    command: ["--demo"]
+    volumes:
+      - ./demo_report.json:/app/demo_report.json
+    environment:
+      - FIREWORKS_API_KEY=${FIREWORKS_API_KEY:-}
+      - PYTHONPATH=/app/src
+
+  # ── Full pipeline on all sample kernels ──
+  full-scan:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kernel-olympics:latest
+    command: ["--input", "sample_kernels/cuda/warp_reduce.cu", "sample_kernels/cuda/transpose.cu", "sample_kernels/cuda/histogram.cu", "sample_kernels/cuda/softmax.cu", "sample_kernels/cuda/conv2d.cu", "sample_kernels/cuda/new_kernel.cu"]
+    volumes:
+      - ./portability_report.json:/app/portability_report.json
+      - ./ported_kernels:/app/ported_kernels
+    environment:
+      - FIREWORKS_API_KEY=${FIREWORKS_API_KEY:-}
+      - PYTHONPATH=/app/src
+
+  # ── AMD GPU Verification (requires ROCm host) ──
+  verify:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: kernel-olympics:latest
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        python3 src/main.py --input sample_kernels/cuda/warp_reduce.cu --output /tmp/report.json &&
+        cd /app/ported_kernels &&
+        for f in *.hip.cpp; do
+          echo "=== Compiling $$f ===" &&
+          hipcc -o "/tmp/$$(basename $$f .hip.cpp)" "$$f" -std=c++17 -O2 --offload-arch=gfx942 &&
+          echo "=== Running $$f ===" &&
+          "/tmp/$$(basename $$f .hip.cpp)" || echo "FAILED"
+        done
+    volumes:
+      - ./portability_report.json:/app/portability_report.json
+      - ./ported_kernels:/app/ported_kernels
+    environment:
+      - FIREWORKS_API_KEY=${FIREWORKS_API_KEY:-}
+      - PYTHONPATH=/app/src
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    # Only works on ROCm hosts (AMD Developer Cloud, etc.)
+    profiles:
+      - gpu

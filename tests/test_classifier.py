@@ -7,10 +7,10 @@ from risk_classifier.classifier import RiskClassifier, DANGER_PATTERNS
 
 
 def test_classifier_init():
-    '''Classifier should initialize with 9 patterns loaded (5 original + 4 new).'''
+    '''Classifier should initialize with 10 patterns loaded.'''
     c = RiskClassifier()
-    assert len(c.patterns) == 9
-    assert len(c.pattern_counters) == 9
+    assert len(c.patterns) == 10
+    assert len(c.pattern_counters) == 10
     assert c.total_scans == 0
 
 
@@ -37,7 +37,7 @@ def test_classify_red_kernel_warp():
     result = c.classify(warp_source, "warp_reduce.cu")
     assert result["risk_level"] == "red", f"Expected RED, got {result['risk_level']}"
     assert len(result["findings"]) >= 3
-    assert result['total_patterns_checked'] == 9
+    assert result['total_patterns_checked'] == 10
 
 
 def test_classify_yellow_kernel_transpose():
@@ -83,10 +83,11 @@ def test_findings_have_context():
 
 
 def test_severity_mapping():
-    '''High: shfl_down_sync, shfl_xor_sync, match_all_sync. Medium: warp_size, shared_mem, all_any_sync, activemask, warp_lane_shift.'''
+    '''High: shfl_down_sync, shfl_xor_sync, shfl_up_sync, match_all_sync. Medium: warp_size, shared_mem, all_any_sync, activemask, warp_lane_shift.'''
     c = RiskClassifier()
     assert c._severity('shfl_down_sync') == 'high'
     assert c._severity('shfl_xor_sync') == 'high'
+    assert c._severity('shfl_up_sync') == 'high'
     assert c._severity('match_all_sync') == 'high'
     assert c._severity('warp_size_constant') == 'medium'
     assert c._severity('shared_mem_warp_tiling') == 'medium'
@@ -128,7 +129,7 @@ def test_classify_batch():
 
 
 def test_softmax_kernel_classify_red():
-    """softmax.cu should be classified RED (all 9 patterns triggered: activemask, all_any_sync, match_all_sync, warp_lane_shift, shfl_down_sync, shfl_xor_sync, warp_size_constant, syncwarp)."""
+    """softmax.cu should be classified RED (many patterns triggered)."""
     softmax_source = open("sample_kernels/cuda/softmax.cu").read()
     c = RiskClassifier()
     result = c.classify(softmax_source, "softmax.cu")
