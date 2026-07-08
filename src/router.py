@@ -212,7 +212,13 @@ class ModelRouter:
     @staticmethod
     def _fix_ported_code(code: str) -> str:
         """Fix AMD-specific issues in ported code."""
-        import re
+        # Replace CUDA headers with HIP equivalents
+        code = re.sub(r'#include\s*<cuda_runtime\.h>', '#include <hip/hip_runtime.h>', code)
+        code = re.sub(r'#include\s*<cuda_runtime_api\.h>', '#include <hip/hip_runtime.h>', code)
+        code = re.sub(r'#include\s*"cuda_runtime\.h"', '#include <hip/hip_runtime.h>', code)
+        # Remove device_launch_parameters.h — not needed in HIP
+        code = re.sub(r'#include\s*<device_launch_parameters\.h>\n?', '', code)
+        # Fix __shfl masks: 32-bit 0xffffffff → 64-bit for wavefront64
         code = re.sub(
             r'(__shfl_\w+_sync\()0x[fF]{8}(,)',
             r'\g<1>0xffffffffffffffffULL\g<2>',
@@ -623,13 +629,33 @@ class ModelRouter:
                             try: parsed = json.loads(m.group(1))
                             except: pass
                     if parsed is None:
-                        m = re.search(r'\{"pass":[^}]*\}', raw)
+                        # Strategy 3: find {"pass"... to end of response, try progressively
+                        m = re.search(r'\\{"pass"\\s*:', raw)
                         if m:
-                            try: parsed = json.loads(m.group(0))
+                            # Take from match to end, try to parse
+                            candidate = raw[m.start():]
+                            # Try full remainder
+                            try: parsed = json.loads(candidate)
                             except: pass
+                            # Try adding closing brace if truncated
+                            if parsed is None and not candidate.rstrip().endswith('}'):
+                                try: parsed = json.loads(candidate.rstrip() + '}')
+                                except: pass
+                            # Try finding balanced braces
+                            if parsed is None:
+                                depth = 0
+                                for ci, ch in enumerate(candidate):
+                                    if ch == '{': depth += 1
+                                    elif ch == '}':
+                                        depth -= 1
+                                        if depth == 0:
+                                            try: parsed = json.loads(candidate[:ci+1])
+                                            except: pass
+                                            break
                     if parsed is None:
                         result["changes"].append(
-                            f'[deepseek-orch] JSON parse error (iter {iteration}): raw={raw[:80]}')
+                            f'[deepseek-orch] JSON parse error (iter {iteration}): '
+                            f'raw[:200]={raw[:200]}')
                         break
 
                     if parsed.get("pass", False):
