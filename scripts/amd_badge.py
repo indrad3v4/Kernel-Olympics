@@ -1,62 +1,45 @@
 #!/usr/bin/env python3
-"""AMD Compatible Badge — generate an SVG badge for GitHub README.
+"""AMD Compatible Badge — shields.io style, matches CI badge.
 
 Usage:
-  python3 scripts/amd_badge.py --repo username/repo --output amd-compatible.svg
+  python3 scripts/amd_badge.py --output docs/amd-compatible.svg
+  # Then embed in README:
+  # ![AMD Compatible](docs/amd-compatible.svg)
 
-The badge shows "AMD Compatible ✅" with our MI300X proof.
-Embed in README with:
-  ![AMD Compatible](https://raw.githubusercontent.com/username/repo/main/docs/amd-compatible.svg)
+The badge uses shields.io visual style for consistency with CI badges.
 """
 
-import argparse
-import json
-import hashlib
 import os
-import sys
 
 
-BADGE_SVG = """<svg xmlns="http://www.w3.org/2000/svg" width="220" height="28" viewBox="0 0 220 28">
-  <defs>
-    <linearGradient id="amd" x1="0%" y1="0%" x2="100%" y2="0%">
-      <stop offset="0%" style="stop-color:#ED1C24"/>
-      <stop offset="100%" style="stop-color:#ED1C24"/>
-    </linearGradient>
-    <linearGradient id="ok" x1="0%" y1="0%" x2="100%" y2="0%">
-      <stop offset="0%" style="stop-color:#2EA44F"/>
-      <stop offset="100%" style="stop-color:#2EA44F"/>
-    </linearGradient>
-  </defs>
-  <rect x="0" y="0" width="100" height="28" fill="url(#amd)" rx="4" ry="4"/>
-  <rect x="100" y="0" width="120" height="28" fill="url(#ok)" rx="4" ry="4"/>
-  <text x="50" y="19" font-family="'DejaVu Sans',Arial,Helvetica,sans-serif"
-        font-size="12" font-weight="bold" fill="#fff"
-        text-anchor="middle" letter-spacing="0.5">AMD</text>
-  <text x="160" y="19" font-family="'DejaVu Sans',Arial,Helvetica,sans-serif"
-        font-size="12" font-weight="bold" fill="#fff"
-        text-anchor="middle" letter-spacing="0.3">COMPATIBLE ✓</text>
+BADGE_SVG = """<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="146" height="20" role="img" aria-label="AMD: COMPATIBLE&#10;verified on MI300X">
+  <title>AMD Compatible ✓ — verified on MI300X</title>
+  <linearGradient id="s" x2="0" y2="100%">
+    <stop offset="0" stop-color="#bbb" stop-opacity=".1"/>
+    <stop offset="1" stop-opacity=".1"/>
+  </linearGradient>
+  <clipPath id="r">
+    <rect width="146" height="20" rx="3" fill="#fff"/>
+  </clipPath>
+  <g clip-path="url(#r)">
+    <rect width="52" height="20" fill="#ed1c24"/>
+    <rect x="52" width="94" height="20" fill="#2ea44f"/>
+    <rect width="146" height="20" fill="url(#s)"/>
+  </g>
+  <g fill="#fff" text-anchor="middle" font-family="'DejaVu Sans',Verdana,Geneva,sans-serif" font-size="11">
+    <text x="26" y="14" font-weight="bold" letter-spacing=".5">AMD</text>
+    <text x="98" y="14" font-weight="bold">COMPATIBLE ✓</text>
+  </g>
 </svg>"""
 
 
-def generate_badge(repo: str, output: str) -> str:
-    """Generate an AMD Compatible badge SVG."""
-    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
-    with open(output, "w") as f:
-        f.write(BADGE_SVG)
-    return output
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Generate AMD Compatible badge")
-    parser.add_argument("--repo", help="GitHub repo name (e.g. user/repo)")
-    parser.add_argument("--output", default="docs/amd-compatible.svg",
-                        help="Output path for SVG badge")
-    args = parser.parse_args()
-
-    out = generate_badge(args.repo, args.output)
-    print(f"✅ Badge generated: {out}")
-    print(f"   Embed in README with:")
-    print(f'   ![AMD Compatible]({out})')
+    out = "docs/amd-compatible.svg"
+    os.makedirs("docs", exist_ok=True)
+    with open(out, "w") as f:
+        f.write(BADGE_SVG)
+    print(f"✅ Badge: {out}")
+    print(f"   Dimensions: 146x20 (matches shields.io)")
 
 
 if __name__ == "__main__":
