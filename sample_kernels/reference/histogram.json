@@ -1,0 +1,15 @@
+{
+  "kernel_name": "histogram_kernel",
+  "params": [
+    {"name": "input", "type": "const float*"},
+    {"name": "histogram", "type": "int*"},
+    {"name": "n", "type": "int"},
+    {"name": "num_bins", "type": "int"}
+  ],
+  "grid": [1, 1, 1],
+  "block": [256, 1, 1],
+  "dynamic_shared_mem": 1024,
+  "input_size": 256,
+  "input_value": 1.0,
+  "tolerance": 0.001
+}

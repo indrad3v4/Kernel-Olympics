@@ -1,0 +1,14 @@
+{
+  "kernel_name": "warp_reduce_kernel",
+  "params": [
+    {"name": "input", "type": "const float*"},
+    {"name": "output", "type": "float*"},
+    {"name": "n", "type": "int"}
+  ],
+  "grid": [4, 1, 1],
+  "block": [64, 1, 1],
+  "input_size": 256,
+  "input_value": 1.0,
+  "expected": [64.0, 64.0, 64.0, 64.0],
+  "tolerance": 0.001
+}
