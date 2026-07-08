@@ -57,11 +57,24 @@ KEY RULES:
 12. Lane identification: if (lane_id < 32) → if (lane_id < 64) for wavefront boundary
 13. __shfl_sync (basic shuffle) — mask and lane count must be adjusted for wavefront64
 
-Output format: JSON with:
-- "ported_code": the full ported kernel
+Output format: Return a JSON object inside a markdown ```json code block.
+The JSON must have these fields:
+- "ported_code": the full ported kernel (the code itself, NOT wrapped in extra markdown)
 - "confidence": 0-100 score
 - "changes": list of specific changes made
 - "explanation": short explanation of the fix
+
+Example:
+```json
+{
+  "ported_code": "__global__ void ...",
+  "confidence": 85,
+  "changes": [...],
+  "explanation": "..."
+}
+```
+
+Put ONLY the ```json ... ``` block in your response — no surrounding prose.
 """
 
     # ✅ VERIFIED WORKING on Fireworks API (tested, confirmed):
@@ -132,7 +145,7 @@ Output format: JSON with:
                 f"Apply similar approach if applicable.\n"
             )
         
-        user_prompt += "\nRespond ONLY with valid JSON matching the expected format."
+        user_prompt += "\nOutput the result as a JSON object inside a ```json markdown block, with fields: ported_code (the full kernel code), confidence (0-100), changes (list), explanation (string)."
         
         # For hackathon: if no API key, use template-based porting
         if not self.api_key or self.api_key == "test":
@@ -159,8 +172,7 @@ Output format: JSON with:
                         {"role": "user", "content": user_prompt}
                     ],
                     "temperature": 0.1,
-                    "max_tokens": 2048,
-                    "response_format": {"type": "json_object"}
+                    "max_tokens": 2048
                 }).encode()
                 req = urllib.request.Request(
                     f"{self.api_base}/chat/completions",
@@ -175,22 +187,21 @@ Output format: JSON with:
                     raw_body = resp.read()
                     result = _json.loads(raw_body)
                 content = result["choices"][0]["message"]["content"]
-                try:
-                    parsed = _json.loads(content)
-                    if "ported_code" in parsed:
-                        parsed["ported_code"] = self._fix_ported_code(parsed["ported_code"])
+                # Try JSON extraction first (handles prose-wrapped JSON)
+                parsed = self._extract_json_from_text(content)
+                if parsed and "ported_code" in parsed:
+                    parsed["ported_code"] = self._fix_ported_code(parsed["ported_code"])
                     return parsed
-                except _json.JSONDecodeError:
-                    # LLM returned text, not JSON — extract code, use template fallback
-                    code_text = self._extract_code_from_text(content)
-                    if code_text:
-                        return {
-                            "ported_code": self._fix_ported_code(code_text),
-                            "confidence": self._rubric_score_extracted(code_text),
-                            "changes": ["LLM returned text — extracted code block"],
-                            "explanation": "Code extracted from LLM text output"
-                        }
-                    raise
+                # Fallback: extract HIP code from text output
+                code_text = self._extract_code_from_text(content)
+                if code_text:
+                    return {
+                        "ported_code": self._fix_ported_code(code_text),
+                        "confidence": self._rubric_score_extracted(code_text),
+                        "changes": ["LLM returned text without valid JSON — extracted code block"],
+                        "explanation": "Code extracted from LLM text output"
+                    }
+                raise ValueError(f"No usable code or JSON found in LLM response: {content[:200]}")
             except urllib.request.HTTPError as e:
                 err_body = e.read().decode(errors='replace')[:200]
                 print(f"║ ⏱️ Model {model} returned HTTP {e.code}: {err_body}")
@@ -207,13 +218,63 @@ Output format: JSON with:
         return result
 
     @staticmethod
+    def _extract_json_from_text(text: str) -> Optional[Dict]:
+        """Extract a JSON object from LLM text that may have surrounding prose.
+
+        Tries, in order:
+          1. Markdown ```json ... ``` block
+          2. First { to last } slice
+          3. Direct json.loads
+        Returns parsed dict or None.
+        """
+        import re, json as _json
+
+        # 1. Markdown json code block
+        m = re.search(r'```(?:json)?\s*\n?(.*?)```', text, re.DOTALL)
+        if m:
+            candidate = m.group(1).strip()
+            try:
+                return _json.loads(candidate)
+            except _json.JSONDecodeError:
+                pass
+
+        # 2. First { to last } — strip surrounding prose
+        start = text.find('{')
+        end = text.rfind('}')
+        if start != -1 and end != -1 and end > start:
+            candidate = text[start:end + 1]
+            try:
+                return _json.loads(candidate)
+            except _json.JSONDecodeError:
+                pass
+
+        # 3. Direct parse
+        try:
+            return _json.loads(text.strip())
+        except _json.JSONDecodeError:
+            pass
+
+        return None
+
+    @staticmethod
     def _extract_code_from_text(text: str) -> str:
-        """Extract HIP/CUDA code from LLM text output (non-JSON responses)."""
+        """Extract HIP/CUDA code from LLM text output (non-JSON responses).
+
+        Handles:
+          - Markdown ```cuda / ```hip / ```cpp code blocks
+          - JSON values that contain code as a field value
+          - Raw __global__ kernel definitions
+          - From #include to end
+        """
         import re
-        # Try markdown code blocks with any language
-        blocks = re.findall(r'```(?:\w+)?\n(.*?)```', text, re.DOTALL)
+        # Try markdown code blocks (cuda, hip, cpp, or unlabeled)
+        blocks = re.findall(r'```(?:cuda|hip|cpp|cu|cl)?\n(.*?)```', text, re.DOTALL)
         if blocks:
             # Pick the longest block (usually the real code)
+            return max(blocks, key=len).strip()
+        # Try generic ``` blocks
+        blocks = re.findall(r'```\n(.*?)```', text, re.DOTALL)
+        if blocks:
             return max(blocks, key=len).strip()
         # Try to find __global__ kernel definition
         match = re.search(r'(__global__\s+void\s+\w+\s*\(.*?)(?=\n\n|\Z)', text, re.DOTALL)
@@ -221,6 +282,10 @@ Output format: JSON with:
             return match.group(1).strip()
         # Try to find from #include to end
         match = re.search(r'(#include\s+<.*)', text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        # Look for __device__ function definitions
+        match = re.search(r'(__device__\s+\w+\s+\w+\s*\(.*?)(?=\n\n|\Z)', text, re.DOTALL)
         if match:
             return match.group(1).strip()
         return ""
