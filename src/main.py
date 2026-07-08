@@ -62,17 +62,18 @@ SPINNER = "|/-\\"
 class Display:
     """Live-updating terminal display. Zero dependencies, pure ANSI."""
 
-    def __init__(self):
+    def __init__(self, silent: bool = False):
         try:
             self.width = min(shutil.get_terminal_size().columns, 80)
         except (ValueError, OSError):
             self.width = 80
-        self._is_tty = sys.stdout.isatty()
+        self._is_tty = sys.stdout.isatty() and not silent
         self._phase_lines = {}
         self._counter = 0
         self._headers_printed = 0
         self._start_time = time.time()
-        print(bold("╔═ Kernel Olympics ═══════════════════════════════╗"))
+        if not silent:
+            print(bold("╔═ Kernel Olympics ═══════════════════════════════╗"))
 
     def phase(self, name: str, icon: str):
         self._counter += 1
@@ -132,7 +133,10 @@ class Display:
 class KernelOlympics:
     """Orchestrates the full CUDA→ROCm migration pipeline."""
 
-    def __init__(self, fresh: bool = False):
+    def __init__(self, fresh: bool = False, silent: bool = False):
+        self.fresh = fresh
+        self.silent = silent
+        self.disp = Display(silent=silent)
         self.scanner = Scanner()
         self.classifier = RiskClassifier()
         self.memory = PatternMemory()
@@ -583,6 +587,12 @@ def main():
     parser.add_argument("--nvidia-sample", type=str, nargs="?",
                         const="cpp/2_Concepts_and_Techniques/shfl_scan/shfl_scan.cu",
                         help="Download and test a sample from NVIDIA/cuda-samples (default: shfl_scan)")
+    parser.add_argument("--daemon", action="store_true",
+                        help="Run in daemon mode: watch a directory for new .cu files and auto-process")
+    parser.add_argument("--watch", default="sample_kernels/cuda",
+                        help="Directory to watch for .cu files (default: sample_kernels/cuda)")
+    parser.add_argument("--interval", type=int, default=5,
+                        help="Poll interval in seconds (default: 5)")
     args = parser.parse_args()
 
     if args.doctor:
@@ -590,6 +600,14 @@ def main():
 
     if args.demo:
         return run_demo(reset=args.reset)
+
+    if args.daemon:
+        return run_daemon(
+            watch_dir=args.watch,
+            interval=args.interval,
+            reference_dir=args.reference,
+            fresh=args.fresh,
+        )
 
     if not args.input and not args.nvidia_sample:
         parser.error("--input or --nvidia-sample is required unless --demo or --doctor is used")
@@ -802,6 +820,140 @@ def run_demo(reset: bool = False):
     print(f"├{'─'*66}┤")
     print(f"║ {dim('Demo report saved to: demo_report.json')}")
     print(bold("╚════════════════════════════════════════════════════════╝"))
+    return 0
+
+
+# ── Daemon / watch mode ──────────────────────────────────────────
+
+_DAEMON_STATE_FILE = os.path.join(
+    os.path.expanduser("~"), ".kernel-olympics", "daemon_state.json"
+)
+_SHUTDOWN_REQUESTED = False
+
+
+def _daemon_signal_handler(signum, frame):
+    """Set global shutdown flag on SIGINT/SIGTERM for clean exit."""
+    global _SHUTDOWN_REQUESTED
+    _SHUTDOWN_REQUESTED = True
+    print("\n[daemon] Shutdown signal received — finishing current file...",
+          file=sys.stderr)
+
+
+class DaemonState:
+    """Tracks which .cu files have already been processed by the daemon.
+    Persisted as a JSON dict on disk so the daemon survives restarts."""
+    def __init__(self, state_path: str = _DAEMON_STATE_FILE):
+        self._path = state_path
+        self._data: dict[str, dict] = {}
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self._path, encoding="utf-8") as f:
+                self._data = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            self._data = {}
+
+    def _save(self):
+        os.makedirs(os.path.dirname(self._path), exist_ok=True)
+        with open(self._path, "w", encoding="utf-8") as f:
+            json.dump(self._data, f, indent=2, sort_keys=True)
+
+    def is_processed(self, file_path: str, mtime: float, size: int) -> bool:
+        entry = self._data.get(file_path)
+        if entry is None:
+            return False
+        return entry.get("mtime") == mtime and entry.get("size") == size
+
+    def mark_processed(self, file_path: str, mtime: float, size: int,
+                       status: str = "ok", result: str = ""):
+        self._data[file_path] = {
+            "mtime": mtime, "size": size,
+            "processed_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "status": status, "result": result,
+        }
+        self._save()
+
+    def list_pending(self, watch_dir: str) -> list[str]:
+        pending = []
+        watch = Path(watch_dir)
+        if not watch.is_dir():
+            return pending
+        for fpath in sorted(watch.glob("*.cu")):
+            try:
+                stat = fpath.stat()
+                entry = self._data.get(str(fpath))
+                if entry is None or entry.get("mtime") != stat.st_mtime or entry.get("size") != stat.st_size:
+                    pending.append(str(fpath))
+            except OSError:
+                continue
+        return pending
+
+
+def _process_single_file(ko: "KernelOlympics", file_path: str,
+                         reference_dir: str) -> dict:
+    try:
+        report = ko.run([file_path], reference_dir=reference_dir)
+        return report
+    except Exception as exc:
+        import traceback
+        return {"error": str(exc), "traceback": traceback.format_exc(), "file": file_path}
+
+
+def run_daemon(watch_dir: str, interval: int = 5,
+               reference_dir: str = "sample_kernels/reference",
+               fresh: bool = False, state_path: str | None = None):
+    """Watch *watch_dir* for new/edited .cu files and process them automatically."""
+    global _SHUTDOWN_REQUESTED
+    _SHUTDOWN_REQUESTED = False
+    import signal
+    signal.signal(signal.SIGINT, _daemon_signal_handler)
+    signal.signal(signal.SIGTERM, _daemon_signal_handler)
+
+    state = DaemonState(state_path or _DAEMON_STATE_FILE)
+    ko = KernelOlympics(fresh=fresh, silent=True)
+
+    watch = Path(watch_dir)
+    if not watch.is_dir():
+        print(f"[daemon] ERROR: watch directory does not exist: {watch_dir}", file=sys.stderr)
+        return 1
+
+    print(f"[daemon] Watching {watch.resolve()} every {interval}s (PID {os.getpid()})", file=sys.stderr)
+    sys.stderr.flush()
+
+    while not _SHUTDOWN_REQUESTED:
+        try:
+            pending = state.list_pending(watch_dir)
+            for fpath_str in pending:
+                if _SHUTDOWN_REQUESTED:
+                    break
+                fpath = Path(fpath_str)
+                try:
+                    stat = fpath.stat()
+                    mtime = stat.st_mtime
+                    size = stat.st_size
+                except OSError as e:
+                    print(f"[daemon] ERROR: cannot stat {fpath}: {e}", file=sys.stderr)
+                    continue
+                print(f"[daemon] Processing: {fpath.name}", file=sys.stderr)
+                sys.stderr.flush()
+                report = _process_single_file(ko, fpath_str, reference_dir)
+                if "error" in report:
+                    print(f"[daemon] ERROR: {fpath.name}: {report['error']}", file=sys.stderr)
+                    state.mark_processed(fpath_str, mtime, size, status="error", result=report["error"])
+                else:
+                    state.mark_processed(fpath_str, mtime, size, status="ok", result="done")
+                    print(f"[daemon] Completed: {fpath.name}", file=sys.stderr)
+                sys.stderr.flush()
+        except Exception as loop_exc:
+            import traceback as _tb
+            print(f"[daemon] Loop error: {loop_exc}", file=sys.stderr)
+        if not _SHUTDOWN_REQUESTED:
+            for _ in range(interval):
+                if _SHUTDOWN_REQUESTED:
+                    break
+                time.sleep(1)
+    print(f"[daemon] Shutdown complete", file=sys.stderr)
     return 0
 
 
