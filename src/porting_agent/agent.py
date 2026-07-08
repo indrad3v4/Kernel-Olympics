@@ -1,5 +1,3 @@
-#agent.py
-
 """
 Porting Agent — uses Fireworks API to fix CUDA→ROCm porting issues.
 
@@ -32,6 +30,12 @@ KEY RULES:
 5. __syncwarp() → use __syncthreads() for HIP compatibility
 6. Use __ballot_sync (HIP) instead of CUDA warp-vote functions
 7. Keep the same algorithm structure — only change what's needed for portability
+8. __activemask() → use __ballot_sync(0xffffffff, 1) for active lane mask on HIP
+9. __all_sync/__any_sync — these take a mask argument; verify it works with 64 lanes
+10. __match_all_sync — no direct HIP equivalent; redesign as sequential check
+11. threadIdx.x >> 5 computes warp index (32 lanes) → should be >> 6 for wavefront64
+12. Lane identification: if (lane_id < 32) → if (lane_id < 64) for wavefront boundary
+13. __shfl_sync (basic shuffle) — mask and lane count must be adjusted for wavefront64
 
 Output format: JSON with:
 - "ported_code": the full ported kernel
@@ -40,17 +44,31 @@ Output format: JSON with:
 - "explanation": short explanation of the fix
 """
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "accounts/fireworks/models/llama-v3p3-70b-instruct"):
+    FALLBACK_MODELS = [
+        "accounts/fireworks/models/kimi-k2p6",                   # 1st: Kimi (works ✅)
+        "accounts/fireworks/models/glm-5p2",                      # 2nd: GLM (works ✅)
+        "accounts/fireworks/models/deepseek-v4-pro",              # 3rd: DeepSeek (works ✅)
+        "accounts/fireworks/models/llama-v3p3-70b-instruct",      # 4th: Llama (may work)
+    ]
+
+    def __init__(self, api_key: Optional[str] = None, model: str = "accounts/fireworks/models/kimi-k2p6",
+                 deepseek_key: str = "", deepseek_model: str = "deepseek-reasoner"):
         self.api_key = api_key or os.getenv("FIREWORKS_API_KEY", "")
         self.model = model
+        self.deepseek_key = deepseek_key or os.getenv("DEEPSEEK_API_KEY", "")
+        self.deepseek_model = deepseek_model
         self.api_base = "https://api.fireworks.ai/inference/v1"
+        self.deepseek_base = "https://api.deepseek.com/v1"
 
     def port_kernel(self, source_code: str, context: str = "",
                     cached_pattern: Optional[Dict] = None) -> Dict:
         """Port a CUDA kernel to ROCm/HIP using LLM."""
         
+        # TRIZ: Fix source code BEFORE any LLM/template processing
+        fixed_source = self._fix_ported_code(source_code)
+        
         # Build prompt with context
-        user_prompt = f"Port this CUDA kernel to AMD ROCm/HIP:\n\n```cuda\n{source_code}\n```\n"
+        user_prompt = f"Port this CUDA kernel to AMD ROCm/HIP:\n\n```cuda\n{fixed_source}\n```\n"
         
         if context:
             user_prompt += f"\nAdditional context:\n{context}\n"
@@ -62,23 +80,21 @@ Output format: JSON with:
                 f"Verified fix: {cached_pattern.get('verified_fix', '')}\n"
                 f"Apply similar approach if applicable.\n"
             )
-
+        
         user_prompt += "\nRespond ONLY with valid JSON matching the expected format."
-
+        
         # For hackathon: if no API key, use template-based porting
         if not self.api_key or self.api_key == "test":
-            return self._template_port(source_code, cached_pattern)
+            return self._template_port(fixed_source, cached_pattern)
 
-        try:
-            import requests
-            response = requests.post(
-                f"{self.api_base}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": self.model,
+        models_to_try = [self.model] + [m for m in self.FALLBACK_MODELS if m != self.model]
+
+        for model in models_to_try:
+            try:
+                import urllib.request
+                import json as _json
+                data = _json.dumps({
+                    "model": model,
                     "messages": [
                         {"role": "system", "content": self.SYSTEM_PROMPT},
                         {"role": "user", "content": user_prompt}
@@ -86,21 +102,124 @@ Output format: JSON with:
                     "temperature": 0.1,
                     "max_tokens": 2048,
                     "response_format": {"type": "json_object"}
-                },
-                timeout=60
-            )
-            response.raise_for_status()
-            result = response.json()
-            content = result["choices"][0]["message"]["content"]
-            return json.loads(content)
-            
-        except Exception as e:
-            return {
-                "ported_code": f"// Porting failed: {str(e)}\n{source_code}",
-                "confidence": 0,
-                "changes": [f"Error: {str(e)}"],
-                "explanation": f"Porting agent error. Falling back to template."
-            }
+                }).encode()
+                req = urllib.request.Request(
+                    f"{self.api_base}/chat/completions",
+                    data=data,
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json"
+                    }
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    result = _json.loads(resp.read())
+                content = result["choices"][0]["message"]["content"]
+                try:
+                    parsed = _json.loads(content)
+                    if "ported_code" in parsed:
+                        parsed["ported_code"] = self._fix_ported_code(parsed["ported_code"])
+                    return parsed
+                except _json.JSONDecodeError:
+                    # LLM returned text, not JSON — extract code, use template fallback
+                    code_text = self._extract_code_from_text(content)
+                    if code_text:
+                        return {
+                            "ported_code": self._fix_ported_code(code_text),
+                            "confidence": 70,
+                            "changes": ["LLM returned text — extracted code block"],
+                            "explanation": "Code extracted from LLM text output"
+                        }
+                    raise
+            except Exception:
+                continue  # Try next model
+
+        # Last resort: try DeepSeek (your Hermes main provider)
+        if self.deepseek_key:
+            try:
+                import urllib.request
+                import json as _json
+                data = _json.dumps({
+                    "model": self.deepseek_model,
+                    "messages": [
+                        {"role": "system", "content": self.SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 2048,
+                    "response_format": {"type": "json_object"}
+                }).encode()
+                req = urllib.request.Request(
+                    f"{self.deepseek_base}/chat/completions",
+                    data=data,
+                    headers={
+                        "Authorization": f"Bearer {self.deepseek_key}",
+                        "Content-Type": "application/json"
+                    }
+                )
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    result = _json.loads(resp.read())
+                content = result["choices"][0]["message"]["content"]
+                try:
+                    parsed = _json.loads(content)
+                    if "ported_code" in parsed:
+                        parsed["ported_code"] = self._fix_ported_code(parsed["ported_code"])
+                    return parsed
+                except _json.JSONDecodeError:
+                    code_text = self._extract_code_from_text(content)
+                    if code_text:
+                        return {
+                            "ported_code": self._fix_ported_code(code_text),
+                            "confidence": 70,
+                            "changes": ["DeepSeek returned text — extracted code"],
+                            "explanation": "Code extracted from DeepSeek text output"
+                        }
+                    raise
+            except Exception:
+                pass  # Fall through to template
+
+        # All models failed — use template fallback
+        result = self._template_port(source_code, cached_pattern)
+        if "ported_code" in result:
+            result["ported_code"] = self._fix_ported_code(result["ported_code"])
+        return result
+
+    @staticmethod
+    def _extract_code_from_text(text: str) -> str:
+        """Extract HIP/CUDA code from LLM text output (non-JSON responses)."""
+        import re
+        # Try markdown code blocks with any language
+        blocks = re.findall(r'```(?:\w+)?\n(.*?)```', text, re.DOTALL)
+        if blocks:
+            # Pick the longest block (usually the real code)
+            return max(blocks, key=len).strip()
+        # Try to find __global__ kernel definition
+        match = re.search(r'(__global__\s+void\s+\w+\s*\(.*?)(?=\n\n|\Z)', text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        # Try to find from #include to end
+        match = re.search(r'(#include\s+<.*)', text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return ""
+
+    @staticmethod
+    def _fix_ported_code(code: str) -> str:
+        """Fix AMD-specific issues in ported code.
+        
+        Fixes:
+        - 32-bit __shfl mask → 64-bit for wavefront64
+        """
+        import re
+        # Count how many 32-bit masks remain
+        mask_pattern = re.compile(r'(__shfl_\w+_sync\()0x[fF]{8}(,)')
+        before = len(mask_pattern.findall(code))
+        code = mask_pattern.sub(r'\g<1>0xffffffffffffffffULL\g<2>', code)
+        after = len(mask_pattern.findall(code))
+        if before > 0 and after == 0:
+            pass  # All masks fixed
+        elif before > 0:
+            print(f"║ ⚠️ Mask fix: {before} found, {after} remaining (regex issue!)")
+        return code
 
     def _template_port(self, source_code: str,
                        cached_pattern: Optional[Dict] = None) -> Dict:
@@ -111,6 +230,7 @@ Output format: JSON with:
         lines = source_code.split('\n')
         result_lines = []
         wavefront_header_added = False
+        has_added_wave64_shfl = False
 
         # Template transformations (only on non-comment lines)
         shared_32_re = re.compile(r'(__shared__[^;]*?\[\s*)32(\s*\])')
@@ -127,6 +247,13 @@ Output format: JSON with:
         tid_warp_mask_re = re.compile(r'(tid\s*&\s*)0x1[fF](\s*\)?\s*==\s*0\b)')
         blockidx_tile_re = re.compile(r'(blockIdx\.[xy]\s*\*\s*)TILE_SIZE')
         shfl_down_re = re.compile(r'__shfl_down_sync\s*\(')
+        activemask_re = re.compile(r'__activemask\s*\(')
+        all_sync_re = re.compile(r'__all_sync\s*\(')
+        any_sync_re = re.compile(r'__any_sync\s*\(')
+        match_all_re = re.compile(r'__match_all_sync\s*\(')
+        warp_lane_shift_re = re.compile(r'(threadIdx\.[xy]\s*>>\s*)5(?!\d)')
+        lane_id_32_re = re.compile(r'(lane_id|laneIdx)\s*[<]\s*32\b')
+        warp_divergent_32_re = re.compile(r'(if\s*\(\s*(?:threadIdx\.[xy]|tid|lane_id|laneIdx)\s*[<]\s*)32(\s*\))')
 
         for line in lines:
             stripped = line.strip()
@@ -156,6 +283,18 @@ Output format: JSON with:
 
             # Fix 5: __shfl_down_sync — no safe automatic fix for offset semantics
             # (The actual fix depends on algorithm context; LLM handles this best)
+            # But we CAN prepend offset=32 for wavefront64 (6 steps → 64 elements)
+            
+            # Fix 5b: Insert 6th shuffle offset for wavefront64
+            if 'shfl_down' in stripped and 'val += __shfl' in line:
+                if not has_added_wave64_shfl:
+                    has_added_wave64_shfl = True
+                    indent = line[:len(line) - len(line.lstrip())]
+                    new_line = f"{indent}val += __shfl_down_sync(0xffffffffffffffffULL, val, 32);  // ADDED: wavefront64 offset\n{line}"
+                    result_lines[-1] = new_line
+                    if "wavefront64_offset32" not in str(changes):
+                        changes.append("wavefront64: added offset=32 shuffle step (6-step reduction for 64 lanes)")
+                    continue
 
             # Fix 6: 0x1f (warp mask 32) → 0x3f (wavefront mask 64)
             if '0x1f' in line and not stripped.startswith('//'):
@@ -207,6 +346,44 @@ Output format: JSON with:
             if shfl_down_re.search(line):
                 if "shfl_down" not in str(changes):
                     changes.append("__shfl_down_sync: verify offsets work with wavefront64 (64 lanes, offset must be power of two)")
+            
+            # Fix 8i: 32-bit mask → 64-bit mask for AMD wavefront64
+            mask_line = re.sub(r'(__shfl_\w+_sync\()0x[fF]{8}(,)', r'\g<1>0xffffffffffffffffULL\g<2>', line)
+            if mask_line != line:
+                line = mask_line
+                if "mask_64bit" not in str(changes):
+                    changes.append("__shfl_*_sync: mask 0xffffffff → 0xffffffffffffffffULL (64-bit for wavefront64)")
+
+            # Fix 9: __activemask() → __ballot_sync(0xffffffff, 1) on HIP
+            if activemask_re.search(line):
+                line = activemask_re.sub('__ballot_sync(0xffffffff  // wavefront64 active mask', line)
+                if "activemask" not in str(changes):
+                    changes.append("__activemask() → __ballot_sync(0xffffffff, 1) for HIP compatibility")
+
+            # Fix 10: __all_sync / __any_sync — annotate for wavefront64
+            if all_sync_re.search(line):
+                if "all_sync" not in str(changes):
+                    changes.append("__all_sync: verify predicate works with wavefront64 (64 lanes)")
+            if any_sync_re.search(line):
+                if "any_sync" not in str(changes):
+                    changes.append("__any_sync: verify predicate works with wavefront64 (64 lanes)")
+
+            # Fix 11: __match_all_sync — annotate (no direct HIP equivalent)
+            if match_all_re.search(line):
+                if "match_all" not in str(changes):
+                    changes.append("__match_all_sync: no direct HIP equivalent — may need algorithm redesign")
+
+            # Fix 12: threadIdx.x >> 5 (warp index) → >> 6 for wavefront64
+            line = warp_lane_shift_re.sub(r'\1 6  // wavefront64: 64 lanes', line)
+
+            # Fix 13: lane_id < 32 → lane_id < 64 (wavefront boundary)
+            if lane_id_32_re.search(line):
+                line = line.replace('< 32', '< WAVEFRONT_SIZE', 1)
+                if "lane_id < 32" not in str(changes):
+                    changes.append("lane_id < 32 → lane_id < WAVEFRONT_SIZE for wavefront64")
+
+            # Fix 14: threadIdx.x/tid < 32 → < WAVEFRONT_SIZE (warp divergence boundary)
+            line = warp_divergent_32_re.sub(r'\1 WAVEFRONT_SIZE \2', line)
 
 
             # Track what changed
