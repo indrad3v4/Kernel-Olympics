@@ -569,8 +569,8 @@ int main() {{
     def _check_hipcc(self) -> bool:
         """Check if hipcc is available on this system (any known path)."""
         # First: try direct subprocess (fastest)
-        for cmd in ["hipcc", "/opt/rocm/bin/hipcc", "/opt/rocm/lib/llvm/bin/hipcc",
-                     "/opt/rocm-7.2.1/bin/hipcc", "/opt/rocm-7.2.1/lib/llvm/bin/hipcc",
+        for cmd in ["hipcc", "/opt/rocm-7.2.1/bin/hipcc", "/opt/rocm/bin/hipcc",
+                     "/opt/rocm-7.2.1/lib/llvm/bin/hipcc", "/opt/rocm/lib/llvm/bin/hipcc",
                      "/usr/bin/hipcc"]:
             try:
                 result = subprocess.run([cmd, "--version"], capture_output=True, text=True, timeout=5)
