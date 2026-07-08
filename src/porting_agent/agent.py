@@ -201,18 +201,23 @@ Output format: JSON with:
 
     @staticmethod
     def _fix_ported_code(code: str) -> str:
-        """Post-process ported code to fix common AMD-specific issues.
+        """Fix AMD-specific issues in ported code.
         
         Fixes:
         - 32-bit __shfl mask → 64-bit for wavefront64
         """
         import re
-        # Fix: 0xffffffff (32-bit mask) → 0xffffffffffffffffULL (64-bit) in __shfl_*_sync calls
+        before = len(re.findall(r'__shfl_\w+_sync\()0x[fF]{8}(,)', code))
         code = re.sub(
             r'(__shfl_\w+_sync\()0x[fF]{8}(,)',
             r'\g<1>0xffffffffffffffffULL\g<2>',
             code
         )
+        after = len(re.findall(r'__shfl_\w+_sync\()0x[fF]{8}(,)', code))
+        if before > 0 and after == 0:
+            pass  # All masks fixed
+        elif before > 0:
+            print(f"║ ⚠️ Mask fix: {before} found, {after} remaining (regex issue!)")
         return code
 
     def _template_port(self, source_code: str,
