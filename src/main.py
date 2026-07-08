@@ -190,7 +190,9 @@ class KernelOlympics:
                 if not source:
                     continue
 
-                cached = self.memory.retrieve(source)
+                # Pass classifier findings so store/retrieve key on the SAME
+                # full-source pattern signature (source is truncated on store).
+                cached = self.memory.retrieve(source, findings=cr.get("findings", []))
                 if cached:
                     pipeline_state["cache_hits"] += 1
                     self.disp.cache_hit()
@@ -293,7 +295,8 @@ class KernelOlympics:
                         verified_fix=port_result.get("ported_code", "")[:500],
                         confidence=port_result.get("confidence", 80) / 100.0,
                         verification_run_id=ver_result.get("compile_output", "")[:20],
-                        llm_time_s=port_result.get("llm_time_s", 0.0)
+                        llm_time_s=port_result.get("llm_time_s", 0.0),
+                        findings=cr.get("findings", [])
                     )
                     self.disp.status("Verifying", f"{Path(cr['file']).name} {green('VERIFIED')}", ok=True)
                 elif not ver_result.get("compile_success") and "hipcc not found" in ver_result.get("compile_output", ""):
@@ -304,7 +307,8 @@ class KernelOlympics:
                         verified_fix=port_result.get("ported_code", "")[:500],
                         confidence=0.70,  # lower confidence — unverified
                         verification_run_id="template_unverified",
-                        llm_time_s=port_result.get("llm_time_s", 0.0)
+                        llm_time_s=port_result.get("llm_time_s", 0.0),
+                        findings=cr.get("findings", [])
                     )
                     self.disp.status("Verifying", f"{Path(cr['file']).name} {yellow('stored (unverified — no GPU)')}", ok=False)
                 else:
