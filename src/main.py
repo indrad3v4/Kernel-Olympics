@@ -128,10 +128,13 @@ class Display:
 class KernelOlympics:
     """Orchestrates the full CUDA→ROCm migration pipeline."""
 
-    def __init__(self):
+    def __init__(self, fresh: bool = False):
         self.scanner = Scanner()
         self.classifier = RiskClassifier()
         self.memory = PatternMemory()
+        if fresh:
+            # Start with an empty pattern cache (T3.2: --fresh)
+            self.memory.clear()
         self.porting_agent = PortingAgent(
             deepseek_key=os.getenv("DEEPSEEK_API_KEY", ""),
             deepseek_model=os.getenv("DEEPSEEK_MODEL", "deepseek-reasoner")
@@ -507,6 +510,7 @@ def main():
     parser.add_argument("--output", default="portability_report.json", help="Output path for JSON report")
     parser.add_argument("--demo", action="store_true", help="Run 'second kernel is faster' speedup demo")
     parser.add_argument("--reset", action="store_true", help="With --demo, clear pattern memory before running")
+    parser.add_argument("--fresh", action="store_true", help="Start with an empty pattern memory (clears the cache DB before running)")
     parser.add_argument("--doctor", action="store_true", help="Run pre-flight environment check and exit")
     args = parser.parse_args()
 
@@ -520,7 +524,7 @@ def main():
         parser.error("--input is required unless --demo or --doctor is used")
         return 1
 
-    ko = KernelOlympics()
+    ko = KernelOlympics(fresh=args.fresh)
     report = ko.run(args.input, args.reference)
 
     output_path = Path(args.output)
