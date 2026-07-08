@@ -28,6 +28,8 @@ class PatternMemory:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         # In-memory trigram index: trigram_hash -> set of pattern_ids
         self._trigram_index: Dict[int, set] = {}
+        # In-memory signature index: signature -> pattern_id (O(1) exact match)
+        self._signature_index: Dict[str, str] = {}
         # In-memory fix cache: pattern_id -> {fix, confidence}
         self._fix_cache: Dict[str, Dict] = {}
         # Cache hit/miss counters
@@ -38,12 +40,39 @@ class PatternMemory:
         self._init_db()
 
     def store(self, pattern_snippet: str, verified_fix: str, confidence: float,
-              verification_run_id: str = "", llm_time_s: float = 0.0) -> str:
-        """Store a verified pattern fix with trigram index + SQLite."""
+              verification_run_id: str = "", llm_time_s: float = 0.0,
+              signature: Optional[str] = None) -> str:
+        """Store a verified pattern fix with trigram index + SQLite.
+
+        If *signature* is provided it is used as the dedup key; otherwise
+        a canonical signature is computed automatically from the snippet.
+        Backward compatible — existing callers work unchanged.
+        """
+        # Compute or use provided signature
+        if signature is None:
+            signature = self._compute_signature(pattern_snippet)
+
         pattern_id = hashlib.sha256(pattern_snippet.encode()).hexdigest()[:12]
         snippet_hash = hashlib.sha256(pattern_snippet.encode()).hexdigest()
 
-        # Already exists — update confidence
+        # Signature-based dedup — stricter than snippet_hash matching
+        existing_pid = self._signature_index.get(signature)
+        if existing_pid is not None:
+            existing = self._db_execute(
+                "SELECT confidence FROM patterns WHERE id = ?", (existing_pid,)
+            ).fetchone()
+            if existing:
+                new_conf = max(existing[0], confidence)
+                self._db_execute(
+                    "UPDATE patterns SET confidence = ?, times_retrieved = times_retrieved + 1 WHERE id = ?",
+                    (new_conf, existing_pid)
+                )
+                self._db_commit()
+                if existing_pid in self._fix_cache:
+                    self._fix_cache[existing_pid]["confidence"] = new_conf
+                return existing_pid
+
+        # Fallback: snippet_hash dedup for backward compat with existing DB rows
         existing = self._db_execute(
             "SELECT confidence FROM patterns WHERE snippet_hash = ?", (snippet_hash,)
         ).fetchone()
@@ -60,12 +89,15 @@ class PatternMemory:
 
         # Insert into SQLite
         self._db_execute(
-            "INSERT INTO patterns (id, snippet_hash, snippet, verified_fix, confidence, llm_time_s) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (pattern_id, snippet_hash, pattern_snippet[:500], verified_fix[:500],
+            "INSERT INTO patterns (id, snippet_hash, signature, snippet, verified_fix, confidence, llm_time_s) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (pattern_id, snippet_hash, signature, pattern_snippet[:500], verified_fix[:500],
              round(confidence, 2), round(llm_time_s, 3))
         )
         self._db_commit()
+
+        # Build signature index
+        self._signature_index[signature] = pattern_id
 
         # Build trigram index
         trigrams = self._compute_trigrams(pattern_snippet)
@@ -85,13 +117,31 @@ class PatternMemory:
 
         return pattern_id
 
-    def retrieve(self, query_snippet: str, threshold: float = 0.25) -> Optional[Dict]:
-        """Fast trigram-based retrieval. Returns cached fix or None.
-        
-        Returns immediately with cached fix if trigram Jaccard similarity > threshold.
-        No cosine similarity, no linear scan — O(1) dict lookup.
+    def retrieve(self, query_snippet: str, threshold: float = 0.25,
+                 signature: Optional[str] = None) -> Optional[Dict]:
+        """Fast trigram-based retrieval with optional exact-signature short-circuit.
+
+        When *signature* is provided, checks the signature index first for
+        an O(1) exact match. Falls back to trigram approximate matching if
+        the signature doesn't match.
+
+        Returns cached fix dict or None.
         """
         t0 = time.perf_counter()
+
+        # Signature short-circuit — O(1) exact match
+        if signature is not None:
+            pid = self._signature_index.get(signature)
+            if pid is not None:
+                cached = self._fix_cache.get(pid)
+                if cached:
+                    self._hits += 1
+                    self._last_cache_time = (time.perf_counter() - t0) * 1000
+                    cached["retrieval_ms"] = round(self._last_cache_time, 1)
+                    cached["jaccard"] = 1.0  # exact signature match
+                    cached["times_retrieved"] = cached.get("times_retrieved", 0) + 1
+                    return cached
+
         query_trigrams = self._compute_trigrams(query_snippet)
 
         if not query_trigrams or not self._trigram_index:
@@ -157,6 +207,7 @@ class PatternMemory:
         self._db_execute("DELETE FROM patterns")
         self._db_commit()
         self._trigram_index.clear()
+        self._signature_index.clear()
         self._fix_cache.clear()
         self._hits = 0
         self._misses = 0
@@ -171,12 +222,28 @@ class PatternMemory:
             if code[i:i+3].strip()  # skip whitespace-only trigrams
         ]
 
+    def _compute_signature(self, code: str) -> str:
+        """Compute a canonical signature from code, normalising superficial differences.
+        
+        Strips comments, normalises whitespace, lowercases — so two snippets
+        that differ only in formatting/commenting produce the same signature.
+        Used as an O(1) exact-match key in the signature index, bypassing
+        trigram-based approximate matching when the caller already has a signature.
+        """
+        import re
+        # Strip single-line comments
+        code = re.sub(r'#.*', '', code)
+        # Normalise whitespace and lowercase
+        code = re.sub(r'\s+', ' ', code).strip().lower()
+        return hashlib.sha256(code.encode()).hexdigest()
+
     def _init_db(self):
         self._conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS patterns (
                 id TEXT PRIMARY KEY,
                 snippet_hash TEXT UNIQUE,
+                signature TEXT,
                 snippet TEXT,
                 verified_fix TEXT,
                 confidence REAL,
@@ -185,15 +252,26 @@ class PatternMemory:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Schema migration: add signature column for existing databases
+        try:
+            self._conn.execute("ALTER TABLE patterns ADD COLUMN signature TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_snippet_hash ON patterns(snippet_hash)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_signature ON patterns(signature)")
         self._conn.commit()
         # Load existing patterns into memory
-        for row in self._conn.execute("SELECT id, snippet, verified_fix, confidence, llm_time_s, times_retrieved FROM patterns").fetchall():
-            pid, snippet, fix, conf, llm_t, times = row
+        for row in self._conn.execute(
+            "SELECT id, snippet, verified_fix, confidence, llm_time_s, times_retrieved, signature "
+            "FROM patterns"
+        ).fetchall():
+            pid, snippet, fix, conf, llm_t, times, sig = row
             self._fix_cache[pid] = {
                 "id": pid, "verified_fix": fix, "confidence": conf,
                 "llm_time_s": llm_t, "times_retrieved": times
             }
+            if sig:
+                self._signature_index[sig] = pid
             if snippet:
                 for h in self._compute_trigrams(snippet):
                     self._trigram_index.setdefault(h, set()).add(pid)

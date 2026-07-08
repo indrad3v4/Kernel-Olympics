@@ -38,8 +38,71 @@ class VerificationAgent:
 
     def __init__(self, docker_image: str = "rocm/dev-ubuntu-22.04:latest"):
         self.docker_image = docker_image
+        self.offload_arch = os.environ.get("AMD_OFFLOAD_ARCH", "gfx942")
         self._hipcc_available = self._check_hipcc()
         self._spec_cache: Dict[str, dict] = {}
+
+        # Persistent build directory — reuse across verify() calls
+        env_build_dir = os.environ.get("VERIFIER_BUILD_DIR")
+        if env_build_dir:
+            self.build_dir = Path(env_build_dir)
+            self.build_dir.mkdir(parents=True, exist_ok=True)
+        else:
+            self.build_dir = Path(tempfile.mkdtemp(prefix="verifier_build_"))
+
+    # ── hipcc warmup ────────────────────────────────────────────────
+
+    def warmup(self) -> str:
+        """Pre-warm hipcc by compiling a trivial kernel.
+
+        hipcc has noticeable cold-start latency on first invocation
+        (LLVM IR parsing, device-lib linking, etc.).  Calling
+        *warmup()* once before the first real verification skips
+        that penalty for the first real compile.
+
+        The compiled binary is also executed briefly to warm GPU
+        driver / ROCr runtime state.
+        """
+        if not self._hipcc_available:
+            return "hipcc not available — skipping warmup."
+
+        warmup_src = (
+            '#include <iostream>\n'
+            '#include <hip/hip_runtime.h>\n'
+            '\n'
+            '__global__ void _verifier_warmup_kernel() {\n'
+            '    // Intentionally empty — pre-warms hipcc compilation pipeline\n'
+            '}\n'
+            '\n'
+            'int main() {\n'
+            '    _verifier_warmup_kernel<<<1, 1>>>();\n'
+            '    hipDeviceSynchronize();\n'
+            '    std::cout << "warmup_ok" << std::endl;\n'
+            '    return 0;\n'
+            '}\n'
+        )
+
+        kernel_name = "_verifier_warmup"
+        src_file = self.build_dir / f"{kernel_name}.hip.cpp"
+        src_file.write_text(warmup_src)
+
+        compile_ok, compile_out = self._compile(src_file, self.build_dir, kernel_name)
+
+        if compile_ok:
+            self._run(self.build_dir, kernel_name)
+
+        # Clean up warmup artifacts
+        for f in self.build_dir.glob(f"{kernel_name}*"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+        try:
+            src_file.unlink()
+        except OSError:
+            pass
+
+        return compile_out
 
     # ── Spec loading ────────────────────────────────────────────────
 
@@ -297,16 +360,21 @@ int main() {{
 }}
 """
 
-    # ── Verify method (updated to be spec-aware) ────────────────────
+    # ── Verify method (using persistent build directory) ────────────
 
     def verify(self, hip_source: str, cuda_reference_output: str = "",
                test_input: str = "", kernel_name: str = "test_kernel") -> Dict:
         """
         Verify a ported HIP kernel:
-        1. Write source to temp file
+        1. Write source to persistent build directory
         2. Compile with hipcc
         3. Run executable
         4. Diff output against CUDA reference
+
+        Uses ``self.build_dir`` (set via the ``VERIFIER_BUILD_DIR`` env
+        var or an auto-created temporary directory) so artifacts survive
+        across calls for inspection and to avoid re-creating the build
+        tree each time.
         """
         result = {
             "kernel": kernel_name,
@@ -326,66 +394,67 @@ int main() {{
         if spec:
             result["spec_used"] = spec.get("kernel_name", kernel_name)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmp_path = Path(tmpdir)
+        # Persistent build directory — per-kernel subdirectory for isolation
+        kernel_build_dir = self.build_dir / kernel_name
+        kernel_build_dir.mkdir(parents=True, exist_ok=True)
 
-            # Write source
-            src_file = tmp_path / f"{kernel_name}.hip.cpp"
-            src_file.write_text(hip_source)
+        # Write source
+        src_file = kernel_build_dir / f"{kernel_name}.hip.cpp"
+        src_file.write_text(hip_source)
 
-            # Generate spec-driven harness
-            harness = self._generate_harness(kernel_name, test_input, hip_source)
-            harness_file = tmp_path / f"test_{kernel_name}.cpp"
-            harness_file.write_text(harness)
+        # Generate spec-driven harness
+        harness = self._generate_harness(kernel_name, test_input, hip_source)
+        harness_file = kernel_build_dir / f"test_{kernel_name}.cpp"
+        harness_file.write_text(harness)
 
-            # Step 1: Compile
-            compile_ok, compile_out = self._compile(harness_file, tmp_path, kernel_name)
-            result["compile_success"] = compile_ok
-            result["compile_output"] = compile_out[:1000] if compile_out else ""
+        # Step 1: Compile
+        compile_ok, compile_out = self._compile(harness_file, kernel_build_dir, kernel_name)
+        result["compile_success"] = compile_ok
+        result["compile_output"] = compile_out[:1000] if compile_out else ""
 
-            if not compile_ok:
-                manual_dir = Path.cwd() / "ported_kernels"
-                manual_dir.mkdir(parents=True, exist_ok=True)
-                manual_path = manual_dir / f"{kernel_name}.hip.cpp"
-                try:
-                    import shutil
-                    shutil.copy2(harness_file, manual_path)
-                    compile_out += f"\n\n⚠️ Ported kernel saved to: {manual_path}\n"
-                    compile_out += f"   Compile manually: hipcc -o /tmp/{kernel_name} {manual_path} -std=c++17 -O2\n"
-                    compile_out += f"   Run: /tmp/{kernel_name}"
-                except Exception:
-                    pass
-                result["passed"] = False
-                return result
+        if not compile_ok:
+            manual_dir = Path.cwd() / "ported_kernels"
+            manual_dir.mkdir(parents=True, exist_ok=True)
+            manual_path = manual_dir / f"{kernel_name}.hip.cpp"
+            try:
+                import shutil
+                shutil.copy2(harness_file, manual_path)
+                compile_out += f"\n\n⚠️ Ported kernel saved to: {manual_path}\n"
+                compile_out += f"   Compile manually: hipcc -o /tmp/{kernel_name} {manual_path} -std=c++17 -O2\n"
+                compile_out += f"   Run: /tmp/{kernel_name}"
+            except Exception:
+                pass
+            result["passed"] = False
+            return result
 
-            # Step 2: Run
-            run_ok, run_output, benchmark = self._run(tmp_path, kernel_name)
-            result["run_success"] = run_ok
-            result["run_output"] = run_output[:1000] if run_output else ""
-            result["benchmark_us"] = benchmark
+        # Step 2: Run
+        run_ok, run_output, benchmark = self._run(kernel_build_dir, kernel_name)
+        result["run_success"] = run_ok
+        result["run_output"] = run_output[:1000] if run_output else ""
+        result["benchmark_us"] = benchmark
 
-            if not run_ok:
-                result["passed"] = False
-                return result
+        if not run_ok:
+            result["passed"] = False
+            return result
 
-            # Step 3: Diff against reference (try spec path first, fallback to param)
-            ref_text = cuda_reference_output
-            spec_ref_path = spec.get("_reference_path") if spec else None
-            if spec_ref_path and not ref_text:
-                try:
-                    ref_text = Path(spec_ref_path).read_text()
-                except OSError:
-                    pass
+        # Step 3: Diff against reference (try spec path first, fallback to param)
+        ref_text = cuda_reference_output
+        spec_ref_path = spec.get("_reference_path") if spec else None
+        if spec_ref_path and not ref_text:
+            try:
+                ref_text = Path(spec_ref_path).read_text()
+            except OSError:
+                pass
 
-            if ref_text:
-                diff_ok, diff_report = self._diff(run_output, ref_text)
-                result["output_match"] = diff_ok
-                result["diff_report"] = diff_report[:500] if diff_report else ""
-                result["passed"] = diff_ok
-            else:
-                result["output_match"] = True
-                result["diff_report"] = "No reference — marked pass (compiled + ran successfully)"
-                result["passed"] = True
+        if ref_text:
+            diff_ok, diff_report = self._diff(run_output, ref_text)
+            result["output_match"] = diff_ok
+            result["diff_report"] = diff_report[:500] if diff_report else ""
+            result["passed"] = diff_ok
+        else:
+            result["output_match"] = True
+            result["diff_report"] = "No reference — marked pass (compiled + ran successfully)"
+            result["passed"] = True
 
         return result
 
@@ -398,7 +467,7 @@ int main() {{
         if self._hipcc_available:
             try:
                 if self._hipcc_path == "hipcc":
-                    cmd_line = f"hipcc -o {output_bin} {harness_file} -std=c++17 -O2 --offload-arch=gfx942"
+                    cmd_line = f"hipcc -o {output_bin} {harness_file} -std=c++17 -O2 --offload-arch={self.offload_arch}"
                     result = subprocess.run(
                         cmd_line, shell=True,
                         capture_output=True, text=True, timeout=60,
@@ -407,7 +476,7 @@ int main() {{
                 else:
                     result = subprocess.run(
                         [self._hipcc_path, "-o", str(output_bin), str(harness_file),
-                         "-std=c++17", "-O2", "--offload-arch=gfx942"],
+                         "-std=c++17", "-O2", f"--offload-arch={self.offload_arch}"],
                         capture_output=True, text=True, timeout=60,
                         cwd=str(build_dir)
                     )

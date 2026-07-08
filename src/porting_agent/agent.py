@@ -130,7 +130,7 @@ Output format: JSON with:
                     if code_text:
                         return {
                             "ported_code": self._fix_ported_code(code_text),
-                            "confidence": 70,
+                            "confidence": self._rubric_score_extracted(code_text),
                             "changes": ["LLM returned text — extracted code block"],
                             "explanation": "Code extracted from LLM text output"
                         }
@@ -174,7 +174,7 @@ Output format: JSON with:
                     if code_text:
                         return {
                             "ported_code": self._fix_ported_code(code_text),
-                            "confidence": 70,
+                            "confidence": self._rubric_score_extracted(code_text),
                             "changes": ["DeepSeek returned text — extracted code"],
                             "explanation": "Code extracted from DeepSeek text output"
                         }
@@ -206,6 +206,138 @@ Output format: JSON with:
         if match:
             return match.group(1).strip()
         return ""
+
+    @staticmethod
+    def _rubric_score(source_code: str, ported_code: str, changes: list,
+                      has_header: bool = False, cached: bool = False) -> int:
+        """Rubric-based confidence scoring for ported kernels (0-100).
+
+        Rubric dimensions:
+          - Wavefront Header (0-20) : #define WAVEFRONT_SIZE present in output
+          - Portability (0-30)      : code is already AMD-ready OR fixes applied
+          - Code Integrity (0-30)   : kernel structure preserved, non-empty
+          - Change Logging (0-20)   : changes list depth and variety
+
+        Special cases:
+          - "No changes needed" (code already AMD-compatible) → full Portability score
+          - Cached verified fix applied → high baseline + rubric sanity check
+        """
+        import re
+
+        # ── Dimension 1: Wavefront Header (0-20) ──
+        header_score = 0
+        if "#define WAVEFRONT_SIZE 64" in ported_code:
+            header_score = 20
+        elif "WAVEFRONT_SIZE" in ported_code:
+            header_score = 12
+
+        # ── Dimension 2: Portability (0-35) ──
+        no_changes_needed = any("no automatic changes needed" in c.lower()
+                                for c in changes)
+        fix_score = 0
+        if no_changes_needed:
+            # Code is already AMD-ready — high confidence
+            fix_score = 35
+        else:
+            change_categories = set()
+            for c in changes:
+                cl = c.lower()
+                if "wavefront" in cl:
+                    change_categories.add("wavefront")
+                if "mask" in cl or "0x3f" in cl or "0x1f" in cl:
+                    change_categories.add("mask")
+                if "shfl" in cl or "shuffle" in cl:
+                    change_categories.add("shuffle")
+                if "sync" in cl:
+                    change_categories.add("sync")
+                if "tile" in cl:
+                    change_categories.add("tile")
+                if "shared" in cl:
+                    change_categories.add("shared_mem")
+                if "lane" in cl:
+                    change_categories.add("lane_id")
+                if "ballot" in cl or "activemask" in cl:
+                    change_categories.add("ballot")
+                if "all_sync" in cl or "any_sync" in cl or "match_all" in cl:
+                    change_categories.add("predicate_sync")
+                if "warp_size" in cl or "warp_mask" in cl:
+                    change_categories.add("warp_size")
+                if "cached" in cl or "verified" in cl:
+                    change_categories.add("cached")
+            # Baseline (processing was done) + category bonus
+            fix_score = min(15 + len(change_categories) * 5, 35)
+
+        # ── Dimension 3: Code Integrity (0-30) ──
+        integrity_score = 0
+        code_len = len(ported_code.strip())
+        if code_len > 0:
+            integrity_score += 5
+        if code_len > 50:
+            integrity_score += 5
+        if code_len > 200:
+            integrity_score += 5
+        if "__global__" in ported_code or "__device__" in ported_code:
+            integrity_score += 10
+        elif "void" in ported_code and ("(" in ported_code and ")" in ported_code):
+            integrity_score += 5
+        if source_code and code_len >= len(source_code.strip()) * 0.5:
+            integrity_score += 5
+
+        # ── Dimension 4: Change Logging (0-20) ──
+        explain_score = 0
+        if changes:
+            if len(changes) >= 1:
+                explain_score += 5
+            if len(changes) >= 3:
+                explain_score += 5
+            if len(changes) >= 5:
+                explain_score += 5
+            if len(changes) >= 8:
+                explain_score += 5
+
+        total = header_score + fix_score + integrity_score + explain_score
+
+        # Cached pattern bonus: +5 if a verified pattern was applied
+        if cached:
+            total += 5
+
+        return min(total, 100)
+
+    @staticmethod
+    def _rubric_score_extracted(code_text: str) -> int:
+        """Rubric for code extracted from LLM text output (0-100).
+
+        Lower confidence because extraction is inherently lossy.
+        """
+        import re
+        score = 0
+
+        # Extraction Success (0-25)
+        if code_text and len(code_text.strip()) > 0:
+            score += 10
+        if len(code_text) > 50:
+            score += 15
+
+        # Code Completeness (0-40)
+        if "__global__" in code_text or "__device__" in code_text:
+            score += 25
+        elif "void" in code_text and re.search(r'\w+\s*\(', code_text):
+            score += 10
+
+        if re.search(r'#include\s*<', code_text):
+            score += 10
+        if re.search(r'\{[^}]*\}', code_text, re.DOTALL):
+            score += 5
+
+        # Structural Validity (0-35)
+        if re.search(r'__global__\s+void\s+\w+\s*\(', code_text):
+            score += 15
+        if re.search(r'threadIdx|blockIdx|blockDim', code_text):
+            score += 10
+        if re.search(r'(__shared__|__device__|__constant__)', code_text):
+            score += 10
+
+        return min(score, 100)
 
     @staticmethod
     def _fix_ported_code(code: str) -> str:
@@ -282,7 +414,7 @@ Output format: JSON with:
 
             # Fix 4: __syncwarp() → __syncthreads()
             if syncwarp_re.search(line):
-                line = syncwarp_re.sub('__syncthreads()  // wavefront64: full block sync', line)
+                line = syncwarp_re.sub('__syncthreads();  // wavefront64: full block sync', line)
                 if "wavefront64: full block sync" not in __import__('json').dumps(changes):
                     changes.append("__syncwarp() → __syncthreads() for HIP compatibility")
 
@@ -306,7 +438,7 @@ Output format: JSON with:
                 line = line.replace('0x1f', '0x3f')
 
             # Fix 7: Hardcoded WARP_SIZE = 32 (with or without const)
-            line = warp_size_re.sub('const int WAVEFRONT_SIZE = 64  // AMD wavefront', line)
+            line = warp_size_re.sub('const int WAVEFRONT_SIZE = 64;  // AMD wavefront', line)
             
             # Fix 7b: #define WARP_SIZE 32 (preprocessor macro style)
             if '#define WARP_SIZE' in line and warp_size_define_re.search(line):
@@ -316,9 +448,9 @@ Output format: JSON with:
 
             # Fix 8: __ballot_sync — fix mask and annotate
             if ballot_re.search(line):
-                line = ballot_re.sub('__ballot_sync(0x3f', line)
+                line = ballot_re.sub('__ballot_sync(0xffffffffffffffffULL', line)
                 if "ballot_sync mask" not in str(changes):
-                    changes.append("__ballot_sync mask 0x1f→0x3f for wavefront64")
+                    changes.append("__ballot_sync mask → 0xffffffffffffffffULL for wavefront64")
             
             # Fix 8b: __shfl_xor_sync — annotate as wavefront-dependent
             if shfl_xor_re.search(line):
@@ -337,12 +469,12 @@ Output format: JSON with:
 
             # Fix 8e: int WARP_MASK = 0x1f → int WAVEFRONT_MASK = 0x3f
             if warp_mask_re.search(line):
-                line = warp_mask_re.sub('int WAVEFRONT_MASK = 0x3f  // wavefront64 mask', line)
+                line = warp_mask_re.sub('int WAVEFRONT_MASK = 0x3f;  // wavefront64 mask', line)
                 if "WARP_MASK → WAVEFRONT_MASK" not in str(changes):
                     changes.append("WARP_MASK 0x1f (32) → WAVEFRONT_MASK 0x3f (64)")
 
             # Fix 8f: tid & 0x1f == 0 → tid & 0x3f == 0 (warp mask check)
-            line = tid_warp_mask_re.sub(r'\1 0x3f\2  // wavefront64', line)
+            line = tid_warp_mask_re.sub(r'\1 0x3f\2', line)
 
             # Fix 8g: blockIdx.* * TILE_SIZE → blockIdx.* * WAVEFRONT_SIZE
             line = blockidx_tile_re.sub(r'\1 WAVEFRONT_SIZE', line)
@@ -359,11 +491,11 @@ Output format: JSON with:
                 if "mask_64bit" not in str(changes):
                     changes.append("__shfl_*_sync: mask 0xffffffff → 0xffffffffffffffffULL (64-bit for wavefront64)")
 
-            # Fix 9: __activemask() → __ballot_sync(0xffffffff, 1) on HIP
+            # Fix 9: __activemask() → __ballot_sync(0xffffffffffffffffULL, 1) on HIP
             if activemask_re.search(line):
-                line = activemask_re.sub('__ballot_sync(0xffffffff, 1)', line)
+                line = activemask_re.sub('__ballot_sync(0xffffffffffffffffULL, 1)', line)
                 if "activemask" not in str(changes):
-                    changes.append("__activemask() → __ballot_sync(0xffffffff, 1) for HIP compatibility")
+                    changes.append("__activemask() → __ballot_sync(0xffffffffffffffffULL, 1) for HIP compatibility")
 
             # Fix 10: __all_sync / __any_sync — annotate for wavefront64
             if all_sync_re.search(line):
@@ -379,7 +511,7 @@ Output format: JSON with:
                     changes.append("__match_all_sync: no direct HIP equivalent — may need algorithm redesign")
 
             # Fix 12: threadIdx.x >> 5 (warp index) → >> 6 for wavefront64
-            line = warp_lane_shift_re.sub(r'\1 6  // wavefront64: 64 lanes', line)
+            line = warp_lane_shift_re.sub(r'\1 6;  // wavefront64: 64 lanes', line)
 
             # Fix 13: lane_id < 32 → lane_id < 64 (wavefront boundary)
             if lane_id_32_re.search(line):
@@ -431,16 +563,25 @@ Output format: JSON with:
                 unique_changes.append(c)
 
         # Apply cached pattern if available
-        confidence = 85  # template port confidence (0-100 scale)
-        if cached_pattern:
-            cached_conf = cached_pattern.get("confidence", 85)
-            # Normalize if stored as 0-1 scale
-            if cached_conf < 1:
-                cached_conf = cached_conf * 100
-            confidence = min(95, cached_conf + 5)
+        has_cached = cached_pattern is not None
+        if has_cached:
             unique_changes.append(f"Applied cached pattern from verified fix (id: {cached_pattern.get('id', 'unknown')})")
             if cached_pattern.get("verified_fix"):
                 code = cached_pattern["verified_fix"]
+
+        # Rubric-based confidence scoring
+        has_wavefront_header = "#define WAVEFRONT_SIZE 64" in code
+        confidence = self._rubric_score(source_code, code, unique_changes,
+                                        has_header=has_wavefront_header,
+                                        cached=has_cached)
+
+        # When a verified cached fix is used, confidence should reflect
+        # the cached pattern's stored verification result (known-good code).
+        if has_cached and cached_pattern.get("verified_fix"):
+            cached_conf = cached_pattern.get("confidence", 0.85)
+            if cached_conf < 1:
+                cached_conf = cached_conf * 100
+            confidence = max(confidence, int(cached_conf))
 
         return {
             "ported_code": code,

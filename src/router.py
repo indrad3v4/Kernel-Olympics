@@ -123,6 +123,67 @@ class ModelRouter:
         )
         return code
 
+    @staticmethod
+    def _rubric_score_pipeline(kimi_success: bool, glm_success: bool,
+                               verify_success: bool, verify_passed: bool,
+                               has_ported_code: bool, ported_code: str,
+                               changes_count: int) -> int:
+        """Rubric-based pipeline confidence score (0-100).
+
+        Dimensions:
+          - Pipeline Completion (0-35): which stages ran successfully
+          - Code Quality (0-35): generated code structure
+          - Verification Outcome (0-30): pass/fail with rationale
+        """
+        score = 0
+
+        # ── Dimension 1: Pipeline Completion (0-35) ──
+        if kimi_success:
+            score += 12
+        if glm_success:
+            score += 18
+        if verify_success:
+            score += 5
+
+        # ── Dimension 2: Code Quality (0-35) ──
+        if has_ported_code and len(ported_code.strip()) > 50:
+            score += 10
+            if "__global__" in ported_code or "__device__" in ported_code:
+                score += 15
+            if "threadIdx" in ported_code or "blockIdx" in ported_code or "blockDim" in ported_code:
+                score += 10
+
+        # ── Dimension 3: Verification Outcome (0-30) ──
+        if verify_passed:
+            score += 30
+        elif verify_success:
+            # Verification ran but found issues — partial credit
+            score += 10
+
+        return min(score, 100)
+
+    @staticmethod
+    def _rubric_score_response(output: str) -> float:
+        """Rubric for individual model response quality (0.0-1.0).
+
+        Evaluates the structural quality of the response text.
+        """
+        if not output or len(output.strip()) == 0:
+            return 0.0
+        score = 0.3  # baseline: non-empty response
+        import re
+        if len(output) > 100:
+            score += 0.1
+        if "__global__" in output or "void" in output:
+            score += 0.15
+        if re.search(r'```(?:cuda|hip|cpp)?\n', output):
+            score += 0.15
+        if re.search(r'\{[^}]*\}', output, re.DOTALL):
+            score += 0.15
+        if "threadIdx" in output or "blockIdx" in output:
+            score += 0.15
+        return min(score, 1.0)
+
     def route(self, kernel_source: str, patterns: List[Dict]) -> Dict:
         """Route kernel through best models based on detected patterns.
 
@@ -141,6 +202,12 @@ class ModelRouter:
         result = {"ported_code": "", "confidence": 0,
                   "changes": [], "model_used": "", "cost": 0}
 
+        # Track pipeline phase outcomes for rubric scoring
+        kimi_success = False
+        glm_success = False
+        verify_success = False
+        verify_passed = False
+
         # Phase 1: Kimi plans the fix (if complex patterns present)
         if "kimi" in models_needed and any("shfl" in pt for pt in pattern_types):
             plan = self._call_model("kimi",
@@ -148,8 +215,8 @@ class ModelRouter:
                 f"Identify which lines need changes and why.\n\n```cuda\n{kernel_source[:2000]}\n```\n\n"
                 f"Output format: JSON list of {{line, issue, fix}}")
             if plan.success:
+                kimi_success = True
                 result["changes"].append(f"[kimi] {plan.output[:200]}")
-                result["confidence"] += 0.3
 
         # Phase 2: GLM generates the code
         if "glm" in models_needed or True:  # always try glm for code gen
@@ -162,11 +229,11 @@ class ModelRouter:
                 f"```cuda\n{kernel_source[:2000]}\n```\n\n"
                 f"Output ONLY the ported kernel code, no explanation.")
             if code.success:
+                glm_success = True
                 extracted = self._extract_code(code.output)
                 extracted = self._fix_ported_code(extracted)
                 result["ported_code"] = extracted
                 result["changes"].append(f"[glm] Generated ported kernel")
-                result["confidence"] += 0.4
 
         # Phase 3: DeepSeek verifies the output
         if result["ported_code"] and "deepseek" in models_needed:
@@ -177,14 +244,23 @@ class ModelRouter:
                 f"```hip\n{result['ported_code'][:2000]}\n```\n\n"
                 f"Output: 'PASS' or 'ISSUES: ...'")
             if verify.success:
+                verify_success = True
                 if "PASS" in verify.output.upper()[:10]:
-                    result["confidence"] += 0.3
+                    verify_passed = True
                     result["changes"].append(f"[deepseek] Verified — no issues found")
                 else:
                     result["changes"].append(f"[deepseek] Issues found: {verify.output[:200]}")
-                    result["confidence"] -= 0.2
 
-        result["confidence"] = min(result["confidence"], 1.0) * 100
+        # Rubric-based scoring replaces the old additive confidence model
+        result["confidence"] = self._rubric_score_pipeline(
+            kimi_success=kimi_success,
+            glm_success=glm_success,
+            verify_success=verify_success,
+            verify_passed=verify_passed,
+            has_ported_code=bool(result["ported_code"]),
+            ported_code=result["ported_code"],
+            changes_count=len(result["changes"]),
+        )
         result["cost"] = round(self.total_cost, 4)
         return result
 
@@ -215,7 +291,7 @@ class ModelRouter:
                 cost = tokens / 1000 * MODEL_CATALOG[model_key]["cost_per_1k"]
                 self.total_cost += cost
                 self.call_log.append({"model": model_key, "tokens": tokens, "cost": cost})
-                return AgentResult(model_key, True, content, 0.7, tokens, round((time.perf_counter()-t0)*1000, 1))
+                return AgentResult(model_key, True, content, self._rubric_score_response(content), tokens, round((time.perf_counter()-t0)*1000, 1))
         except Exception:
             pass
 
@@ -236,7 +312,7 @@ class ModelRouter:
                 content = data["choices"][0]["message"]["content"]
                 cost = 0  # local = free
                 self.call_log.append({"model": model_key, "source": "local-vllm", "cost": cost})
-                return AgentResult(model_key, True, content, 0.85, 0, round((time.perf_counter()-t0)*1000, 1))
+                return AgentResult(model_key, True, content, self._rubric_score_response(content), 0, round((time.perf_counter()-t0)*1000, 1))
         except Exception:
             pass
 

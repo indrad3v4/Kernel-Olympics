@@ -538,7 +538,6 @@ def run_demo(reset: bool = False):
 
     # Decide whether we can do realistic LLM timing
     has_api = bool(os.getenv("FIREWORKS_API_KEY"))
-    DEMO_LLM_S = 12.0  # simulated LLM time for demo when no real API
 
     print(bold("╔═ Kernel Olympics — Demo Mode ══════════════════════════╗"))
     print(bold("║") + " Demonstrating: Pattern Memory 'Second Kernel is Faster'  " + bold("║"))
@@ -575,7 +574,7 @@ def run_demo(reset: bool = False):
         print(f"║ {green('●')} Retrieved in {green(f'{cache_ms:.1f}ms')}  "
               f"{dim(f'(jaccard: {jaccard_val:.0%})')}")
         # For the speed comparison, still show a "what if it was LLM" baseline
-        llm_elapsed = warp_cached.get("llm_time_s", DEMO_LLM_S) or DEMO_LLM_S
+        llm_elapsed = warp_cached.get("llm_time_s", 0.0) or 0.0
         simulated_first = True
         warp_port_result = {
             "ported_code": warp_cached["verified_fix"],
@@ -593,9 +592,8 @@ def run_demo(reset: bool = False):
         simulated_first = False
         if not has_api:
             simulated_first = True
-            print(f"║ {dim('(template port took {:.2f}s — simulating {:.1f}s LLM call)')}  ".format(
-                llm_elapsed, DEMO_LLM_S))
-            llm_elapsed = DEMO_LLM_S
+            print(f"║ {dim('(template port completed in {:.2f}s — simulated LLM)')}  ".format(
+                llm_elapsed))
 
         # Store with forced LLM-time simulation
         demo_memory.record_llm_time(llm_elapsed)
@@ -656,7 +654,7 @@ def run_demo(reset: bool = False):
 
     if simulated_first or existing_count > 0:
         print(f"║ {green('●')} Kernel 1 ({dim('LLM call, no cache')}): "
-              f"{yellow(f'{first_ms:.0f}ms')} {'':>6} {dim('(value engineering: 12s real LLM)')}")
+              f"{yellow(f'{first_ms:.0f}ms')} {'':>6} {dim('(simulated LLM — template port timing)')}")
     else:
         print(f"║ {green('●')} Kernel 1 ({dim('LLM call, no cache')}): "
               f"{yellow(f'{first_ms:.0f}ms')}")
@@ -666,7 +664,7 @@ def run_demo(reset: bool = False):
           f"{dim(f'(analysis: ~{llm_elapsed:.1f}s LLM → ~{second_ms:.0f}ms cache)')}")
     print(f"║                                                 ")
     if cached:
-        print(f"║ {dim('Pattern memory avoided a {:.0f}s LLM call'.format(llm_elapsed))}")
+        print(f"║ {dim('Pattern memory avoided a {:.2f}s LLM call'.format(llm_elapsed))}")
     print(f"║ {dim('Demo complete. Pattern memory proves: similar kernels')}")
     print(f"║ {dim('get faster as the cache grows.')}   ")
     print(bold("╚════════════════════════════════════════════════════════╝"))
