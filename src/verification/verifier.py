@@ -13,8 +13,11 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Any
 from dataclasses import dataclass
+
+# ── Spec directory (relative to this file) ──────────────────────────
+_SPEC_DIR = Path(__file__).parent / "specs"
 
 
 @dataclass
@@ -27,6 +30,7 @@ class VerificationResult:
     run_output: str
     diff_report: str
     benchmark_us: Optional[float] = None
+    spec_name: Optional[str] = None
 
 
 class VerificationAgent:
@@ -35,8 +39,267 @@ class VerificationAgent:
     def __init__(self, docker_image: str = "rocm/dev-ubuntu-22.04:latest"):
         self.docker_image = docker_image
         self._hipcc_available = self._check_hipcc()
+        self._spec_cache: Dict[str, dict] = {}
 
-    def verify(self, hip_source: str, cuda_reference_output: str,
+    # ── Spec loading ────────────────────────────────────────────────
+
+    def list_specs(self) -> list[str]:
+        """Return all available kernel spec names (without .json)."""
+        if not _SPEC_DIR.is_dir():
+            return []
+        return sorted(f.stem for f in _SPEC_DIR.glob("*.json"))
+
+    def load_spec(self, kernel_name: str) -> Optional[dict]:
+        """Load a kernel spec by name from the specs/ directory."""
+        if kernel_name in self._spec_cache:
+            return self._spec_cache[kernel_name]
+
+        spec_path = _SPEC_DIR / f"{kernel_name}.json"
+        if not spec_path.exists():
+            return None
+
+        with open(spec_path) as f:
+            spec = json.load(f)
+
+        # Resolve reference_output relative to repo root
+        ref = spec.get("reference_output", "")
+        if ref and not Path(ref).is_absolute():
+            # Walk up from specs/ to find the repo root
+            repo_root = _SPEC_DIR.parent.parent.parent  # src/verification/specs → repo
+            resolved = repo_root / ref
+            if resolved.exists():
+                spec["_reference_path"] = str(resolved)
+
+        self._spec_cache[kernel_name] = spec
+        return spec
+
+    # ── Spec-driven harness generation ──────────────────────────────
+
+    def _generate_harness(self, kernel_name: str, test_input: str,
+                          ported_kernel_source: str) -> str:
+        """
+        Generate a test harness driven by the kernel's JSON spec.
+
+        If a spec exists for *kernel_name* it is used to produce the
+        correct launch configuration, parameter list, input setup, and
+        output readback.  Otherwise falls back to the legacy heuristic
+        (auto-detect kernel function, generic 256‑element harness).
+        """
+        # Try loading the spec
+        spec = self.load_spec(kernel_name)
+
+        if spec is not None:
+            return self._harness_from_spec(spec, ported_kernel_source)
+
+        # Fallback: legacy heuristic
+        import re
+        match = re.search(r'__global__\s+void\s+(\w+)\s*\(', ported_kernel_source)
+        actual_kernel = match.group(1) if match else f"{kernel_name}_kernel"
+        return self._legacy_harness(actual_kernel, ported_kernel_source)
+
+    def _harness_from_spec(self, spec: dict, ported_kernel_source: str) -> str:
+        """Build a C++ harness from a kernel spec dictionary."""
+        fn = spec.get("kernel_function", "kernel")
+        params = spec.get("params", [])
+        launch = spec.get("launch", {"grid": {"x": 1}, "block": {"x": 64}})
+        inp = spec.get("input_setup", {})
+        out = spec.get("output_readback", {"count": 4, "element_type": "float",
+                                             "format": "float_per_line"})
+
+        grid = launch["grid"]
+        block = launch["block"]
+        gx = grid.get("x", 1); gy = grid.get("y", 1); gz = grid.get("z", 1)
+        bx = block.get("x", 64); by = block.get("y", 1); bz = block.get("z", 1)
+        total_threads = gx * gy * gz * bx * by * bz
+
+        readback_count = out.get("count", 4)
+        elem_type = out.get("element_type", "float")
+        is_int = elem_type.startswith("int")
+
+        # Input data size
+        input_count = inp.get("count", total_threads)
+        default_val = inp.get("default_value", 0.0)
+        linear_ramp = inp.get("linear_ramp", False)
+
+        # Collect scalar argument overrides
+        scalar_overrides = {}
+        kernel_args_override = spec.get("kernel_args_override", "")
+        if kernel_args_override:
+            vals = [v.strip() for v in kernel_args_override.split(",")]
+            scalar_idx = 0
+            for p in params:
+                if p["direction"] == "scalar":
+                    if scalar_idx < len(vals):
+                        scalar_overrides[p["name"]] = vals[scalar_idx]
+                    scalar_idx += 1
+
+        # Build input setup lines
+        input_lines = []
+        if linear_ramp:
+            input_lines.append(
+                f"    std::vector<{elem_type}> input({input_count});"
+            )
+            input_lines.append(
+                f"    for (int i = 0; i < {input_count}; i++) input[i] = static_cast<{elem_type}>(i + 1);"
+            )
+        else:
+            input_lines.append(
+                f"    std::vector<{elem_type}> input({input_count}, "
+                f"static_cast<{elem_type}>({default_val}));"
+            )
+
+        # Build output buffer
+        output_lines = [
+            f"    std::vector<{elem_type}> output({input_count}, 0);"
+        ]
+
+        # Build variable declarations for pointer params
+        decl_lines = []
+        alloc_lines = []
+        memcpy_h2d_lines = []
+        memcpy_d2h_lines = []
+        free_lines = []
+        kernel_args = []
+        scalar_init_lines = []
+
+        for p in params:
+            name = p["name"]
+            ptype = p["type"]
+            direction = p["direction"]
+
+            if direction == "scalar":
+                if name in scalar_overrides:
+                    scalar_init_lines.append(
+                        f"    int {name} = {scalar_overrides[name]};"
+                    )
+                else:
+                    val = p.get("value", input_count)
+                    scalar_init_lines.append(
+                        f"    int {name} = {val};"
+                    )
+                kernel_args.append(name)
+            else:
+                size_expr = p.get("size_expr", str(input_count))
+                decl_lines.append(f"    {ptype} d_{name};")
+                alloc_lines.append(
+                    f"    hipMalloc(&d_{name}, {size_expr} * sizeof({elem_type}));"
+                )
+                if direction == "in":
+                    memcpy_h2d_lines.append(
+                        f"    hipMemcpy(d_{name}, {name}.data(), "
+                        f"{size_expr} * sizeof({elem_type}), hipMemcpyHostToDevice);"
+                    )
+                else:
+                    memcpy_d2h_lines.append(
+                        f"    hipMemcpy({name}.data(), d_{name}, "
+                        f"{size_expr} * sizeof({elem_type}), hipMemcpyDeviceToHost);"
+                    )
+                free_lines.append(f"    hipFree(d_{name});")
+                kernel_args.append(f"d_{name}")
+
+        # Dynamic shared memory
+        dynamic_smem = spec.get("dynamic_shared_mem", 0)
+        dsmem_suffix = f", {dynamic_smem}" if dynamic_smem else ""
+
+        # Build print / output format
+        print_lines = []
+        if out.get("format") == "int_per_line":
+            for i in range(readback_count):
+                print_lines.append(
+                    f'        std::cout << output[{i}] << std::endl;'
+                )
+        else:
+            for i in range(readback_count):
+                print_lines.append(
+                    f'        std::cout << std::fixed << output[{i}] << std::endl;'
+                )
+
+        # Build parameter and kernel-call string
+        kernel_call_args = ", ".join(kernel_args)
+
+        # Assemble full harness
+        lines = [
+            '#include <iostream>',
+            '#include <iomanip>',
+            '#include <vector>',
+            '#include <hip/hip_runtime.h>',
+            '#include <cmath>',
+            '',
+            ported_kernel_source,
+            '',
+            'int main() {',
+        ]
+
+        for line in scalar_init_lines:
+            lines.append(line)
+        for line in input_lines:
+            lines.append(line)
+        for line in output_lines:
+            lines.append(line)
+        for line in decl_lines:
+            lines.append(line)
+        for line in alloc_lines:
+            lines.append(line)
+        for line in memcpy_h2d_lines:
+            lines.append(line)
+
+        lines.append(
+            f'    {fn}<<<dim3({gx},{gy},{gz}), dim3({bx},{by},{bz}){dsmem_suffix}>>>({kernel_call_args});'
+        )
+        lines.append('    hipDeviceSynchronize();')
+
+        for line in memcpy_d2h_lines:
+            lines.append(line)
+
+        for line in print_lines:
+            lines.append(line)
+
+        for line in free_lines:
+            lines.append(line)
+        lines.append('    return 0;')
+        lines.append('}')
+
+        return '\n'.join(lines)
+
+    def _legacy_harness(self, actual_kernel: str, ported_kernel_source: str) -> str:
+        """Legacy fallback harness (hardcoded 256-element generic harness)."""
+        return f"""
+#include <iostream>
+#include <vector>
+#include <hip/hip_runtime.h>
+#include <cmath>
+
+{ported_kernel_source}
+
+int main() {{
+    const int N = 256;
+    std::vector<float> input(N, 1.0f);
+    std::vector<float> output(N, 0.0f);
+
+    float *d_input, *d_output;
+    hipMalloc(&d_input, N * sizeof(float));
+    hipMalloc(&d_output, N * sizeof(float));
+
+    hipMemcpy(d_input, input.data(), N * sizeof(float), hipMemcpyHostToDevice);
+
+    {actual_kernel}<<<4, 64>>>(d_input, d_output, N);
+    hipDeviceSynchronize();
+
+    hipMemcpy(output.data(), d_output, 4 * sizeof(float), hipMemcpyDeviceToHost);
+
+    for (int i = 0; i < 4; i++) {{
+        std::cout << output[i] << std::endl;
+    }}
+
+    hipFree(d_input);
+    hipFree(d_output);
+    return 0;
+}}
+"""
+
+    # ── Verify method (updated to be spec-aware) ────────────────────
+
+    def verify(self, hip_source: str, cuda_reference_output: str = "",
                test_input: str = "", kernel_name: str = "test_kernel") -> Dict:
         """
         Verify a ported HIP kernel:
@@ -54,8 +317,14 @@ class VerificationAgent:
             "compile_output": "",
             "run_output": "",
             "diff_report": "",
-            "benchmark_us": None
+            "benchmark_us": None,
+            "spec_used": None
         }
+
+        # Record spec if one exists
+        spec = self.load_spec(kernel_name)
+        if spec:
+            result["spec_used"] = spec.get("kernel_name", kernel_name)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -64,7 +333,7 @@ class VerificationAgent:
             src_file = tmp_path / f"{kernel_name}.hip.cpp"
             src_file.write_text(hip_source)
 
-            # Write test harness if not provided
+            # Generate spec-driven harness
             harness = self._generate_harness(kernel_name, test_input, hip_source)
             harness_file = tmp_path / f"test_{kernel_name}.cpp"
             harness_file.write_text(harness)
@@ -75,7 +344,6 @@ class VerificationAgent:
             result["compile_output"] = compile_out[:1000] if compile_out else ""
 
             if not compile_ok:
-                # Save ported kernel for manual compilation on AMD GPU
                 manual_dir = Path.cwd() / "ported_kernels"
                 manual_dir.mkdir(parents=True, exist_ok=True)
                 manual_path = manual_dir / f"{kernel_name}.hip.cpp"
@@ -100,19 +368,28 @@ class VerificationAgent:
                 result["passed"] = False
                 return result
 
-            # Step 3: Diff against reference (if available)
-            if cuda_reference_output:
-                diff_ok, diff_report = self._diff(run_output, cuda_reference_output)
+            # Step 3: Diff against reference (try spec path first, fallback to param)
+            ref_text = cuda_reference_output
+            spec_ref_path = spec.get("_reference_path") if spec else None
+            if spec_ref_path and not ref_text:
+                try:
+                    ref_text = Path(spec_ref_path).read_text()
+                except OSError:
+                    pass
+
+            if ref_text:
+                diff_ok, diff_report = self._diff(run_output, ref_text)
                 result["output_match"] = diff_ok
                 result["diff_report"] = diff_report[:500] if diff_report else ""
                 result["passed"] = diff_ok
             else:
-                # No reference — compile + run success = pass (self-consistency)
                 result["output_match"] = True
                 result["diff_report"] = "No reference — marked pass (compiled + ran successfully)"
                 result["passed"] = True
 
         return result
+
+    # ── Compile / Run / Diff helpers (unchanged from original) ──────
 
     def _compile(self, harness_file: Path, build_dir: Path, kernel_name: str) -> tuple:
         """Compile HIP kernel with hipcc."""
@@ -120,7 +397,6 @@ class VerificationAgent:
 
         if self._hipcc_available:
             try:
-                # hipcc may be a shell wrapper — use shell=True if path is just "hipcc"
                 if self._hipcc_path == "hipcc":
                     cmd_line = f"hipcc -o {output_bin} {harness_file} -std=c++17 -O2 --offload-arch=gfx942"
                     result = subprocess.run(
@@ -137,7 +413,6 @@ class VerificationAgent:
                     )
                 return result.returncode == 0, result.stdout + result.stderr
             except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-                # Save ported kernel for manual compilation
                 manual_dir = Path.cwd() / "ported_kernels"
                 manual_dir.mkdir(parents=True, exist_ok=True)
                 manual_path = manual_dir / f"{kernel_name}.hip.cpp"
@@ -152,8 +427,6 @@ class VerificationAgent:
                     f"Then run: /tmp/{kernel_name}"
                 )
         else:
-            # hipcc not found via paths — save ported kernel for manual compilation
-            # Save to persistent location (not temp dir which gets cleaned up)
             manual_dir = Path.cwd() / "ported_kernels"
             manual_dir.mkdir(parents=True, exist_ok=True)
             manual_path = manual_dir / f"{kernel_name}.hip.cpp"
@@ -216,49 +489,10 @@ class VerificationAgent:
                                     fromfile='expected', tofile='actual', lineterm='')
         return False, "\n".join(list(diff)[:20])
 
-    def _generate_harness(self, kernel_name: str, test_input: str, ported_kernel_source: str) -> str:
-        """Generate a test harness that wraps the REAL ported kernel."""
-        # Auto-detect kernel function name from ported source
-        import re
-        match = re.search(r'__global__\s+void\s+(\w+)\s*\(', ported_kernel_source)
-        actual_kernel = match.group(1) if match else f"{kernel_name}_kernel"
-        return f"""
-#include <iostream>
-#include <vector>
-#include <hip/hip_runtime.h>
-#include <cmath>
-
-{ported_kernel_source}
-
-int main() {{
-    const int N = 256;
-    std::vector<float> input(N, 1.0f);
-    std::vector<float> output(N, 0.0f);
-
-    float *d_input, *d_output;
-    hipMalloc(&d_input, N * sizeof(float));
-    hipMalloc(&d_output, N * sizeof(float));
-
-    hipMemcpy(d_input, input.data(), N * sizeof(float), hipMemcpyHostToDevice);
-
-    {actual_kernel}<<<4, 64>>>(d_input, d_output, N);
-    hipDeviceSynchronize();
-
-    hipMemcpy(output.data(), d_output, 4 * sizeof(float), hipMemcpyDeviceToHost);
-
-    for (int i = 0; i < 4; i++) {{
-        std::cout << output[i] << std::endl;
-    }}
-
-    hipFree(d_input);
-    hipFree(d_output);
-    return 0;
-}}
-"""
+    # ── hipcc detection (unchanged from original) ───────────────────
 
     def _check_hipcc(self) -> bool:
         """Check if hipcc is available on this system (any known path)."""
-        # Try direct path first (for real binaries)
         candidates = ["hipcc", "/opt/rocm/bin/hipcc", "/opt/rocm/lib/llvm/bin/hipcc",
                        "/opt/rocm-7.2.1/bin/hipcc", "/opt/rocm-7.2.1/lib/llvm/bin/hipcc",
                        "/usr/bin/hipcc"]
@@ -270,7 +504,6 @@ int main() {{
                     return True
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 continue
-        # Try via shell (for shell wrappers like ROCm's hipcc)
         try:
             result = subprocess.run("which hipcc 2>/dev/null || command -v hipcc 2>/dev/null",
                                     shell=True, capture_output=True, text=True, timeout=5)
@@ -279,7 +512,6 @@ int main() {{
                 return True
         except subprocess.TimeoutExpired:
             pass
-        # Try shell=True execution
         try:
             result = subprocess.run("hipcc --version", shell=True,
                                     capture_output=True, text=True, timeout=5)
@@ -288,7 +520,6 @@ int main() {{
                 return True
         except subprocess.TimeoutExpired:
             pass
-        # Last resort: glob /opt/rocm* for hipcc
         import glob
         for match in glob.glob("/opt/rocm*/**/hipcc", recursive=True):
             self._hipcc_path = match

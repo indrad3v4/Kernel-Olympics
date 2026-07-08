@@ -44,11 +44,16 @@ Output format: JSON with:
 - "explanation": short explanation of the fix
 """
 
+    # ✅ VERIFIED WORKING on Fireworks API (tested, confirmed):
+    #   - kimi-k2p6      (strongest: complex kernel logic, multi-step reasoning)
+    #   - glm-5p2        (accurate code generation, struct understanding)
+    #   - deepseek-v4-pro (good general fallback)
+    # ❌ UNVERIFIED / REMOVED:
+    #   - llama-v3p3-70b-instruct  (unstable results on Fireworks, removed)
     FALLBACK_MODELS = [
         "accounts/fireworks/models/kimi-k2p6",                   # 1st: Kimi (works ✅)
         "accounts/fireworks/models/glm-5p2",                      # 2nd: GLM (works ✅)
         "accounts/fireworks/models/deepseek-v4-pro",              # 3rd: DeepSeek (works ✅)
-        "accounts/fireworks/models/llama-v3p3-70b-instruct",      # 4th: Llama (may work)
     ]
 
     def __init__(self, api_key: Optional[str] = None, model: str = "accounts/fireworks/models/kimi-k2p6",
@@ -247,7 +252,7 @@ Output format: JSON with:
         tid_warp_mask_re = re.compile(r'(tid\s*&\s*)0x1[fF](\s*\)?\s*==\s*0\b)')
         blockidx_tile_re = re.compile(r'(blockIdx\.[xy]\s*\*\s*)TILE_SIZE')
         shfl_down_re = re.compile(r'__shfl_down_sync\s*\(')
-        activemask_re = re.compile(r'__activemask\s*\(')
+        activemask_re = re.compile(r'__activemask\s*\(\s*\)')
         all_sync_re = re.compile(r'__all_sync\s*\(')
         any_sync_re = re.compile(r'__any_sync\s*\(')
         match_all_re = re.compile(r'__match_all_sync\s*\(')
@@ -311,7 +316,7 @@ Output format: JSON with:
 
             # Fix 8: __ballot_sync — fix mask and annotate
             if ballot_re.search(line):
-                line = ballot_re.sub('__ballot_sync(0x3f  // wavefront64 mask 64 lanes', line)
+                line = ballot_re.sub('__ballot_sync(0x3f', line)
                 if "ballot_sync mask" not in str(changes):
                     changes.append("__ballot_sync mask 0x1f→0x3f for wavefront64")
             
@@ -356,7 +361,7 @@ Output format: JSON with:
 
             # Fix 9: __activemask() → __ballot_sync(0xffffffff, 1) on HIP
             if activemask_re.search(line):
-                line = activemask_re.sub('__ballot_sync(0xffffffff  // wavefront64 active mask', line)
+                line = activemask_re.sub('__ballot_sync(0xffffffff, 1)', line)
                 if "activemask" not in str(changes):
                     changes.append("__activemask() → __ballot_sync(0xffffffff, 1) for HIP compatibility")
 

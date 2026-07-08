@@ -2,7 +2,7 @@
 Model Router — Lightweight agent orchestration for CUDA→ROCm porting.
 
 Architecture:
-  Risk Classifier → Model Router → Kimi (planner) OR GLM (coder) OR Gemma (verifier)
+  Risk Classifier → Model Router → Kimi (planner) OR GLM (coder) OR DeepSeek (fallback/verifier)
                     ↓                    ↓                          ↓
                Pattern Memory ←─── verified fix ←───────────── real AMD GPU
 
@@ -19,6 +19,16 @@ from dataclasses import dataclass, field
 
 
 # ── Model catalog ────────────────────────────────────────────────
+# ✅ VERIFIED WORKING on Fireworks API (tested, confirmed):
+#   - kimi-k2p6    (planner — complex kernel logic, multi-step reasoning)
+#   - glm-5p2      (coder — accurate code generation)
+#   - deepseek-v4-pro (fallback — general purpose)
+#
+# ❌ UNVERIFIED / REMOVED (not confirmed working, removed from catalog):
+#   - gemma-4-31b-it  (dedicated deployment only, not available via Fireworks API)
+#   - llama-v3p3-70b-instruct (unstable results on Fireworks)
+#
+# Only verified models are kept to avoid silent failures during porting.
 
 MODEL_CATALOG = {
     "kimi": {
@@ -33,12 +43,11 @@ MODEL_CATALOG = {
         "strength": "accurate code generation, struct understanding",
         "cost_per_1k": 0.0014,
     },
-    "gemma4": {
-        "id": "accounts/fireworks/models/gemma-4-31b-it",
-        "role": "verifier",
-        "strength": "cheap, fast, good at spotting errors",
-        "cost_per_1k": 0.0003,
-        "access": "dedicated deployment only — use local vLLM on AMD GPU instead",
+    "deepseek": {
+        "id": "accounts/fireworks/models/deepseek-v4-pro",  # ✅ VERIFIED WORKING
+        "role": "fallback/verifier",
+        "strength": "general purpose, good fallback when primary models fail",
+        "cost_per_1k": 0.0012,
     },
 }
 
@@ -51,9 +60,9 @@ ROUTING_TABLE = {
     "shared_mem_warp_count": "glm",
     "lane_id_mask": "glm",
     "tile_size_warp": "glm",
-    # Generic patterns → cheapest model
-    "__syncthreads": "gemma4",
-    "default": "gemma4",
+    # Generic patterns → cheapest verified model
+    "__syncthreads": "deepseek",
+    "default": "deepseek",
 }
 
 
@@ -127,7 +136,7 @@ class ModelRouter:
 
         # Determine which patterns need which model
         pattern_types = [p.get("pattern", "default") for p in patterns]
-        models_needed = set(ROUTING_TABLE.get(pt, "gemma4") for pt in pattern_types)
+        models_needed = set(ROUTING_TABLE.get(pt, "deepseek") for pt in pattern_types)
 
         result = {"ported_code": "", "confidence": 0,
                   "changes": [], "model_used": "", "cost": 0}
@@ -159,9 +168,9 @@ class ModelRouter:
                 result["changes"].append(f"[glm] Generated ported kernel")
                 result["confidence"] += 0.4
 
-        # Phase 3: Gemma verifies the output
-        if result["ported_code"] and "gemma4" in models_needed:
-            verify = self._call_model("gemma4",
+        # Phase 3: DeepSeek verifies the output
+        if result["ported_code"] and "deepseek" in models_needed:
+            verify = self._call_model("deepseek",
                 f"Review this HIP kernel for correctness. "
                 f"Check: wavefront64 compatibility, correct __shfl usage, "
                 f"shared memory sizing, and sync semantics.\n\n"
@@ -170,9 +179,9 @@ class ModelRouter:
             if verify.success:
                 if "PASS" in verify.output.upper()[:10]:
                     result["confidence"] += 0.3
-                    result["changes"].append(f"[gemma4] Verified — no issues found")
+                    result["changes"].append(f"[deepseek] Verified — no issues found")
                 else:
-                    result["changes"].append(f"[gemma4] Issues found: {verify.output[:200]}")
+                    result["changes"].append(f"[deepseek] Issues found: {verify.output[:200]}")
                     result["confidence"] -= 0.2
 
         result["confidence"] = min(result["confidence"], 1.0) * 100

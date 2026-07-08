@@ -1,6 +1,7 @@
 # Build artifacts
 ported_kernels/
 data/
+pattern_memory.db
 __pycache__/
 *.pyc
 *.egg-info/
