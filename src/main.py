@@ -234,7 +234,7 @@ class KernelOlympics:
                         gemma_online = True
                     except Exception:
                         pass
-                    verifier_name = "Gemma 4(AMD)" if gemma_online else "DeepSeek V4 Pro(fallback)"
+                    verifier_name = "Gemma 4(AMD)" if gemma_online else "DeepSeek V4 Pro(Gemma fallback)"
                     self.disp.status("Porting", f"GLM(planner) → Kimi K2.7(coder) → {verifier_name}")
                     t0 = time.perf_counter()
                     port_result = self.router.route(source, cr.get("findings", []))
