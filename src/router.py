@@ -2,9 +2,9 @@
 Model Router — Lightweight agent orchestration for CUDA→ROCm porting.
 
 Architecture:
-  Risk Classifier → Model Router → Kimi (planner) OR GLM (coder) OR DeepSeek (fallback/verifier)
+  Risk Classifier → Model Router → GLM (planner) OR Kimi K2.7 (coder) OR DeepSeek (verifier)
                     ↓                    ↓                          ↓
-               Pattern Memory ←─── verified fix ←───────────── real AMD GPU
+                Pattern Memory ←─── verified fix ←───────────── real AMD GPU
 
 TRIZ: Use risk classifier output as routing resource (no extra LLM call to decide).
        Each model does what it's best at — no wasted tokens.
@@ -31,36 +31,38 @@ from dataclasses import dataclass, field
 # Only verified models are kept to avoid silent failures during porting.
 
 MODEL_CATALOG = {
-    "kimi": {
-        "id": "accounts/fireworks/models/kimi-k2p6",  # ✅ VERIFIED WORKING
-        "role": "planner",
-        "strength": "complex kernel logic, multi-step reasoning",
-        "cost_per_1k": 0.00095,
-    },
     "glm": {
         "id": "accounts/fireworks/models/glm-5p2",  # ✅ VERIFIED WORKING
-        "role": "coder",
-        "strength": "accurate code generation, struct understanding",
+        "role": "planner",
+        "strength": "kernel analysis, pattern detection, warp/wavefront reasoning",
         "cost_per_1k": 0.0014,
+    },
+    "kimi27": {
+        "id": "accounts/fireworks/models/kimi-k2p7-code",  # ✅ VERIFIED WORKING
+        "role": "coder",
+        "strength": "code generation, struct-aware HIP porting",
+        "cost_per_1k": 0.00095,
     },
     "deepseek": {
         "id": "accounts/fireworks/models/deepseek-v4-pro",  # ✅ VERIFIED WORKING
-        "role": "fallback/verifier",
-        "strength": "general purpose, good fallback when primary models fail",
+        "role": "verifier",
+        "strength": "correctness checking, fallback when primary models fail",
         "cost_per_1k": 0.0012,
     },
 }
 
 # Pattern → best model routing table
 ROUTING_TABLE = {
-    "shfl_down_sync": "kimi",
-    "shfl_xor_sync": "kimi",
-    "syncwarp": "kimi",
-    "warp_size_constant": "glm",
-    "shared_mem_warp_count": "glm",
-    "lane_id_mask": "glm",
-    "tile_size_warp": "glm",
-    # Generic patterns → cheapest verified model
+    # Complex warp patterns → GLM (planner analyzes the structure)
+    "shfl_down_sync": "glm",
+    "shfl_xor_sync": "glm",
+    "syncwarp": "glm",
+    # Structural patterns → Kimi K2.7 (coder generates HIP code)
+    "warp_size_constant": "kimi27",
+    "shared_mem_warp_count": "kimi27",
+    "lane_id_mask": "kimi27",
+    "tile_size_warp": "kimi27",
+    # Simple patterns → DeepSeek (verifier/catch-all)
     "__syncthreads": "deepseek",
     "default": "deepseek",
 }
@@ -82,9 +84,9 @@ class ModelRouter:
     Flow:
       1. Classifier detects patterns in kernel
       2. Router picks best model per pattern
-      3. Kimi plans the fix structure (if complex)
-      4. GLM generates the code
-      5. Gemma verifies the output
+      3. GLM plans the fix structure (if complex)
+      4. Kimi K2.7 generates the code
+      5. DeepSeek verifies the output
     """
 
     def __init__(self, api_key: str = ""):
@@ -203,24 +205,24 @@ class ModelRouter:
                   "changes": [], "model_used": "", "cost": 0}
 
         # Track pipeline phase outcomes for rubric scoring
-        kimi_success = False
-        glm_success = False
+        planner_success = False
+        coder_success = False
         verify_success = False
         verify_passed = False
 
-        # Phase 1: Kimi plans the fix (if complex patterns present)
-        if "kimi" in models_needed and any("shfl" in pt for pt in pattern_types):
-            plan = self._call_model("kimi",
+        # Phase 1: GLM plans the fix (planner, complex warp patterns)
+        if "glm" in models_needed and any("shfl" in pt for pt in pattern_types):
+            plan = self._call_model("glm",
                 f"Analyze this CUDA kernel for warp(32)→wavefront(64) divergence. "
                 f"Identify which lines need changes and why.\n\n```cuda\n{kernel_source[:2000]}\n```\n\n"
                 f"Output format: JSON list of {{line, issue, fix}}")
             if plan.success:
-                kimi_success = True
-                result["changes"].append(f"[kimi] {plan.output[:200]}")
+                planner_success = True
+                result["changes"].append(f"[glm] {plan.output[:200]}")
 
-        # Phase 2: GLM generates the code
-        if "glm" in models_needed or True:  # always try glm for code gen
-            code = self._call_model("glm",
+        # Phase 2: Kimi K2.7 Code generates the ported HIP code
+        if "kimi27" in models_needed:
+            code = self._call_model("kimi27",
                 f"Port this CUDA kernel to HIP/ROCm. Fix warp(32)→wavefront(64) issues:\n"
                 f"- __shfl_down_sync offset 16 works on both\n"
                 f"- __shfl_xor_sync mask 0x1f → 0x3f\n"
@@ -253,8 +255,8 @@ class ModelRouter:
 
         # Rubric-based scoring replaces the old additive confidence model
         result["confidence"] = self._rubric_score_pipeline(
-            kimi_success=kimi_success,
-            glm_success=glm_success,
+            kimi_success=planner_success,
+            glm_success=coder_success,
             verify_success=verify_success,
             verify_passed=verify_passed,
             has_ported_code=bool(result["ported_code"]),

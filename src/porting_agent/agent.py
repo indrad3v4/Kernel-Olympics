@@ -45,18 +45,18 @@ Output format: JSON with:
 """
 
     # ✅ VERIFIED WORKING on Fireworks API (tested, confirmed):
-    #   - kimi-k2p6      (strongest: complex kernel logic, multi-step reasoning)
+    #   - kimi-k2p7-code (strongest: code generation, struct-aware HIP porting)
     #   - glm-5p2        (accurate code generation, struct understanding)
     #   - deepseek-v4-pro (good general fallback)
     # ❌ UNVERIFIED / REMOVED:
     #   - llama-v3p3-70b-instruct  (unstable results on Fireworks, removed)
     FALLBACK_MODELS = [
-        "accounts/fireworks/models/kimi-k2p6",                   # 1st: Kimi (works ✅)
-        "accounts/fireworks/models/glm-5p2",                      # 2nd: GLM (works ✅)
+        "accounts/fireworks/models/kimi-k2p7-code",              # 1st: Kimi K2.7 Code (coder ✅)
+        "accounts/fireworks/models/glm-5p2",                      # 2nd: GLM (planner ✅)
         "accounts/fireworks/models/deepseek-v4-pro",              # 3rd: DeepSeek (works ✅)
     ]
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "accounts/fireworks/models/kimi-k2p6",
+    def __init__(self, api_key: Optional[str] = None, model: str = "accounts/fireworks/models/kimi-k2p7-code",
                  deepseek_key: str = "", deepseek_model: str = "deepseek-reasoner"):
         self.api_key = api_key or os.getenv("FIREWORKS_API_KEY", "")
         self.model = model
@@ -135,7 +135,8 @@ Output format: JSON with:
                             "explanation": "Code extracted from LLM text output"
                         }
                     raise
-            except Exception:
+            except Exception as e:
+                print(f"║ ⚠️ Model {model} failed: {e}")
                 continue  # Try next model
 
         # Last resort: try DeepSeek (your Hermes main provider)
@@ -179,7 +180,8 @@ Output format: JSON with:
                             "explanation": "Code extracted from DeepSeek text output"
                         }
                     raise
-            except Exception:
+            except Exception as e:
+                print(f"║ ⚠️ DeepSeek model {self.deepseek_model} failed: {e}")
                 pass  # Fall through to template
 
         # All models failed — use template fallback

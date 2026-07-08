@@ -108,11 +108,15 @@ class Display:
         llm_s = mem_stats.get("last_llm_time_s", 0)
         speedup = f"~{llm_s / (max(cache_ms, 0.1)/1000):.0f}×" if cache_ms > 0 and llm_s > 0 else "N/A"
         
+        total_cost = pipeline_state.get("total_cost", 0.0)
+        cost_str = f"${total_cost:.4f}" if total_cost > 0 else dim("$0.0000 (no LLM calls)")
+        
         print(f"║{'═'*66}║")
         print(f"║ {bold('Summary')}")
         print(f"║ {green('●')} Cache: {bold(str(hits))} hits  LLM: {bold(str(calls))} calls  {cyan(f'{hit_rate:.0f}%')} hit rate")
         print(f"║ {green('●')} Fastest: {cache_ms}ms  LLM avg: {llm_s}s  {cyan(speedup)} faster with cache")
         print(f"║ {green('●')} Patterns: {pipeline_state.get('patterns_before',0)} → {bold(str(pipeline_state.get('patterns_after',0)))} stored")
+        print(f"║ {green('●')} Cost: {bold(cost_str)} ({calls} LLM call{'s' if calls != 1 else ''})")
         print(f"║ {green('●')} Elapsed: {elapsed:.1f}s total")
         print(f"╚{'═'*66}╝")
 
@@ -139,7 +143,7 @@ class KernelOlympics:
 
     def run(self, input_paths: list[str], reference_dir: str = "sample_kernels/reference") -> dict:
         pipeline_state = {"phase": "initializing", "patterns_before": 0, "patterns_after": 0,
-                          "cache_hits": 0, "llm_calls": 0}
+                          "cache_hits": 0, "llm_calls": 0, "total_cost": 0.0}
 
         # Phase 1: Scanner
         self.disp.phase("Scanning", "🔍")
@@ -207,10 +211,11 @@ class KernelOlympics:
                 else:
                     pipeline_state["llm_calls"] += 1
                     self.disp.llm_call()
-                    self.disp.status("Porting", f"Kimi(planner) → GLM(coder) → Gemma(verifier)")
+                    self.disp.status("Porting", f"GLM(planner) → Kimi K2.7(coder) → DeepSeek(verifier)")
                     t0 = time.perf_counter()
                     port_result = self.router.route(source, cr.get("findings", []))
                     llm_elapsed = time.perf_counter() - t0
+                    pipeline_state["total_cost"] += port_result.get("cost", 0)
                     if not port_result.get("ported_code"):
                         port_result = self.porting_agent.port_kernel(source)
                         llm_elapsed = time.perf_counter() - t0

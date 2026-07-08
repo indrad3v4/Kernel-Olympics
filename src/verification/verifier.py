@@ -95,11 +95,13 @@ class VerificationAgent:
         for f in self.build_dir.glob(f"{kernel_name}*"):
             try:
                 f.unlink()
-            except OSError:
+            except OSError as e:
+                print(f"║ ⚠️ Warmup cleanup failed: {e}")
                 pass
         try:
             src_file.unlink()
-        except OSError:
+        except OSError as e:
+            print(f"║ ⚠️ Warmup cleanup (src_file) failed: {e}")
             pass
 
         return compile_out
@@ -422,7 +424,8 @@ int main() {{
                 compile_out += f"\n\n⚠️ Ported kernel saved to: {manual_path}\n"
                 compile_out += f"   Compile manually: hipcc -o /tmp/{kernel_name} {manual_path} -std=c++17 -O2\n"
                 compile_out += f"   Run: /tmp/{kernel_name}"
-            except Exception:
+            except Exception as e:
+                print(f"║ ⚠️ Failed to save ported kernel to {manual_path}: {e}")
                 pass
             result["passed"] = False
             return result
@@ -443,7 +446,8 @@ int main() {{
         if spec_ref_path and not ref_text:
             try:
                 ref_text = Path(spec_ref_path).read_text()
-            except OSError:
+            except OSError as e:
+                print(f"║ ⚠️ Could not read spec reference file: {e}")
                 pass
 
         if ref_text:
@@ -488,7 +492,8 @@ int main() {{
                 try:
                     import shutil
                     shutil.copy2(harness_file, manual_path)
-                except Exception:
+                except Exception as e:
+                    print(f"║ ⚠️ Failed to copy kernel to {manual_path} during compile fallback: {e}")
                     pass
                 return False, (
                     f"hipcc compilation failed. Ported kernel saved to {manual_path}.\n"
@@ -502,7 +507,8 @@ int main() {{
             try:
                 import shutil
                 shutil.copy2(harness_file, manual_path)
-            except Exception:
+            except Exception as e:
+                print(f"║ ⚠️ Failed to copy kernel to {manual_path} in else branch: {e}")
                 pass
             msg = (
                 f"hipcc not found in subprocess. Ported kernel saved to {manual_path}.\n"
@@ -550,6 +556,7 @@ int main() {{
                     return True, f"Outputs match within tolerance (max diff: {max_diff:.2e})."
                 return False, f"Outputs differ (max diff: {max_diff:.4f})."
         except ValueError:
+            print("║ ⚠️ Diff: could not parse output lines as floats — falling back to textual diff")
             pass
 
         # Show diff
@@ -571,7 +578,8 @@ int main() {{
                 if result.returncode == 0:
                     self._hipcc_path = cmd
                     return True
-            except (FileNotFoundError, subprocess.TimeoutExpired):
+            except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+                print(f"║ ⚠️ hipcc candidate '{cmd}' not available: {e}")
                 continue
         try:
             result = subprocess.run("which hipcc 2>/dev/null || command -v hipcc 2>/dev/null",
@@ -580,6 +588,7 @@ int main() {{
                 self._hipcc_path = result.stdout.strip()
                 return True
         except subprocess.TimeoutExpired:
+            print("║ ⚠️ 'which hipcc' timed out — continuing")
             pass
         try:
             result = subprocess.run("hipcc --version", shell=True,
@@ -588,6 +597,7 @@ int main() {{
                 self._hipcc_path = "hipcc"
                 return True
         except subprocess.TimeoutExpired:
+            print("║ ⚠️ 'hipcc --version' (shell) timed out — continuing")
             pass
         import glob
         for match in glob.glob("/opt/rocm*/**/hipcc", recursive=True):
