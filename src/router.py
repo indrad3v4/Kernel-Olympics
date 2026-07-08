@@ -137,7 +137,8 @@ SYSTEM_PROMPTS = {
         "You are a HIP kernel code reviewer. "
         "Check ported code for wavefront64 correctness. "
         'Respond with JSON: {"pass":bool,"issues":[str],"feedback":str,"verdict":str}. '
-        "No reasoning. No explanation outside JSON."
+        "DO NOT include reasoning, explanations, or chain-of-thought. "
+        "Output ONLY the JSON object, nothing before or after."
     ),
 }
 
@@ -246,6 +247,9 @@ class ModelRouter:
         code = re.sub(r'#include\s*<helper_functions\.h>\n?', '', code)
         code = re.sub(r'#include\s*"helper_cuda\.h"\n?', '', code)
         code = re.sub(r'#include\s*"helper_functions\.h"\n?', '', code)
+        # Remove project-specific .cuh headers — not available in HIP port
+        code = re.sub(r'#include\s*"[^"]*\.cuh"\n?', '', code)
+        code = re.sub(r'#include\s*<[^>]*\.cuh>\n?', '', code)
         # Remove device_launch_parameters.h — not needed in HIP
         code = re.sub(r'#include\s*<device_launch_parameters\.h>\n?', '', code)
         # Fix __shfl masks: 32-bit 0xffffffff → 64-bit for wavefront64
@@ -546,21 +550,27 @@ class ModelRouter:
                         break
 
                     # Parse orchestrator JSON response
+                    # DeepSeek-v4-pro is a REASONING model — it may produce
+                    # chain-of-thought prose BEFORE the JSON. Extract from anywhere.
                     raw = orchestrator.output.strip()
                     parsed = None
+
+                    # Strategy 1: response is pure JSON
                     if raw.startswith("{"):
                         try: parsed = json.loads(raw)
                         except: pass
+
+                    # Strategy 2: JSON inside ```json ... ``` markdown
                     if parsed is None:
                         m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
                         if m:
                             try: parsed = json.loads(m.group(1))
                             except: pass
+
+                    # Strategy 3: find {"pass" ... anywhere in response (reasoning models)
                     if parsed is None:
-                        # Strategy 3: find {"pass"... to end of response, try progressively
-                        m = re.search(r'\\{"pass"\\s*:', raw)
+                        m = re.search(r'\{"pass"\s*:', raw)
                         if m:
-                            # Take from match to end, try to parse
                             candidate = raw[m.start():]
                             # Try full remainder
                             try: parsed = json.loads(candidate)
@@ -569,17 +579,43 @@ class ModelRouter:
                             if parsed is None and not candidate.rstrip().endswith('}'):
                                 try: parsed = json.loads(candidate.rstrip() + '}')
                                 except: pass
-                            # Try finding balanced braces
+                            # Try balanced braces (handles nested objects in values)
                             if parsed is None:
                                 depth = 0
+                                in_string = False
+                                escape = False
                                 for ci, ch in enumerate(candidate):
-                                    if ch == '{': depth += 1
-                                    elif ch == '}':
-                                        depth -= 1
-                                        if depth == 0:
-                                            try: parsed = json.loads(candidate[:ci+1])
-                                            except: pass
-                                            break
+                                    if escape:
+                                        escape = False
+                                        continue
+                                    if ch == '\\':
+                                        escape = True
+                                        continue
+                                    if ch == '"' and not escape:
+                                        in_string = not in_string
+                                    if not in_string:
+                                        if ch == '{': depth += 1
+                                        elif ch == '}':
+                                            depth -= 1
+                                            if depth == 0:
+                                                try: parsed = json.loads(candidate[:ci+1])
+                                                except: pass
+                                                break
+
+                    # Strategy 4: last-resort regex extract pass/issues/feedback fields
+                    if parsed is None:
+                        pass_match = re.search(r'"pass"\s*:\s*(true|false)', raw, re.IGNORECASE)
+                        if pass_match:
+                            issues_match = re.findall(r'"issues"\s*:\s*\[(.*?)\]', raw, re.DOTALL)
+                            feedback_match = re.search(r'"feedback"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+                            verdict_match = re.search(r'"verdict"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+                            parsed = {
+                                "pass": pass_match.group(1).lower() == "true",
+                                "issues": [s.strip().strip('"') for s in issues_match[0].split(',')] if issues_match else [],
+                                "feedback": feedback_match.group(1) if feedback_match else "",
+                                "verdict": verdict_match.group(1) if verdict_match else "",
+                            }
+
                     if parsed is None:
                         result["changes"].append(
                             f'[deepseek-orch] JSON parse error (iter {iteration}): '
