@@ -113,7 +113,7 @@ class Display:
         speedup = f"~{llm_s / (max(cache_ms, 0.1)/1000):.0f}×" if cache_ms > 0 and llm_s > 0 else "N/A"
         
         total_cost = pipeline_state.get("total_cost", 0.0)
-        cost_str = f"${total_cost:.4f}" if total_cost > 0 else dim("$0.0000 (no LLM calls)")
+        cost_str = f"${total_cost:.4f}" if total_cost > 0 else f"$0.0000 ({calls} LLM call{'s' if calls != 1 else ''})"
         
         print(f"║{'═'*66}║")
         print(f"║ {bold('Summary')}")
