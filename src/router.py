@@ -567,7 +567,10 @@ class ModelRouter:
             if plan.success:
                 planner_success = True
                 glm_plan_output = plan.output
-                result["changes"].append(f"[glm] Plan: {plan.output[:200]}")
+                result["changes"].append(f"[glm] Planning complete: {plan.output[:120]}")
+                result["changes"].append("[orch] DeepSeek JOB 1: reviewing GLM plan in verify phase")
+            else:
+                result["changes"].append("[glm] Planning FAILED — proceeding without GLM plan")
 
         # Phase 2: Kimi K2.7 generates initial ported code + orchestration loop
         if "kimi27" in models_needed:
@@ -594,6 +597,8 @@ class ModelRouter:
                         iteration=iteration,
                         max_iterations=max_iterations,
                     )
+                    result["changes"].append(
+                        f"[orch] DeepSeek JOB 2 — verifying code (attempt {iteration}/{max_iterations})")
                     orchestrator = self._call_model(
                         "deepseek", verify_prompt,
                         system_prompt=SYSTEM_PROMPTS.get("deepseek", "")

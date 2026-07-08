@@ -239,7 +239,7 @@ class KernelOlympics:
                     except Exception:
                         pass
                     verifier_name = "Gemma 4(AMD)" if gemma_online else "DeepSeek V4 Pro(Gemma fallback)"
-                    self.disp.status("Porting", f"GLM(planner) → Kimi K2.7(coder) → {verifier_name}")
+                    self.disp.status("Porting", f"DeepSeek-Orch (JOB 1: review GLM)→ Kimi K2.7(coder) → DeepSeek-Orch (JOB 2: verify loop)")
                     t0 = time.perf_counter()
                     port_result = self.router.route(source, cr.get("findings", []))
                     llm_elapsed = time.perf_counter() - t0
@@ -248,7 +248,15 @@ class KernelOlympics:
                         port_result = self.porting_agent.port_kernel(source)
                         pipeline_state["total_cost"] += port_result.get("cost", 0)
                         llm_elapsed = time.perf_counter() - t0
-                    self.disp.file_done(Path(cr['file']).name, f"3-model pipeline ✅ ({port_result.get('confidence', 0)}%, {llm_elapsed:.0f}s)", ok=True)
+                    # Show orchestrator loop details
+                    iters = port_result.get("iterations_used", 1)
+                    orch_passed = port_result.get("orchestrator_passed", False)
+                    orch_changes = [c for c in port_result.get("changes", []) if "deepseek-orch" in c or "orchestrator" in str(c).lower()]
+                    if orch_changes:
+                        for ch in orch_changes[:3]:  # Show up to 3 orchestrator changes
+                            print(f"║  🧠 {dim(ch[:70]):<64}║")
+                    tag = "✅ PASSED" if orch_passed else f"🔁 {iters}/{3} iterations"
+                    self.disp.file_done(Path(cr['file']).name, f"DeepSeek-Orch {tag} ({port_result.get('confidence', 0)}%, {llm_elapsed:.0f}s)", ok=orch_passed)
                     save_path = Path.cwd() / "ported_kernels" / (Path(cr["file"]).stem + ".hip.cpp")
                     print(f"║  📁 Ported kernel → {bold(str(save_path)):<47}║")
                     self.memory.record_llm_time(llm_elapsed)
@@ -341,6 +349,13 @@ class KernelOlympics:
                 else:
                     reason = "Not compiled — saved for manual hipcc" if not ver_result.get("compile_success") else "Output mismatch"
                     self.disp.status("Verifying", f"{Path(cr['file']).name} {yellow(reason)}", ok=False)
+                    # Show compile errors or hipcc status
+                    compile_output = ver_result.get("compile_output", "")
+                    if compile_output and "hipcc not found" not in compile_output:
+                        for line in compile_output.strip().splitlines()[:3]:
+                            print(f"║  ⚠️  {red(line[:65]):<64}║")
+                    if not ver_result.get("hipcc_available", True):
+                        print(f"║  ⚠️  {red('hipcc not found — export PATH=/opt/rocm-7.2.1/bin:$PATH'):<64}║")
             else:
                 self.disp.file_done(Path(cr['file']).name, f"{cr.get('risk_level')} — no porting needed", ok=True)
 

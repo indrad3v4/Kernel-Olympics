@@ -388,7 +388,9 @@ int main() {{
             "run_output": "",
             "diff_report": "",
             "benchmark_us": None,
-            "spec_used": None
+            "spec_used": None,
+            "hipcc_available": self._hipcc_available,
+            "hipcc_path": getattr(self, "_hipcc_path", "not found"),
         }
 
         # Record spec if one exists
