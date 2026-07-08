@@ -170,7 +170,8 @@ Output format: JSON with:
                         "Content-Type": "application/json"
                     }
                 )
-                with urllib.request.urlopen(req, timeout=15) as resp:
+                timeout = 60 if model == models_to_try[0] else 15
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
                     result = _json.loads(resp.read())
                 content = result["choices"][0]["message"]["content"]
                 try:
