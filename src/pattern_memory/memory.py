@@ -36,6 +36,7 @@ class CacheEntry:
     confidence: float         # 0..1
     llm_time_s: float = 0.0   # measured LLM time this fix originally cost
     times_retrieved: int = 0
+    failure_count: int = 0    # verifications of this signature that failed
     metadata: Dict = field(default_factory=dict)
 
     def to_public(self, retrieval_ms: Optional[float] = None) -> Dict:
@@ -47,6 +48,7 @@ class CacheEntry:
             "confidence": self.confidence,
             "llm_time_s": self.llm_time_s,
             "times_retrieved": self.times_retrieved,
+            "failure_count": self.failure_count,
             "match_type": "exact_signature",
             "metadata": dict(self.metadata),
         }
@@ -128,6 +130,8 @@ class PatternMemory:
             self._persist(existing)
             return existing.sig_id
 
+        # store() upgrades any prior negative-only placeholder (see store_negative)
+        # into a real fix, preserving its recorded failure_count.
         entry = CacheEntry(
             signature=key,
             sig_id=sig.digest(),
@@ -140,6 +144,38 @@ class PatternMemory:
         self._persist(entry)
         return entry.sig_id
 
+    def store_negative(self, pattern_snippet: str = "", error_message: str = "",
+                       llm_time_s: Optional[float] = None, *, findings=None,
+                       signature=None) -> None:
+        """Record a *failed* verification for a signature.
+
+        Increments the signature's ``failure_count`` so a known-bad fix is not
+        served. If the signature has no verified fix yet, a negative-only
+        placeholder entry is created (empty fix, confidence 0) — :meth:`retrieve`
+        treats such entries as a miss. No-op for empty signatures.
+        """
+        sig = self._derive_signature(source=pattern_snippet, findings=findings, signature=signature)
+        if sig.is_empty:
+            return
+
+        key = sig.serialize()
+        entry = self._cache.get(key)
+        if entry is not None:
+            entry.failure_count += 1
+            if error_message:
+                entry.metadata["last_error"] = error_message[:200]
+        else:
+            entry = CacheEntry(
+                signature=key,
+                sig_id=sig.digest(),
+                verified_fix="",
+                confidence=0.0,
+                failure_count=1,
+                metadata={"last_error": error_message[:200]} if error_message else {},
+            )
+            self._cache[key] = entry
+        self._persist(entry)
+
     def retrieve(self, query_snippet: Optional[str] = None, *, findings=None,
                  signature=None) -> Optional[Dict]:
         """Return the cached fix for this kernel's signature, or ``None``.
@@ -147,7 +183,8 @@ class PatternMemory:
         Exact signature match only — no fuzzy similarity. The signature is taken
         from ``signature``, then ``findings``, then by classifying
         ``query_snippet``. An empty signature (no migration problems) is always a
-        miss.
+        miss, as is a negative-only entry with no verified fix (see
+        :meth:`store_negative`).
         """
         start = time.perf_counter()
         sig = self._derive_signature(source=query_snippet, findings=findings, signature=signature)
@@ -156,7 +193,7 @@ class PatternMemory:
             return None
 
         entry = self._cache.get(sig.serialize())
-        if entry is None:
+        if entry is None or not entry.verified_fix:
             self._misses += 1
             return None
 
@@ -264,6 +301,7 @@ class PatternMemory:
                 confidence      REAL DEFAULT 0,
                 llm_time_s      REAL DEFAULT 0,
                 times_retrieved INTEGER DEFAULT 0,
+                failure_count   INTEGER DEFAULT 0,
                 metadata        TEXT,
                 created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -277,14 +315,14 @@ class PatternMemory:
         try:
             rows = self._conn.execute(
                 f"SELECT signature, sig_id, verified_fix, confidence, llm_time_s, "
-                f"times_retrieved, metadata FROM {self._TABLE}"
+                f"times_retrieved, failure_count, metadata FROM {self._TABLE}"
             ).fetchall()
         except sqlite3.Error:
             return
 
         for row in rows:
             try:
-                signature, sig_id, fix, confidence, llm_t, times, meta_json = row
+                signature, sig_id, fix, confidence, llm_t, times, failures, meta_json = row
                 if not signature:
                     continue
                 metadata = json.loads(meta_json) if meta_json else {}
@@ -297,6 +335,7 @@ class PatternMemory:
                     confidence=float(confidence or 0),
                     llm_time_s=float(llm_t or 0),
                     times_retrieved=int(times or 0),
+                    failure_count=int(failures or 0),
                     metadata=metadata,
                 )
             except (ValueError, TypeError, json.JSONDecodeError):
@@ -313,21 +352,22 @@ class PatternMemory:
                 f"""
                 INSERT INTO {self._TABLE}
                     (signature, sig_id, verified_fix, confidence, llm_time_s,
-                     times_retrieved, metadata, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                     times_retrieved, failure_count, metadata, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(signature) DO UPDATE SET
                     sig_id          = excluded.sig_id,
                     verified_fix    = excluded.verified_fix,
                     confidence      = excluded.confidence,
                     llm_time_s      = excluded.llm_time_s,
                     times_retrieved = excluded.times_retrieved,
+                    failure_count   = excluded.failure_count,
                     metadata        = excluded.metadata,
                     updated_at      = CURRENT_TIMESTAMP
                 """,
                 (
                     entry.signature, entry.sig_id, entry.verified_fix,
                     entry.confidence, entry.llm_time_s, entry.times_retrieved,
-                    json.dumps(entry.metadata),
+                    entry.failure_count, json.dumps(entry.metadata),
                 ),
             )
             self._conn.commit()

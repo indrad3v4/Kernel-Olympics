@@ -267,6 +267,52 @@ def test_clear():
     _cleanup(path)
 
 
+def test_store_negative_placeholder_is_not_served():
+    """A signature that only ever failed verification must not be served."""
+    m, path = _fresh_memory()
+    m.store_negative(findings=WARP_REDUCE_FINDINGS, error_message="compile failed")
+    assert m.count() == 1                       # placeholder recorded
+    assert m.retrieve(findings=WARP_REDUCE_FINDINGS) is None  # but never served
+    _cleanup(path)
+
+
+def test_store_negative_increments_failure_count():
+    """Repeated failures accumulate on the signature's failure_count."""
+    m, path = _fresh_memory()
+    m.store_negative(findings=WARP_REDUCE_FINDINGS, error_message="e1")
+    m.store_negative(findings=WARP_REDUCE_FINDINGS, error_message="e2")
+    m.store(verified_fix="good fix", confidence=0.9, findings=WARP_REDUCE_FINDINGS)
+
+    match = m.retrieve(findings=WARP_REDUCE_FINDINGS)
+    assert match is not None                    # a real fix now exists -> served
+    assert match["failure_count"] == 2          # prior failures preserved
+    assert match["verified_fix"] == "good fix"
+    _cleanup(path)
+
+
+def test_store_negative_empty_signature_is_noop():
+    m, path = _fresh_memory()
+    m.store_negative(pattern_snippet="__global__ void safe(float* a){ *a = 1.0f; }")
+    assert m.count() == 0
+    _cleanup(path)
+
+
+def test_failure_count_persists(tmp_path=None):
+    """failure_count survives a reload from SQLite."""
+    fd, path = tempfile.mkstemp(suffix='.db')
+    os.close(fd)
+    m1 = PatternMemory(db_path=path)
+    m1.store(verified_fix="fix", confidence=0.9, findings=WARP_REDUCE_FINDINGS)
+    m1.store_negative(findings=WARP_REDUCE_FINDINGS)
+    m1.close()
+
+    m2 = PatternMemory(db_path=path)
+    match = m2.retrieve(findings=WARP_REDUCE_FINDINGS)
+    assert match["failure_count"] == 1
+    m2.close()
+    _cleanup(path)
+
+
 def test_corrupted_row_is_skipped():
     """A malformed metadata blob must not break cache loading."""
     fd, path = tempfile.mkstemp(suffix='.db')
