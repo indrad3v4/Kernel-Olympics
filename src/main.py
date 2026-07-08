@@ -235,6 +235,15 @@ class KernelOlympics:
                 ver_result["confidence"] = port_result.get("confidence", 0)
                 verification_results.append(ver_result)
 
+                # Always save ported kernel to ported_kernels/
+                manual_dir = Path.cwd() / "ported_kernels"
+                manual_dir.mkdir(parents=True, exist_ok=True)
+                manual_path = manual_dir / f"{Path(cr['file']).stem}.hip.cpp"
+                try:
+                    manual_path.write_text(port_result.get("ported_code", source))
+                except Exception:
+                    pass
+
                 if ver_result.get("passed"):
                     self.memory.store(
                         pattern_snippet=source[:500],
