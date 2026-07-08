@@ -58,6 +58,8 @@ MODEL_CATALOG = {
         "strength": "kernel analysis, pattern detection, warp/wavefront reasoning",
         "cost_per_1k": 0.0014,
         "local_first": False,
+        "max_tokens": 2048,      # planner needs room for analysis
+        "temperature": 0.3,      # some creativity for pattern detection
     },
     "kimi27": {
         "id": "accounts/fireworks/models/kimi-k2p7-code",  # ✅ VERIFIED WORKING
@@ -65,6 +67,8 @@ MODEL_CATALOG = {
         "strength": "code generation, struct-aware HIP porting",
         "cost_per_1k": 0.00095,
         "local_first": False,
+        "max_tokens": 4096,      # coder needs room for full kernel output
+        "temperature": 0.1,      # code generation needs precision
     },
     "deepseek": {
         "id": "accounts/fireworks/models/deepseek-v4-pro",  # ✅ VERIFIED WORKING
@@ -72,47 +76,68 @@ MODEL_CATALOG = {
         "strength": "correctness checking, fallback when local Gemma unavailable",
         "cost_per_1k": 0.0012,
         "local_first": False,
+        "max_tokens": 1024,      # verifier output is small (pass/fail + feedback)
+        "temperature": 0.0,      # deterministic verification
     },
     "gemma4": {
         "id": "accounts/fireworks/models/gemma-4-31b-it",  # Real Gemma on AMD GPU via vLLM
         "role": "verifier",
         "strength": "AMD-native verification via local vLLM on MI300X",
-        "local_first": True,  # Try localhost:8000 first, then Fireworks
+        "cost_per_1k": 0.0,
+        "local_first": True,     # Try localhost:8000 first, then Fireworks
+        "max_tokens": 1024,
+        "temperature": 0.0,      # deterministic verification
     },
 }
 
+# ── JSON schemas for response_format (enforced by Fireworks API) ──
+# Using json_object (not json_schema) for compatibility — the system prompt
+# already defines the exact shape. json_schema is stricter but not all models support it.
+
+JSON_SCHEMAS = {
+    "deepseek": {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "VerificationResult",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "pass": {"type": "boolean"},
+                    "issues": {"type": "array", "items": {"type": "string"}},
+                    "feedback": {"type": "string"},
+                    "verdict": {"type": "string"},
+                },
+                "required": ["pass", "issues", "feedback", "verdict"],
+            },
+        },
+    },
+    "glm": {
+        "type": "json_object",
+    },
+    "kimi27": {
+        "type": "json_object",
+    },
+}
 # ── Role-specific system prompts ──
 # Each model gets its OWN role definition. No shared prompts.
 # These are passed as system messages to the LLM alongside the phase prompt.
 
 SYSTEM_PROMPTS = {
     "glm": (
-        "You are GLM-Planner, a CUDA→HIP migration architect. "
-        "Your role is to analyze CUDA kernels flagged with "
-        "warp(32)→wavefront(64) divergence issues and produce a "
-        "structured plan of line-level changes. "
-        "Output ONLY valid JSON. No prose, no explanation, no code."
+        "You are a CUDA-to-HIP kernel analyzer. "
+        "Find warp(32)→wavefront(64) divergence issues. "
+        "Respond with a JSON array: [{\"line\":int,\"issue\":str,\"fix\":str}]."
     ),
     "kimi27": (
-        "You are Kimi-Coder, a CUDA→HIP code generation specialist. "
-        "Your role is to port CUDA kernels to AMD ROCm/HIP, fixing "
-        "warp(32)→wavefront(64) divergence issues. "
-        "Output ONLY valid JSON. No prose, no explanation, no markdown outside the json block."
+        "You are a CUDA-to-HIP code porting specialist. "
+        "Port CUDA kernels to AMD ROCm/HIP, fixing warp→wavefront issues. "
+        "Respond with JSON: {\"ported_code\":str,\"confidence\":int,\"changes\":[str],\"explanation\":str}."
     ),
     "deepseek": (
-        "You are DeepSeek-Orchestrator. You manage 2 subordinate agents:\n"
-        "  1. GLM-Planner — analyzes kernels for warp→wavefront issues\n"
-        "  2. Kimi-Coder — generates HIP kernel code\n\n"
-        "YOUR 2 JOBS:\n"
-        "  JOB 1 (Orchestrator): Read the GLM analysis below. Decide if it's complete.\n"
-        "    - If GLM missed issues → note them in your issues list\n"
-        "    - Kimi will receive your feedback before coding\n"
-        "  JOB 2 (Evaluator): Verify Kimi's ported code for correctness.\n"
-        "    - Check wavefront64 compatibility, __shfl masks, shared memory\n"
-        "    - If PASS → output {\"pass\":true,\"verdict\":\"All checks passed\"}\n"
-        "    - If FAIL → output {\"pass\":false,\"issues\":[...],\"feedback\":\"line-level fix instruction\"}\n\n"
-        "CRITICAL: You are the FINAL AUTHORITY. Do not pass code with issues.\n"
-        "Output ONLY valid JSON. No prose."
+        "You are a HIP kernel code reviewer. "
+        "Check ported code for wavefront64 correctness. "
+        'Respond with JSON: {"pass":bool,"issues":[str],"feedback":str,"verdict":str}. '
+        "No reasoning. No explanation outside JSON."
     ),
 }
 
@@ -304,14 +329,9 @@ class ModelRouter:
         Output format: JSON array of {"line": int, "issue": str, "fix": str}
         """
         prompt = (
-            "You are GLM-Planner, a CUDA->HIP migration architect.\n"
-            "Your task: analyze the given CUDA kernel for warp(32) -> "
-            "wavefront(64) divergence issues. "
-            "For each issue found, output ONE JSON object with:\n"
-            '  "line":   integer line number of the issue\n'
-            '  "issue":  description of the divergence problem\n'
-            '  "fix":    recommended change for HIP compatibility\n\n'
-            "If multiple issues exist, output a JSON ARRAY of objects.\n\n"
+            "Analyze this CUDA kernel for warp(32)→wavefront(64) divergence issues.\n"
+            "For each issue, output: {\"line\": int, \"issue\": str, \"fix\": str}\n"
+            "Multiple issues → JSON array. No issues → empty array [].\n\n"
         )
 
         pattern_summary = _format_patterns_summary(patterns)
@@ -319,22 +339,8 @@ class ModelRouter:
             prompt += pattern_summary + "\n"
 
         prompt += (
-            f"KERNEL TO ANALYZE:\n"
-            f"```cuda\n{kernel_source[:2000]}\n```\n\n"
-            "OUTPUT FORMAT -- STRICT JSON ONLY.\n"
-            "Single issue:\n"
-            '  {"line": 42, "issue": "...", "fix": "..."}\n\n'
-            "Multiple issues:\n"
-            '  [{"line": 42, "issue": "...", "fix": "..."}, '
-            '{"line": 55, "issue": "...", "fix": "..."}]\n\n'
-            "EXAMPLE:\n"
-            "```json\n"
-            '{"line": 42, "issue": "__syncwarp() only syncs 32 threads '
-            "but AMD wavefronts need 64\", "
-            '"fix": "Replace __syncwarp() with __syncthreads()"}\n'
-            "```\n\n"
-            "CRITICAL: Return ONLY valid JSON. No prose, no explanation, "
-            "no code blocks (unless your JSON is inside one)."
+            f"```cuda\n{kernel_source[:4000]}\n```\n\n"
+            "Respond with JSON only."
         )
         return prompt
 
@@ -348,48 +354,26 @@ class ModelRouter:
         changes (list[str]), explanation (str).
         """
         prompt = (
-            "You are Kimi-Coder, a CUDA->HIP code generation specialist.\n"
-            "Your task: port the given CUDA kernel to AMD ROCm/HIP, fixing\n"
-            "warp(32) -> wavefront(64) divergence issues.\n\n"
-            "PORTING CHECKLIST:\n"
-            "- __shfl_down_sync offset 16 works on both (verify algorithm)\n"
-            "- __shfl_xor_sync mask 0x1f -> 0x3f for wavefront64\n"
-            "- warpSize 32 -> use dynamic warpSize() or WAVEFRONT_SIZE constant\n"
-            "- shared memory sized for warp 32 -> WAVEFRONT_SIZE (64) or dynamic\n"
-            "- __syncwarp() -> __syncthreads() for HIP\n"
-            "- #define WAVEFRONT_SIZE 64 at top of kernel\n"
+            "Port this CUDA kernel to AMD ROCm/HIP. Fix warp(32)→wavefront(64) issues.\n\n"
+            "CHECKLIST:\n"
+            "- __shfl_xor_sync mask 0x1f → 0x3f for wavefront64\n"
+            "- __shfl_down_sync masks → 0xffffffffffffffffULL (64-bit)\n"
+            "- warpSize 32 → WAVEFRONT_SIZE 64 or dynamic\n"
+            "- shared memory sized for warp 32 → WAVEFRONT_SIZE (64)\n"
+            "- __syncwarp() → __syncthreads()\n"
+            "- #define WAVEFRONT_SIZE 64 at top\n"
+            "- Replace #include <cuda_runtime.h> → #include <hip/hip_runtime.h>\n"
+            "- Remove #include <helper_cuda.h>, <helper_functions.h>, <device_launch_parameters.h>\n\n"
         )
 
         pattern_summary = _format_patterns_summary(patterns)
         if pattern_summary:
-            prompt += "\n" + pattern_summary + "\n"
+            prompt += pattern_summary + "\n"
 
         prompt += (
-            f"\nKERNEL TO PORT:\n"
-            f"```cuda\n{kernel_source[:2000]}\n```\n\n"
-            "OUTPUT FORMAT -- STRICT JSON inside ```json ... ```:\n"
-            "{\n"
-            '  "ported_code": "<full ported HIP kernel>",\n'
-            '  "confidence": <0-100>,\n'
-            '  "changes": ["change 1", "change 2", ...],\n'
-            '  "explanation": "what was fixed and why"\n'
-            "}\n\n"
-            "EXAMPLE:\n"
-            "```json\n"
-            "{\n"
-            '  "ported_code": "#define WAVEFRONT_SIZE 64\\n\\n'
-            '__global__ void vec_add(float* a, float* b, int n) {\\n'
-            '    int tid = threadIdx.x;\\n    ...\\n}",\n'
-            '  "confidence": 88,\n'
-            '  "changes": ["Replaced hardcoded 32 with WAVEFRONT_SIZE (64)",\n'
-            '              "Changed __syncwarp() to __syncthreads()"],\n'
-            '  "explanation": "Ported warp-32 kernel to wavefront-64 HIP '
-            'by replacing hardcoded 32 with WAVEFRONT_SIZE and fixing '
-            'sync primitives"\n'
-            "}\n"
-            "```\n\n"
-            "CRITICAL: Return ONLY the ```json ... ``` block. "
-            "No prose before or after."
+            f"```cuda\n{kernel_source[:6000]}\n```\n\n"
+            "Respond with JSON: {\"ported_code\": str, \"confidence\": 0-100, "
+            "\"changes\": [str], \"explanation\": str}."
         )
         return prompt
 
@@ -404,39 +388,28 @@ class ModelRouter:
         DeepSeek orchestrator's specific feedback to fix issues.
         """
         prompt = (
-            "You are Kimi-Coder, refining your CUDA->HIP code based on "
-            "orchestrator feedback.\n\n"
-            f"ITERATION {iteration}: You previously generated a ported HIP kernel, "
-            "but the orchestrator found issues. Please fix them.\n\n"
-            "PORTING CHECKLIST (re-verify your fixes):\n"
-            "- __shfl_down_sync offset 16 works on both (verify algorithm)\n"
-            "- __shfl_xor_sync mask 0x1f -> 0x3f for wavefront64\n"
-            "- warpSize 32 -> use dynamic warpSize() or WAVEFRONT_SIZE constant\n"
-            "- shared memory sized for warp 32 -> WAVEFRONT_SIZE (64) or dynamic\n"
-            "- __syncwarp() -> __syncthreads() for HIP\n"
-            "- #define WAVEFRONT_SIZE 64 at top of kernel\n"
+            f"Fix your ported HIP kernel based on reviewer feedback (iteration {iteration}).\n\n"
+            "CHECKLIST:\n"
+            "- __shfl_xor_sync mask 0x1f → 0x3f for wavefront64\n"
+            "- __shfl_down_sync masks → 0xffffffffffffffffULL (64-bit)\n"
+            "- warpSize 32 → WAVEFRONT_SIZE 64 or dynamic\n"
+            "- shared memory sized for warp 32 → WAVEFRONT_SIZE (64)\n"
+            "- __syncwarp() → __syncthreads()\n"
+            "- #define WAVEFRONT_SIZE 64 at top\n"
+            "- Replace #include <cuda_runtime.h> → #include <hip/hip_runtime.h>\n"
+            "- Remove #include <helper_cuda.h>, <helper_functions.h>, <device_launch_parameters.h>\n\n"
         )
 
         pattern_summary = _format_patterns_summary(patterns)
         if pattern_summary:
-            prompt += "\n" + pattern_summary + "\n"
+            prompt += pattern_summary + "\n"
 
         prompt += (
-            f"\nORIGINAL CUDA KERNEL:\n"
-            f"```cuda\n{kernel_source[:2000]}\n```\n\n"
-            f"YOUR PREVIOUS PORTED OUTPUT:\n"
-            f"```hip\n{previous_code[:2000]}\n```\n\n"
-            f"ORCHESTRATOR FEEDBACK (fix these issues):\n"
-            f"{feedback}\n\n"
-            "OUTPUT FORMAT -- STRICT JSON inside ```json ... ```:\n"
-            "{\n"
-            '  "ported_code": "<full ported HIP kernel with fixes applied>",\n'
-            '  "confidence": <0-100>,\n'
-            '  "changes": ["fix 1", "fix 2", ...],\n'
-            '  "explanation": "what was fixed based on orchestrator feedback"\n'
-            "}\n\n"
-            "CRITICAL: Fix ALL issues listed in orchestrator feedback. "
-            "Return ONLY the ```json ... ``` block."
+            f"Original CUDA:\n```cuda\n{kernel_source[:4000]}\n```\n\n"
+            f"Your previous output:\n```hip\n{previous_code[:4000]}\n```\n\n"
+            f"Reviewer feedback (fix ALL):\n{feedback}\n\n"
+            "Respond with JSON: {\"ported_code\": str, \"confidence\": 0-100, "
+            "\"changes\": [str], \"explanation\": str}."
         )
         return prompt
 
@@ -446,87 +419,37 @@ class ModelRouter:
                                       feedback: str = "",
                                       iteration: int = 1,
                                       max_iterations: int = 3) -> str:
-        """Build the DeepSeek orchestrator verification prompt with feedback.
+        """Build the DeepSeek verification prompt.
 
-        DeepSeek-Orchestrator verifies ported HIP code and provides
-        specific, actionable feedback for Kimi-Coder to fix issues in
-        the next iteration of the orchestration loop.
-
-        Output format: JSON with pass (bool), issues (list[str]),
-        feedback (str), verdict (str).
+        Simplified: no role philosophy, no examples, no "2 JOBS" narrative.
+        System prompt already defines role + JSON contract.
         """
-        prompt = (
-            "You are DeepSeek-Orchestrator, the central orchestrator of the "
-            "CUDA->HIP migration pipeline.\n"
-            f"Orchestration loop: iteration {iteration}/{max_iterations}.\n\n"
-            "Your task: review the following ported HIP kernel for correctness. "
-            "If verification fails, provide SPECIFIC, ACTIONABLE, LINE-LEVEL "
-            "feedback that Kimi-Coder can use to fix the issues.\n\n"
-            "CHECKS:\n"
-            "- wavefront64 compatibility (64 threads per wavefront)\n"
-            "- __shfl masks use 0xffffffffffffffffULL (64-bit, not 32-bit)\n"
-            "- __syncwarp() replaced with __syncthreads() where appropriate\n"
-            "- shared memory sized for wavefront64 (not warp32)\n"
-            "- HIP API usage (not deprecated CUDA APIs)\n"
-            "- __ballot_sync used correctly for HIP\n"
+        prompt = f"Review this ported HIP kernel (iteration {iteration}/{max_iterations}).\n\n"
+
+        prompt += (
+            "Checks:\n"
+            "- __shfl masks: 0xffffffffffffffffULL (64-bit, not 32-bit 0xffffffff)\n"
+            "- __shfl_xor_sync mask: 0x3f (not 0x1f) for wavefront64\n"
+            "- __syncwarp() → __syncthreads()\n"
+            "- shared memory sized for 64, not 32\n"
+            "- No CUDA headers (cuda_runtime.h, helper_cuda.h, device_launch_parameters.h)\n"
+            "- WAVEFRONT_SIZE 64 defined\n\n"
         )
 
-        # As orchestrator, review GLM-Planner's analysis
         if glm_analysis:
-            prompt += (
-                f"\nGLM-PLANNER ANALYSIS (under your authority as orchestrator):\n"
-                f"{glm_analysis[:1000]}\n\n"
-                "As orchestrator, verify GLM's analysis is complete. "
-                "Note any missed issues.\n"
-            )
+            prompt += f"GLM analysis:\n{glm_analysis[:800]}\n\n"
 
         if feedback:
-            prompt += (
-                f"\nPREVIOUS FEEDBACK (issues that were reported in iteration "
-                f"{iteration - 1} — verify they have been fixed):\n"
-                f"{feedback}\n"
-            )
+            prompt += f"Previous issues (verify fixed):\n{feedback[:800]}\n\n"
 
         pattern_summary = _format_patterns_summary(patterns)
         if pattern_summary:
-            prompt += "\n" + pattern_summary + "\n"
+            prompt += pattern_summary + "\n"
 
         prompt += (
-            f"\nPORTED HIP KERNEL TO REVIEW:\n"
-            f"```hip\n{ported_code[:2000]}\n```\n\n"
-            "OUTPUT FORMAT -- STRICT JSON only:\n"
-            "{\n"
-            '  "pass": true/false,\n'
-            '  "issues": ["issue 1", "issue 2", ...],\n'
-            '  "feedback": "actionable, line-level feedback for Kimi to fix issues — '
-            'be specific, mention exact lines and what to change. Empty string if pass=true.",\n'
-            '  "verdict": "concise explanation of pass/fail"\n'
-            "}\n\n"
-            "EXAMPLE (pass):\n"
-            "```json\n"
-            "{\n"
-            '  "pass": true,\n'
-            '  "issues": [],\n'
-            '  "feedback": "",\n'
-            '  "verdict": "All wavefront64 checks pass. '
-            'Masks use 0xffffffffffffffffULL, sync primitives are correct."\n'
-            "}\n"
-            "```\n\n"
-            "EXAMPLE (fail with actionable feedback):\n"
-            "```json\n"
-            "{\n"
-            '  "pass": false,\n'
-            '  "issues": ["Line 42: __shfl_xor_sync mask is 0x1f, should be 0x3f for wavefront64"],\n'
-            '  "feedback": "Line 42: Change __shfl_xor_sync mask from 0x1f to 0x3f '
-            'to support 64-thread wavefronts.",\n'
-            '  "verdict": "Shuffle mask is configured for 32-thread warps but '
-            'AMD wavefronts need 64-thread masks.",\n'
-            "}\n"
-            "```\n\n"
-            "CRITICAL: Return ONLY valid JSON. "
-            "Set pass=true ONLY if all checks pass. "
-            "When pass=false, the 'feedback' field is REQUIRED and must be "
-            "specific enough for Kimi-Coder to fix without guessing."
+            f"```hip\n{ported_code[:4000]}\n```\n\n"
+            'Respond with JSON: {"pass": bool, "issues": [str], '
+            '"feedback": str, "verdict": str}.'
         )
         return prompt
 
@@ -825,12 +748,13 @@ class ModelRouter:
                     payload = {
                         "model": model_id,
                         "messages": messages,
-                        "max_tokens": 1024,
-                        "temperature": 0.2,
+                        "max_tokens": model_info.get("max_tokens", 1024),
+                        "temperature": model_info.get("temperature", 0.2),
                     }
-                    # Force JSON output for models that support it
-                    if model_key in ("deepseek", "glm", "kimi27"):
-                        payload["response_format"] = {"type": "json_object"}
+                    # Use json_schema for DeepSeek (strict), json_object for others
+                    schema = JSON_SCHEMAS.get(model_key)
+                    if schema:
+                        payload["response_format"] = schema
                     data_bytes = json.dumps(payload).encode()
                     req = urllib.request.Request(
                         f"{self.base_url}/chat/completions",
@@ -840,7 +764,7 @@ class ModelRouter:
                             "Content-Type": "application/json"
                         }
                     )
-                    with urllib.request.urlopen(req, timeout=60) as resp:
+                    with urllib.request.urlopen(req, timeout=90) as resp:
                         raw = resp.read()
                         try:
                             data = json.loads(raw)
@@ -864,7 +788,7 @@ class ModelRouter:
                                            tokens, round((time.perf_counter()-t0)*1000, 1))
             except Exception as e:
                 source = "local-vllm" if endpoint == "local" else "fireworks"
-                err_msg = str(e)[:80]
+                err_msg = str(e)[:200]
                 self.call_log.append({"model": model_key, "source": source, "error": err_msg})
                 # If response_format caused a 400, retry without it
                 fw_payload = payload if endpoint == "fireworks" else {}
@@ -881,7 +805,7 @@ class ModelRouter:
                                 "Content-Type": "application/json"
                             }
                         )
-                        with urllib.request.urlopen(req, timeout=60) as resp:
+                        with urllib.request.urlopen(req, timeout=90) as resp:
                             raw = resp.read()
                             data = json.loads(raw)
                             content = data["choices"][0]["message"]["content"]
