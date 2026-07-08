@@ -151,8 +151,14 @@ class RiskClassifier:
 
 
 if __name__ == "__main__":
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+    from utf8_console import enable_utf8_console
+    enable_utf8_console()
+
     # Quick test with the sample kernel
-    source = open("sample_kernels/cuda/warp_reduce.cu").read()
+    source = open("sample_kernels/cuda/warp_reduce.cu", encoding="utf-8").read()
     classifier = RiskClassifier()
     result = classifier.classify(source, "sample_kernels/cuda/warp_reduce.cu")
     print(f"Risk level: {result['risk_level']}")

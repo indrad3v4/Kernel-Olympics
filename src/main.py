@@ -24,7 +24,7 @@ from pathlib import Path
 # Auto-load .env file if present
 _env_path = Path(__file__).parent.parent / ".env"
 if _env_path.exists():
-    with open(_env_path) as _f:
+    with open(_env_path, encoding="utf-8") as _f:
         for _line in _f:
             _line = _line.strip()
             if _line and not _line.startswith("#") and "=" in _line:
@@ -33,6 +33,10 @@ if _env_path.exists():
                 os.environ.setdefault(_k.strip(), _v)
 
 sys.path.insert(0, str(Path(__file__).parent))
+
+# Force UTF-8 stdout/stderr (with ASCII fallback) before any glyphs print.
+from utf8_console import enable_utf8_console
+enable_utf8_console()
 
 from scanner.scanner import Scanner
 from risk_classifier.classifier import RiskClassifier
@@ -155,7 +159,7 @@ class KernelOlympics:
         file_sources = {}
         for fp in input_paths:
             try:
-                file_sources[fp] = Path(fp).read_text()
+                file_sources[fp] = Path(fp).read_text(encoding="utf-8")
             except:
                 pass
         classifier_results = self.classifier.classify_batch(file_sources)
@@ -225,7 +229,7 @@ class KernelOlympics:
                 # Phase 5: Verification
                 self.disp.phase("Verifying", "✅")
                 ref_path = Path(reference_dir) / f"{Path(cr['file']).stem}_output.txt"
-                reference_output = ref_path.read_text() if ref_path.exists() else ""
+                reference_output = ref_path.read_text(encoding="utf-8") if ref_path.exists() else ""
 
                 ver_result = self.verifier.verify(
                     hip_source=port_result.get("ported_code", source),
@@ -278,7 +282,7 @@ class KernelOlympics:
                 ]
                 harness = "\n".join(lines)
                 try:
-                    manual_path.write_text(harness)
+                    manual_path.write_text(harness, encoding="utf-8")
                 except Exception as e:
                     print(f"  ⚠️ Failed to save: {e}")
 
@@ -520,7 +524,7 @@ def main():
     report = ko.run(args.input, args.reference)
 
     output_path = Path(args.output)
-    with open(output_path, 'w') as f:
+    with open(output_path, 'w', encoding="utf-8") as f:
         json.dump(report, f, indent=2, default=str)
     print(f"Report saved to: {output_path}")
 
@@ -563,7 +567,7 @@ def run_demo(reset: bool = False):
 
     # First kernel: warp_reduce.cu
     print(bold("╠════════════════════════════════════════════════════════╣"))
-    warp_source = Path("sample_kernels/cuda/warp_reduce.cu").read_text()
+    warp_source = Path("sample_kernels/cuda/warp_reduce.cu").read_text(encoding="utf-8")
 
     # Check if warp_reduce is already cached
     warp_cached = demo_memory.retrieve(warp_source)
@@ -611,7 +615,7 @@ def run_demo(reset: bool = False):
 
     # Second kernel: histogram.cu (similar patterns)
     print(bold("╠════════════════════════════════════════════════════════╣"))
-    hist_source = Path("sample_kernels/cuda/histogram.cu").read_text()
+    hist_source = Path("sample_kernels/cuda/histogram.cu").read_text(encoding="utf-8")
     print(f"║ {bold('Kernel 2:')} histogram.cu — {green('cache lookup...')}        ")
     cached = demo_memory.retrieve(hist_source)
 
@@ -683,7 +687,7 @@ def run_demo(reset: bool = False):
         "patterns_in_cache": existing_count,
         "warp_first_time": not bool(warp_cached and not reset)
     }
-    Path("demo_report.json").write_text(json.dumps(report, indent=2))
+    Path("demo_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"├{'─'*66}┤")
     print(f"║ {dim('Demo report saved to: demo_report.json')}")
     print(bold("╚════════════════════════════════════════════════════════╝"))

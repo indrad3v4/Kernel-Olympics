@@ -25,6 +25,10 @@ import json
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from utf8_console import enable_utf8_console
+enable_utf8_console()
+
 REPO_URL = "https://github.com/indrad3v4/Kernel-Olympics.git"
 WORK_DIR = Path("/workspace/Kernel-Olympics")
 FIREWORKS_KEY = os.environ.get("FIREWORKS_API_KEY", "")
@@ -118,7 +122,7 @@ def run_pipeline():
         report_path = Path(f"/tmp/report_{Path(kernel).stem}.json")
         if report_path.exists():
             try:
-                data = json.loads(report_path.read_text())
+                data = json.loads(report_path.read_text(encoding="utf-8"))
                 stats = data.get("statistics", {})
                 risk = stats.get("risk_breakdown", {})
                 print(f"  {kernel}: "
@@ -195,7 +199,7 @@ def verify_kernels():
         "summary": f"{passed_count}/{len(results)} passed"
     }
     proof_path = WORK_DIR / "amd_gpu_proof.json"
-    proof_path.write_text(json.dumps(proof, indent=2))
+    proof_path.write_text(json.dumps(proof, indent=2), encoding="utf-8")
     print(f"\nProof saved to: {proof_path}")
     return True
 

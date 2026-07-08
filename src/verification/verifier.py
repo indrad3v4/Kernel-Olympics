@@ -84,7 +84,7 @@ class VerificationAgent:
 
         kernel_name = "_verifier_warmup"
         src_file = self.build_dir / f"{kernel_name}.hip.cpp"
-        src_file.write_text(warmup_src)
+        src_file.write_text(warmup_src, encoding="utf-8")
 
         compile_ok, compile_out = self._compile(src_file, self.build_dir, kernel_name)
 
@@ -121,7 +121,7 @@ class VerificationAgent:
         if not spec_path.exists():
             return None
 
-        with open(spec_path) as f:
+        with open(spec_path, encoding="utf-8") as f:
             spec = json.load(f)
 
         # Resolve reference_output relative to repo root
@@ -400,12 +400,12 @@ int main() {{
 
         # Write source
         src_file = kernel_build_dir / f"{kernel_name}.hip.cpp"
-        src_file.write_text(hip_source)
+        src_file.write_text(hip_source, encoding="utf-8")
 
         # Generate spec-driven harness
         harness = self._generate_harness(kernel_name, test_input, hip_source)
         harness_file = kernel_build_dir / f"test_{kernel_name}.cpp"
-        harness_file.write_text(harness)
+        harness_file.write_text(harness, encoding="utf-8")
 
         # Step 1: Compile
         compile_ok, compile_out = self._compile(harness_file, kernel_build_dir, kernel_name)
@@ -442,7 +442,7 @@ int main() {{
         spec_ref_path = spec.get("_reference_path") if spec else None
         if spec_ref_path and not ref_text:
             try:
-                ref_text = Path(spec_ref_path).read_text()
+                ref_text = Path(spec_ref_path).read_text(encoding="utf-8")
             except OSError:
                 pass
 

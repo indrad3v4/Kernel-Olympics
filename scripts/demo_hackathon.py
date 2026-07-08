@@ -9,6 +9,10 @@ Run THIS on the AMD Jupyter (notebooks.amd.com).
 import subprocess, sys, time, json
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from utf8_console import enable_utf8_console
+enable_utf8_console()
+
 REPO = Path("/workspace/Kernel-Olympics")
 
 def run(cmd, cwd=REPO, timeout=30):
@@ -90,7 +94,7 @@ int main() {
     hipFree(d_out);
     return pass ? 0 : 1;
 }
-""")
+""", encoding="utf-8")
 r = run(f"hipcc -o /tmp/ko_demo {src} -std=c++17 -O2", timeout=30)
 if r.returncode == 0:
     print("\n  Compilation: ✅ PASSED")

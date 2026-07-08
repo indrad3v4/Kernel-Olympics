@@ -173,6 +173,12 @@ class ReportGenerator:
 
 
 if __name__ == "__main__":
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent.parent))
+    from utf8_console import enable_utf8_console
+    enable_utf8_console()
+
     # Quick test
     rg = ReportGenerator()
     report = rg.generate([], [], [], {"total_patterns": 12, "avg_confidence": 87, "total_retrievals": 5}, 4.0)
