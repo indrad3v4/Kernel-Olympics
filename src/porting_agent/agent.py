@@ -37,11 +37,14 @@ _force_ipv4()
 class PortingAgent:
     """LLM-based CUDA→ROCm porting agent using Fireworks API."""
 
-    SYSTEM_PROMPT = """You are an expert CUDA→ROCm/HIP migration engineer. 
-Your job is to port CUDA kernels to AMD ROCm/HIP, specifically fixing 
-warp(32)→wavefront(64) divergence issues.
+    SYSTEM_PROMPT = """You are PortingAgent, an expert CUDA→ROCm/HIP migration engineer. 
+You receive CUDA kernels flagged with warp(32)→wavefront(64) divergence issues
+and produce a JSON object describing the exact fix.
 
-KEY RULES:
+ROLE: CUDA→HIP porting specialist — you understand AMD GPU architecture
+(wavefront=64 threads) and know how every CUDA warp intrinsic maps to HIP.
+
+PORTING RULES (follow all that apply):
 1. AMD GPUs use wavefronts of 64 threads, not warps of 32
 2. __shfl_down_sync(0xffffffff, val, 16) on wavefront64 skips half the lanes — 
    the offset must be adjusted or use a different algorithm
@@ -57,24 +60,28 @@ KEY RULES:
 12. Lane identification: if (lane_id < 32) → if (lane_id < 64) for wavefront boundary
 13. __shfl_sync (basic shuffle) — mask and lane count must be adjusted for wavefront64
 
-Output format: Return a JSON object inside a markdown ```json code block.
-The JSON must have these fields:
-- "ported_code": the full ported kernel (the code itself, NOT wrapped in extra markdown)
-- "confidence": 0-100 score
-- "changes": list of specific changes made
-- "explanation": short explanation of the fix
+OUTPUT FORMAT — STRICT JSON (no prose, no extra text):
+Respond with a single JSON object inside a ```json markdown code block.
+The JSON object must have EXACTLY these four fields:
 
-Example:
+{
+  "ported_code": "<string — the full ported HIP kernel code>",
+  "confidence": <integer 0-100 — rubric-based confidence score>,
+  "changes": ["<string — one change description per modification>", ...],
+  "explanation": "<string — short explanation of what was fixed and why>"
+}
+
+EXAMPLE:
 ```json
 {
-  "ported_code": "__global__ void ...",
-  "confidence": 85,
-  "changes": [...],
-  "explanation": "..."
+  "ported_code": "__global__ void vec_add(float* a, float* b, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) a[i] += b[i]; }",
+  "confidence": 88,
+  "changes": ["Replaced warp32 hardcodes with WAVEFRONT_SIZE (64)", "Changed __syncwarp() to __syncthreads()"],
+  "explanation": "Ported warp-32 kernel to wavefront-64 HIP by replacing hardcoded 32 with WAVEFRONT_SIZE and fixing sync primitives."
 }
 ```
 
-Put ONLY the ```json ... ``` block in your response — no surrounding prose.
+CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explanation before it, no summary after it. If I cannot parse valid JSON from your response, the pipeline fails.
 """
 
     # ✅ VERIFIED WORKING on Fireworks API (tested, confirmed):
@@ -485,8 +492,13 @@ Put ONLY the ```json ... ``` block in your response — no surrounding prose.
         
         Fixes:
         - 32-bit __shfl mask → 64-bit for wavefront64
+        - `global void` → `__global__ void` (LLM drops __)
+        - `device void` → `__device__ void`
         """
         import re
+        # Fix missing __ on global/device
+        code = re.sub(r'^global\s+void', '__global__ void', code, flags=re.MULTILINE)
+        code = re.sub(r'^device\s+void', '__device__ void', code, flags=re.MULTILINE)
         # Count how many 32-bit masks remain
         mask_pattern = re.compile(r'(__shfl_\w+_sync\()0x[fF]{8}(,)')
         before = len(mask_pattern.findall(code))
