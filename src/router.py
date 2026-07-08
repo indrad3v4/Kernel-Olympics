@@ -99,10 +99,12 @@ SYSTEM_PROMPTS = {
         "Output ONLY valid JSON. No prose, no explanation, no markdown outside the json block."
     ),
     "deepseek": (
-        "You are DeepSeek-Reviewer, a CUDA→HIP verification specialist. "
-        "Your role is to review ported HIP kernels for correctness, "
-        "checking wavefront64 compatibility, correct __shfl masks, "
-        "shared memory sizing, and HIP API usage. "
+        "You are DeepSeek-Orchestrator, the central orchestrator of the "
+        "CUDA→HIP migration pipeline. Your role is to verify ported HIP kernels "
+        "for correctness — checking wavefront64 compatibility, __shfl masks, "
+        "shared memory sizing, and HIP API usage — and to coordinate iterative "
+        "refinement with Kimi-Coder. When verification fails, provide specific, "
+        "actionable, line-level feedback so Kimi can fix the issues. "
         "Output ONLY valid JSON. No prose, no praise, no explanation."
     ),
 }
@@ -373,18 +375,74 @@ class ModelRouter:
         )
         return prompt
 
-    def _build_deepseek_verify_prompt(self, ported_code: str,
-                                      patterns: List[Dict]) -> str:
-        """Build the DeepSeek (or Gemma) verification phase prompt.
+    def _build_kimi_refine_prompt(self, kernel_source: str,
+                                  previous_code: str,
+                                  feedback: str,
+                                  patterns: List[Dict],
+                                  iteration: int) -> str:
+        """Build the Kimi refinement prompt for orchestration loop iterations.
 
-        Role: DeepSeek-Reviewer — verifies correctness of ported HIP code.
-
-        Output format: JSON with pass (bool), issues (list[str]),
-        verdict (str).
+        Kimi receives the original kernel, its previous output, and
+        DeepSeek orchestrator's specific feedback to fix issues.
         """
         prompt = (
-            "You are DeepSeek-Reviewer, a CUDA->HIP verification specialist.\n"
-            "Your task: review the following ported HIP kernel for correctness.\n\n"
+            "You are Kimi-Coder, refining your CUDA->HIP code based on "
+            "orchestrator feedback.\n\n"
+            f"ITERATION {iteration}: You previously generated a ported HIP kernel, "
+            "but the orchestrator found issues. Please fix them.\n\n"
+            "PORTING CHECKLIST (re-verify your fixes):\n"
+            "- __shfl_down_sync offset 16 works on both (verify algorithm)\n"
+            "- __shfl_xor_sync mask 0x1f -> 0x3f for wavefront64\n"
+            "- warpSize 32 -> use dynamic warpSize() or WAVEFRONT_SIZE constant\n"
+            "- shared memory sized for warp 32 -> WAVEFRONT_SIZE (64) or dynamic\n"
+            "- __syncwarp() -> __syncthreads() for HIP\n"
+            "- #define WAVEFRONT_SIZE 64 at top of kernel\n"
+        )
+
+        pattern_summary = _format_patterns_summary(patterns)
+        if pattern_summary:
+            prompt += "\n" + pattern_summary + "\n"
+
+        prompt += (
+            f"\nORIGINAL CUDA KERNEL:\n"
+            f"```cuda\n{kernel_source[:2000]}\n```\n\n"
+            f"YOUR PREVIOUS PORTED OUTPUT:\n"
+            f"```hip\n{previous_code[:2000]}\n```\n\n"
+            f"ORCHESTRATOR FEEDBACK (fix these issues):\n"
+            f"{feedback}\n\n"
+            "OUTPUT FORMAT -- STRICT JSON inside ```json ... ```:\n"
+            "{\n"
+            '  "ported_code": "<full ported HIP kernel with fixes applied>",\n'
+            '  "confidence": <0-100>,\n'
+            '  "changes": ["fix 1", "fix 2", ...],\n'
+            '  "explanation": "what was fixed based on orchestrator feedback"\n'
+            "}\n\n"
+            "CRITICAL: Fix ALL issues listed in orchestrator feedback. "
+            "Return ONLY the ```json ... ``` block."
+        )
+        return prompt
+
+    def _build_deepseek_verify_prompt(self, ported_code: str,
+                                      patterns: List[Dict],
+                                      feedback: str = "",
+                                      iteration: int = 1,
+                                      max_iterations: int = 3) -> str:
+        """Build the DeepSeek orchestrator verification prompt with feedback.
+
+        DeepSeek-Orchestrator verifies ported HIP code and provides
+        specific, actionable feedback for Kimi-Coder to fix issues in
+        the next iteration of the orchestration loop.
+
+        Output format: JSON with pass (bool), issues (list[str]),
+        feedback (str), verdict (str).
+        """
+        prompt = (
+            "You are DeepSeek-Orchestrator, the central orchestrator of the "
+            "CUDA->HIP migration pipeline.\n"
+            f"Orchestration loop: iteration {iteration}/{max_iterations}.\n\n"
+            "Your task: review the following ported HIP kernel for correctness. "
+            "If verification fails, provide SPECIFIC, ACTIONABLE, LINE-LEVEL "
+            "feedback that Kimi-Coder can use to fix the issues.\n\n"
             "CHECKS:\n"
             "- wavefront64 compatibility (64 threads per wavefront)\n"
             "- __shfl masks use 0xffffffffffffffffULL (64-bit, not 32-bit)\n"
@@ -393,6 +451,13 @@ class ModelRouter:
             "- HIP API usage (not deprecated CUDA APIs)\n"
             "- __ballot_sync used correctly for HIP\n"
         )
+
+        if feedback:
+            prompt += (
+                f"\nPREVIOUS FEEDBACK (issues that were reported in iteration "
+                f"{iteration - 1} — verify they have been fixed):\n"
+                f"{feedback}\n"
+            )
 
         pattern_summary = _format_patterns_summary(patterns)
         if pattern_summary:
@@ -405,48 +470,77 @@ class ModelRouter:
             "{\n"
             '  "pass": true/false,\n'
             '  "issues": ["issue 1", "issue 2", ...],\n'
+            '  "feedback": "actionable, line-level feedback for Kimi to fix issues — '
+            'be specific, mention exact lines and what to change. Empty string if pass=true.",\n'
             '  "verdict": "concise explanation of pass/fail"\n'
             "}\n\n"
-            "EXAMPLE:\n"
+            "EXAMPLE (pass):\n"
             "```json\n"
             "{\n"
             '  "pass": true,\n'
             '  "issues": [],\n'
+            '  "feedback": "",\n'
             '  "verdict": "All wavefront64 checks pass. '
             'Masks use 0xffffffffffffffffULL, sync primitives are correct."\n'
             "}\n"
             "```\n\n"
+            "EXAMPLE (fail with actionable feedback):\n"
+            "```json\n"
+            "{\n"
+            '  "pass": false,\n'
+            '  "issues": ["Line 42: __shfl_xor_sync mask is 0x1f, should be 0x3f for wavefront64"],\n'
+            '  "feedback": "Line 42: Change __shfl_xor_sync mask from 0x1f to 0x3f '
+            'to support 64-thread wavefronts.",\n'
+            '  "verdict": "Shuffle mask is configured for 32-thread warps but '
+            'AMD wavefronts need 64-thread masks.",\n'
+            "}\n"
+            "```\n\n"
             "CRITICAL: Return ONLY valid JSON. "
             "Set pass=true ONLY if all checks pass. "
-            "If issues exist, list them specifically and set pass=false."
+            "When pass=false, the 'feedback' field is REQUIRED and must be "
+            "specific enough for Kimi-Coder to fix without guessing."
         )
         return prompt
 
     # ── Main routing logic ──────────────────────────────────────
 
-    def route(self, kernel_source: str, patterns: List[Dict]) -> Dict:
+    def route(self, kernel_source: str, patterns: List[Dict],
+              max_iterations: int = 3) -> Dict:
         """Route kernel through best models based on detected patterns.
 
+        Orchestration loop: Kimi generates → DeepSeek orchestrator reviews →
+        loop with feedback → converge (up to max_iterations cycles).
+
+        Args:
+            kernel_source: The CUDA kernel source code.
+            patterns: List of classifier-detected patterns.
+            max_iterations: Maximum Kimi→DeepSeek cycles (default 3).
+
         Returns:
-          {"ported_code": ..., "confidence": ..., "changes": [...], "model_used": ..., "cost": ...}
+            {"ported_code": ..., "confidence": ..., "changes": [...],
+             "model_used": ..., "cost": ..., "orchestrator_passed": ...,
+             "iterations_used": ...}
         """
         if not self.api_key:
             return {"ported_code": "", "confidence": 0,
                     "changes": ["No API key -- use template fallback"],
-                    "model_used": "none", "cost": 0}
+                    "model_used": "none", "cost": 0,
+                    "orchestrator_passed": False, "iterations_used": 0}
 
         # Determine which patterns need which model
         pattern_types = [p.get("pattern", "default") for p in patterns]
         models_needed = set(ROUTING_TABLE.get(pt, "deepseek") for pt in pattern_types)
 
         result = {"ported_code": "", "confidence": 0,
-                  "changes": [], "model_used": "", "cost": 0}
+                  "changes": [], "model_used": "", "cost": 0,
+                  "orchestrator_passed": False, "iterations_used": 0}
 
         # Track pipeline phase outcomes for rubric scoring
         planner_success = False
         coder_success = False
         verify_success = False
         verify_passed = False
+        orchestrator_feedback = ""
 
         # Phase 1: GLM plans the fix (planner, complex warp patterns)
         if "glm" in models_needed and any("shfl" in pt for pt in pattern_types):
@@ -457,7 +551,7 @@ class ModelRouter:
                 planner_success = True
                 result["changes"].append(f"[glm] Plan: {plan.output[:200]}")
 
-        # Phase 2: Kimi K2.7 Code generates the ported HIP code
+        # Phase 2: Kimi K2.7 generates initial ported code + orchestration loop
         if "kimi27" in models_needed:
             kimi_prompt = self._build_kimi_code_prompt(kernel_source, patterns)
             code = self._call_model("kimi27", kimi_prompt,
@@ -468,8 +562,80 @@ class ModelRouter:
                 extracted = self._fix_ported_code(extracted)
                 result["ported_code"] = extracted
                 result["changes"].append("[kimi27] Generated ported kernel")
+                result["model_used"] = "kimi27"
 
-        # Phase 3: Gemma 4 verifies the output (local AMD GPU via vLLM)
+                # ── Orchestration Loop: Kimi → DeepSeek → loop → Kimi → DeepSeek ──
+                for iteration in range(1, max_iterations + 1):
+                    if not result["ported_code"]:
+                        break
+
+                    verify_prompt = self._build_deepseek_verify_prompt(
+                        result["ported_code"], patterns,
+                        feedback=orchestrator_feedback,
+                        iteration=iteration,
+                        max_iterations=max_iterations,
+                    )
+                    orchestrator = self._call_model(
+                        "deepseek", verify_prompt,
+                        system_prompt=SYSTEM_PROMPTS.get("deepseek", "")
+                    )
+                    result["iterations_used"] = iteration
+
+                    if not orchestrator.success:
+                        result["changes"].append(
+                            f"[deepseek-orch] Call failed (iteration {iteration})")
+                        break
+
+                    # Parse orchestrator JSON response
+                    try:
+                        parsed = json.loads(orchestrator.output)
+                    except (json.JSONDecodeError, TypeError) as e:
+                        result["changes"].append(
+                            f"[deepseek-orch] JSON parse error (iteration {iteration}): "
+                            f"{str(e)[:60]}")
+                        break
+
+                    if parsed.get("pass", False):
+                        verify_success = True
+                        verify_passed = True
+                        result["orchestrator_passed"] = True
+                        result["changes"].append(
+                            f"[deepseek-orch] Passed verification (iteration {iteration})")
+                        break  # Converged — exit loop
+
+                    # Verification failed — extract feedback for refinement
+                    verify_success = True
+                    orchestrator_feedback = parsed.get("feedback", "")
+                    issues = parsed.get("issues", [])
+                    if issues:
+                        result["changes"].append(
+                            f"[deepseek-orch] Iteration {iteration}: "
+                            f"{' | '.join(issues[:3])}")
+
+                    if iteration < max_iterations:
+                        # Loop back: Kimi refines with orchestrator-specific feedback
+                        refine_prompt = self._build_kimi_refine_prompt(
+                            kernel_source, result["ported_code"],
+                            orchestrator_feedback, patterns, iteration + 1
+                        )
+                        refine = self._call_model(
+                            "kimi27", refine_prompt,
+                            system_prompt=SYSTEM_PROMPTS.get("kimi27", "")
+                        )
+                        if refine.success:
+                            extracted = self._extract_code(refine.output)
+                            extracted = self._fix_ported_code(extracted)
+                            result["ported_code"] = extracted
+                            result["changes"].append(
+                                f"[kimi27] Refined with orchestrator feedback "
+                                f"(iteration {iteration} → {iteration + 1})")
+                        else:
+                            result["changes"].append(
+                                f"[kimi27] Refinement failed (iteration {iteration})")
+                            break
+                    # else: max iterations reached, accept current output
+
+        # Phase 3: Gemma 4 final verification (local AMD GPU via vLLM)
         if result["ported_code"] and "gemma4" in models_needed:
             # Try Gemma locally first, fallback to DeepSeek via Fireworks
             verify_prompt = self._build_deepseek_verify_prompt(
@@ -478,14 +644,12 @@ class ModelRouter:
             verify = self._call_model("gemma4", verify_prompt,
                                       system_prompt=SYSTEM_PROMPTS.get("deepseek", ""))
             if verify.success:
-                verify_success = True
-                verify_source = "local-gemma4"
+                verify_success = verify_success or True
                 result["model_used"] = "gemma4"
-                # Try to parse JSON verdict
                 try:
                     parsed = json.loads(verify.output)
                     if parsed.get("pass", False):
-                        verify_passed = True
+                        verify_passed = verify_passed or True
                         result["changes"].append(
                             "[gemma4] Verified -- no issues found (local AMD GPU)")
                     else:
@@ -493,9 +657,8 @@ class ModelRouter:
                         result["changes"].append(
                             f"[gemma4] Issues found: {'; '.join(issues[:3])}")
                 except (json.JSONDecodeError, TypeError):
-                    # Fallback to text-based check
                     if "PASS" in verify.output.upper()[:10]:
-                        verify_passed = True
+                        verify_passed = verify_passed or True
                         result["changes"].append(
                             "[gemma4] Verified -- no issues found (local AMD GPU)")
                     else:
@@ -509,11 +672,11 @@ class ModelRouter:
                 verify = self._call_model("deepseek", verify_prompt,
                                           system_prompt=SYSTEM_PROMPTS.get("deepseek", ""))
                 if verify.success:
-                    verify_success = True
+                    verify_success = verify_success or True
                     try:
                         parsed = json.loads(verify.output)
                         if parsed.get("pass", False):
-                            verify_passed = True
+                            verify_passed = verify_passed or True
                             result["changes"].append(
                                 "[deepseek] Verified -- no issues found")
                         else:
@@ -522,14 +685,14 @@ class ModelRouter:
                                 f"[deepseek] Issues found: {'; '.join(issues[:3])}")
                     except (json.JSONDecodeError, TypeError):
                         if "PASS" in verify.output.upper()[:10]:
-                            verify_passed = True
+                            verify_passed = verify_passed or True
                             result["changes"].append(
                                 "[deepseek] Verified -- no issues found")
                         else:
                             result["changes"].append(
                                 f"[deepseek] Issues found: {verify.output[:200]}")
 
-        # Rubric-based scoring replaces the old additive confidence model
+        # Rubric-based scoring
         result["confidence"] = self._rubric_score_pipeline(
             kimi_success=coder_success,
             glm_success=planner_success,

@@ -242,6 +242,7 @@ class KernelOlympics:
                     pipeline_state["total_cost"] += port_result.get("cost", 0)
                     if not port_result.get("ported_code"):
                         port_result = self.porting_agent.port_kernel(source)
+                        pipeline_state["total_cost"] += port_result.get("cost", 0)
                         llm_elapsed = time.perf_counter() - t0
                     self.disp.file_done(Path(cr['file']).name, f"3-model pipeline ✅ ({port_result.get('confidence', 0)}%, {llm_elapsed:.0f}s)", ok=True)
                     save_path = Path.cwd() / "ported_kernels" / (Path(cr["file"]).stem + ".hip.cpp")
