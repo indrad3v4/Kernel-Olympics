@@ -1,0 +1,32 @@
+{
+  "kernel_name": "conv2d",
+  "kernel_function": "conv2d_kernel",
+  "description": "2D convolution with warp-level tiling — shared memory and __shfl_xor_sync",
+  "params": [
+    {"name": "input",    "type": "const float*", "direction": "in",   "size_expr": "width * height * channels"},
+    {"name": "output",   "type": "float*",        "direction": "out",  "size_expr": "width * height * channels"},
+    {"name": "width",    "type": "int",           "direction": "scalar"},
+    {"name": "height",   "type": "int",           "direction": "scalar"},
+    {"name": "channels", "type": "int",           "direction": "scalar"}
+  ],
+  "launch": {
+    "grid":  {"x": 8, "y": 8, "z": 1},
+    "block": {"x": 38, "y": 38, "z": 1}
+  },
+  "input_setup": {
+    "count": 65536,
+    "default_value": 1.0
+  },
+  "output_readback": {
+    "count": 4,
+    "element_type": "float",
+    "format": "float_per_line"
+  },
+  "kernel_args_override": "256, 256, 1",
+  "reference_output": "sample_kernels/reference/conv2d_output.txt",
+  "warp_size_issues": [
+    "TILE_SIZE 32 assumes 32-lane warp for optimal tiling",
+    "__shfl_xor_sync(0x1f, ...) uses 32-bit warp mask",
+    "__syncwarp() semantics differ on AMD GPUs"
+  ]
+}

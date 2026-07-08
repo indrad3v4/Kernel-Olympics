@@ -1,0 +1,14 @@
+{
+  "kernel_function": "warp_reduce_kernel",
+  "params": [
+    {"name": "input", "type": "const float*", "direction": "input"},
+    {"name": "output", "type": "float*", "direction": "output"},
+    {"name": "n", "type": "int", "direction": "scalar"}
+  ],
+  "launch": {
+    "grid": {"x": 4, "y": 1, "z": 1},
+    "block": {"x": 64, "y": 1, "z": 1}
+  },
+  "input_setup": {"count": 256, "default_value": 1.0},
+  "output_readback": {"count": 4, "element_type": "float", "format": "float_per_line"}
+}

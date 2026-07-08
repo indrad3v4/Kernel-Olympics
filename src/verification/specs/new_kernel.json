@@ -1,0 +1,28 @@
+{
+  "kernel_name": "new_kernel",
+  "kernel_function": "warp_scan_kernel",
+  "description": "Warp-level inclusive prefix sum (Hillis-Steele scan) via __shfl_up_sync",
+  "params": [
+    {"name": "input",  "type": "const float*", "direction": "in",   "size_expr": "n"},
+    {"name": "output", "type": "float*",        "direction": "out",  "size_expr": "n"},
+    {"name": "n",      "type": "int",           "direction": "scalar"}
+  ],
+  "launch": {
+    "grid":  {"x": 1, "y": 1, "z": 1},
+    "block": {"x": 256, "y": 1, "z": 1}
+  },
+  "input_setup": {
+    "count": 256,
+    "default_value": 1.0
+  },
+  "output_readback": {
+    "count": 4,
+    "element_type": "float",
+    "format": "float_per_line"
+  },
+  "reference_output": "sample_kernels/reference/new_kernel_output.txt",
+  "warp_size_issues": [
+    "__activemask() returns 32-bit mask — cannot represent wavefront64 lanes 32-63",
+    "__shfl_up_sync offsets assume 32-lane warp"
+  ]
+}

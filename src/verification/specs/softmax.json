@@ -1,0 +1,34 @@
+{
+  "kernel_name": "softmax",
+  "kernel_function": "softmax_kernel",
+  "description": "Warp-level softmax using __shfl_down_sync, __activemask, __all_sync, __match_all_sync",
+  "params": [
+    {"name": "input",  "type": "const float*", "direction": "in",   "size_expr": "n"},
+    {"name": "output", "type": "float*",        "direction": "out",  "size_expr": "n"},
+    {"name": "n",      "type": "int",           "direction": "scalar"},
+    {"name": "stride", "type": "int",           "direction": "scalar"}
+  ],
+  "launch": {
+    "grid":  {"x": 1, "y": 1, "z": 1},
+    "block": {"x": 256, "y": 1, "z": 1}
+  },
+  "input_setup": {
+    "count": 256,
+    "default_value": 1.0
+  },
+  "output_readback": {
+    "count": 4,
+    "element_type": "float",
+    "format": "float_per_line"
+  },
+  "kernel_args_override": "256, 256",
+  "reference_output": "sample_kernels/reference/softmax_output.txt",
+  "warp_size_issues": [
+    "__activemask() returns 32-bit mask (no HIP equivalent)",
+    "__shfl_down_sync chain assumes 32-lane warp",
+    "__all_sync(0xffffffff, ...) assumes all 32 lanes active",
+    "__match_all_sync has no HIP equivalent",
+    "threadIdx.x >> 5 and & 0x1f assume 32-lane warp",
+    "hardcoded 32 in batch offset and loop bounds"
+  ]
+}

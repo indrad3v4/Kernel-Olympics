@@ -1,0 +1,16 @@
+{
+  "kernel_function": "histogram_kernel",
+  "params": [
+    {"name": "input", "type": "const float*", "direction": "input"},
+    {"name": "histogram", "type": "int*", "direction": "output"},
+    {"name": "n", "type": "int", "direction": "scalar"},
+    {"name": "num_bins", "type": "int", "direction": "scalar"}
+  ],
+  "launch": {
+    "grid": {"x": 1, "y": 1, "z": 1},
+    "block": {"x": 256, "y": 1, "z": 1}
+  },
+  "input_setup": {"count": 256, "default_value": 1.0},
+  "output_readback": {"count": 4, "element_type": "int", "format": "int_per_line"},
+  "dynamic_shared_mem": 1024
+}
