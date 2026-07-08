@@ -207,13 +207,11 @@ Output format: JSON with:
         - 32-bit __shfl mask → 64-bit for wavefront64
         """
         import re
-        before = len(re.findall(r'__shfl_\w+_sync\()0x[fF]{8}(,)', code))
-        code = re.sub(
-            r'(__shfl_\w+_sync\()0x[fF]{8}(,)',
-            r'\g<1>0xffffffffffffffffULL\g<2>',
-            code
-        )
-        after = len(re.findall(r'__shfl_\w+_sync\()0x[fF]{8}(,)', code))
+        # Count how many 32-bit masks remain
+        mask_pattern = re.compile(r'(__shfl_\w+_sync\()0x[fF]{8}(,)')
+        before = len(mask_pattern.findall(code))
+        code = mask_pattern.sub(r'\g<1>0xffffffffffffffffULL\g<2>', code)
+        after = len(mask_pattern.findall(code))
         if before > 0 and after == 0:
             pass  # All masks fixed
         elif before > 0:
