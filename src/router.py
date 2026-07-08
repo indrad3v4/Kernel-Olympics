@@ -52,41 +52,41 @@ _force_ipv4()
 # Only verified models are kept to avoid silent failures during porting.
 
 MODEL_CATALOG = {
-    "glm": {
-        "id": "accounts/fireworks/models/glm-5p2",  # ✅ VERIFIED WORKING
-        "role": "planner",
-        "strength": "kernel analysis, pattern detection, warp/wavefront reasoning",
-        "cost_per_1k": 0.0014,
+    "deepseek": {
+        "id": "accounts/fireworks/models/deepseek-v4-pro",  # ✅ VERIFIED WORKING
+        "role": "planner",          # CHANGED: reasoning model → planner (prose OK)
+        "strength": "deep reasoning, chain-of-thought planning, pattern analysis",
+        "cost_per_1k": 0.0012,
         "local_first": False,
-        "max_tokens": 2048,      # planner needs room for analysis
-        "temperature": 0.3,      # some creativity for pattern detection
+        "max_tokens": 2048,      # planner needs room for reasoning
+        "temperature": 0.3,      # creativity for diverse plans
     },
     "kimi27": {
         "id": "accounts/fireworks/models/kimi-k2p7-code",  # ✅ VERIFIED WORKING
-        "role": "coder",
+        "role": "coder",            # UNCHANGED
         "strength": "code generation, struct-aware HIP porting",
         "cost_per_1k": 0.00095,
         "local_first": False,
         "max_tokens": 4096,      # coder needs room for full kernel output
         "temperature": 0.1,      # code generation needs precision
     },
-    "deepseek": {
-        "id": "accounts/fireworks/models/deepseek-v4-pro",  # ✅ VERIFIED WORKING
-        "role": "verifier_fallback",
-        "strength": "correctness checking, fallback when local Gemma unavailable",
-        "cost_per_1k": 0.0012,
+    "glm": {
+        "id": "accounts/fireworks/models/glm-5p2",  # ✅ VERIFIED WORKING
+        "role": "evaluator",         # CHANGED: was planner → now evaluator (strict JSON)
+        "strength": "structured JSON output, correctness checking, wavefront64 validation",
+        "cost_per_1k": 0.0014,
         "local_first": False,
-        "max_tokens": 1024,      # verifier output is small (pass/fail + feedback)
-        "temperature": 0.0,      # deterministic verification
+        "max_tokens": 1024,      # evaluator output is compact (pass/fail + issues)
+        "temperature": 0.0,      # deterministic evaluation
     },
     "gemma4": {
         "id": "accounts/fireworks/models/gemma-4-31b-it",  # Real Gemma on AMD GPU via vLLM
-        "role": "verifier",
+        "role": "verifier",         # local AMD GPU verification (Gemma Prize)
         "strength": "AMD-native verification via local vLLM on MI300X",
         "cost_per_1k": 0.0,
         "local_first": True,     # Try localhost:8000 first, then Fireworks
         "max_tokens": 1024,
-        "temperature": 0.0,      # deterministic verification
+        "temperature": 0.0,
     },
 }
 
@@ -95,10 +95,10 @@ MODEL_CATALOG = {
 # already defines the exact shape. json_schema is stricter but not all models support it.
 
 JSON_SCHEMAS = {
-    "deepseek": {
+    "glm": {  # GLM is now evaluator — strict schema for pass/fail JSON
         "type": "json_schema",
         "json_schema": {
-            "name": "VerificationResult",
+            "name": "EvaluationResult",
             "schema": {
                 "type": "object",
                 "properties": {
@@ -111,31 +111,33 @@ JSON_SCHEMAS = {
             },
         },
     },
-    "glm": {
-        "type": "json_object",
-    },
     "kimi27": {
         "type": "json_object",
     },
+    # DeepSeek is planner — no response_format (prose/reasoning is OK)
 }
 # ── Role-specific system prompts ──
 # Each model gets its OWN role definition. No shared prompts.
 # These are passed as system messages to the LLM alongside the phase prompt.
 
 SYSTEM_PROMPTS = {
-    "glm": (
-        "You are a CUDA-to-HIP kernel analyzer. "
-        "Find warp(32)→wavefront(64) divergence issues. "
-        "Respond with a JSON array: [{\"line\":int,\"issue\":str,\"fix\":str}]."
+    "deepseek": (
+        "You are a CUDA-to-HIP porting planner. "
+        "Analyze the CUDA kernel and produce a detailed porting plan: "
+        "list every CUDA-specific construct, its HIP replacement, and the order of changes. "
+        "Focus on warp(32)→wavefront(64) divergence, __shfl mask widths, shared memory sizing, "
+        "header replacements, and any local .cuh dependencies that must be inlined or removed. "
+        "Write your plan as clear prose with a numbered checklist of fixes. "
+        "Reason freely — your plan will be consumed by a coder agent."
     ),
     "kimi27": (
         "You are a CUDA-to-HIP code porting specialist. "
         "Port CUDA kernels to AMD ROCm/HIP, fixing warp→wavefront issues. "
         "Respond with JSON: {\"ported_code\":str,\"confidence\":int,\"changes\":[str],\"explanation\":str}."
     ),
-    "deepseek": (
-        "You are a HIP kernel code reviewer. "
-        "Check ported code for wavefront64 correctness. "
+    "glm": (
+        "You are a HIP kernel code evaluator. "
+        "Check ported code for wavefront64 correctness, CUDA remnants, and compilation safety. "
         'Respond with JSON: {"pass":bool,"issues":[str],"feedback":str,"verdict":str}. '
         "DO NOT include reasoning, explanations, or chain-of-thought. "
         "Output ONLY the JSON object, nothing before or after."
@@ -237,7 +239,11 @@ class ModelRouter:
 
     @staticmethod
     def _fix_ported_code(code: str) -> str:
-        """Fix AMD-specific issues in ported code."""
+        """Fix AMD-specific issues in ported code.
+
+        Post-processing safety net applied after every Kimi code generation
+        and refinement pass. Catches common issues the LLM may miss.
+        """
         # Replace CUDA headers with HIP equivalents
         code = re.sub(r'#include\s*<cuda_runtime\.h>', '#include <hip/hip_runtime.h>', code)
         code = re.sub(r'#include\s*<cuda_runtime_api\.h>', '#include <hip/hip_runtime.h>', code)
@@ -252,12 +258,34 @@ class ModelRouter:
         code = re.sub(r'#include\s*<[^>]*\.cuh>\n?', '', code)
         # Remove device_launch_parameters.h — not needed in HIP
         code = re.sub(r'#include\s*<device_launch_parameters\.h>\n?', '', code)
-        # Fix __shfl masks: 32-bit 0xffffffff → 64-bit for wavefront64
+
+        # Inject #define WAVEFRONT_SIZE 64 if not already defined
+        # ROCm wavefront is 64 on gfx9 (MI300/MI250). CUDA warp is 32.
+        if not re.search(r'#define\s+WAVEFRONT_SIZE', code):
+            # Insert after the last #include line (or at top if no includes)
+            include_lines = list(re.finditer(r'#include\s+[<"].*[>"]\n', code))
+            if include_lines:
+                last_include = include_lines[-1]
+                insert_pos = last_include.end()
+                code = code[:insert_pos] + '#define WAVEFRONT_SIZE 64\n' + code[insert_pos:]
+            else:
+                code = '#define WAVEFRONT_SIZE 64\n' + code
+
+        # Fix __shfl_xor_sync mask: 0x1f (5-bit, warp32) → 0x3f (6-bit, wavefront64)
+        code = re.sub(
+            r'(__shfl_xor_sync\s*\()0x1f(,)',
+            r'\g<1>0x3f\g<2>',
+            code
+        )
+        # Fix __shfl_down_sync mask: 32-bit 0xffffffff → 64-bit for wavefront64
         code = re.sub(
             r'(__shfl_\w+_sync\()0x[fF]{8}(,)',
             r'\g<1>0xffffffffffffffffULL\g<2>',
             code
         )
+        # Replace __syncwarp() with __syncthreads() for wavefront64 safety
+        code = re.sub(r'\b__syncwarp\s*\(\s*\)', '__syncthreads()', code)
+
         return code
 
     @staticmethod
@@ -323,19 +351,19 @@ class ModelRouter:
 
     # ── Phase prompt builders ────────────────────────────────────
 
-    def _build_glm_plan_prompt(self, kernel_source: str,
-                               patterns: List[Dict]) -> str:
-        """Build the GLM planner phase prompt with classifier context.
+    def _build_deepseek_plan_prompt(self, kernel_source: str,
+                                    patterns: List[Dict]) -> str:
+        """Build the DeepSeek planner phase prompt with classifier context.
 
-        Role: GLM-Planner — analyzes warp/wavefront divergence and produces
-        a line-level JSON plan of issues and fixes.
-
-        Output format: JSON array of {"line": int, "issue": str, "fix": str}
+        Role: DeepSeek-Planner — reasons freely about the CUDA kernel and produces
+        a detailed porting plan as prose. No JSON required — reasoning is the asset here.
+        The plan is passed to Kimi-Coder as context.
         """
         prompt = (
-            "Analyze this CUDA kernel for warp(32)→wavefront(64) divergence issues.\n"
-            "For each issue, output: {\"line\": int, \"issue\": str, \"fix\": str}\n"
-            "Multiple issues → JSON array. No issues → empty array [].\n\n"
+            "Analyze this CUDA kernel and produce a porting plan for AMD ROCm/HIP.\n"
+            "Identify every CUDA-specific construct and its HIP replacement.\n"
+            "Prioritize: warp(32)→wavefront(64) divergence, __shfl mask widths, "
+            "shared memory sizing, header swaps, local .cuh dependencies.\n\n"
         )
 
         pattern_summary = _format_patterns_summary(patterns)
@@ -343,16 +371,20 @@ class ModelRouter:
             prompt += pattern_summary + "\n"
 
         prompt += (
-            f"```cuda\n{kernel_source[:4000]}\n```\n\n"
-            "Respond with JSON only."
+            f"```cuda\n{kernel_source[:5000]}\n```\n\n"
+            "Write a detailed porting plan as a numbered checklist. "
+            "For each item: what to change, where (line/construct), and why. "
+            "Be specific — a coder agent will follow your plan exactly."
         )
         return prompt
 
     def _build_kimi_code_prompt(self, kernel_source: str,
-                                patterns: List[Dict]) -> str:
+                                patterns: List[Dict],
+                                deepseek_plan: str = "") -> str:
         """Build the Kimi K2.7 code generator phase prompt.
 
         Role: Kimi-Coder — generates the actual ported HIP kernel code.
+        Now receives DeepSeek's plan as context (was GLM analysis before).
 
         Output format: JSON with ported_code (str), confidence (0-100),
         changes (list[str]), explanation (str).
@@ -367,8 +399,12 @@ class ModelRouter:
             "- __syncwarp() → __syncthreads()\n"
             "- #define WAVEFRONT_SIZE 64 at top\n"
             "- Replace #include <cuda_runtime.h> → #include <hip/hip_runtime.h>\n"
-            "- Remove #include <helper_cuda.h>, <helper_functions.h>, <device_launch_parameters.h>\n\n"
+            "- Remove #include <helper_cuda.h>, <helper_functions.h>, <device_launch_parameters.h>\n"
+            "- Remove ALL #include \"*.cuh\" local headers (inline their content if needed)\n\n"
         )
+
+        if deepseek_plan:
+            prompt += f"DeepSeek Planner's plan (follow this):\n{deepseek_plan[:2000]}\n\n"
 
         pattern_summary = _format_patterns_summary(patterns)
         if pattern_summary:
@@ -385,14 +421,15 @@ class ModelRouter:
                                   previous_code: str,
                                   feedback: str,
                                   patterns: List[Dict],
-                                  iteration: int) -> str:
+                                  deepseek_plan: str = "",
+                                  iteration: int = 1) -> str:
         """Build the Kimi refinement prompt for orchestration loop iterations.
 
         Kimi receives the original kernel, its previous output, and
-        DeepSeek orchestrator's specific feedback to fix issues.
+        GLM evaluator's specific feedback to fix issues.
         """
         prompt = (
-            f"Fix your ported HIP kernel based on reviewer feedback (iteration {iteration}).\n\n"
+            f"Fix your ported HIP kernel based on evaluator feedback (iteration {iteration}).\n\n"
             "CHECKLIST:\n"
             "- __shfl_xor_sync mask 0x1f → 0x3f for wavefront64\n"
             "- __shfl_down_sync masks → 0xffffffffffffffffULL (64-bit)\n"
@@ -401,8 +438,12 @@ class ModelRouter:
             "- __syncwarp() → __syncthreads()\n"
             "- #define WAVEFRONT_SIZE 64 at top\n"
             "- Replace #include <cuda_runtime.h> → #include <hip/hip_runtime.h>\n"
-            "- Remove #include <helper_cuda.h>, <helper_functions.h>, <device_launch_parameters.h>\n\n"
+            "- Remove #include <helper_cuda.h>, <helper_functions.h>, <device_launch_parameters.h>\n"
+            "- Remove ALL #include \"*.cuh\" local headers\n\n"
         )
+
+        if deepseek_plan:
+            prompt += f"DeepSeek Planner's plan (reference):\n{deepseek_plan[:1500]}\n\n"
 
         pattern_summary = _format_patterns_summary(patterns)
         if pattern_summary:
@@ -411,24 +452,25 @@ class ModelRouter:
         prompt += (
             f"Original CUDA:\n```cuda\n{kernel_source[:4000]}\n```\n\n"
             f"Your previous output:\n```hip\n{previous_code[:4000]}\n```\n\n"
-            f"Reviewer feedback (fix ALL):\n{feedback}\n\n"
+            f"Evaluator feedback (fix ALL):\n{feedback}\n\n"
             "Respond with JSON: {\"ported_code\": str, \"confidence\": 0-100, "
             "\"changes\": [str], \"explanation\": str}."
         )
         return prompt
 
-    def _build_deepseek_verify_prompt(self, ported_code: str,
-                                      patterns: List[Dict],
-                                      glm_analysis: str = "",
-                                      feedback: str = "",
-                                      iteration: int = 1,
-                                      max_iterations: int = 3) -> str:
-        """Build the DeepSeek verification prompt.
+    def _build_glm_evaluate_prompt(self, ported_code: str,
+                                   patterns: List[Dict],
+                                   deepseek_plan: str = "",
+                                   feedback: str = "",
+                                   iteration: int = 1,
+                                   max_iterations: int = 3) -> str:
+        """Build the GLM evaluator prompt.
 
-        Simplified: no role philosophy, no examples, no "2 JOBS" narrative.
+        Role: GLM-Evaluator — strict JSON output. Checks ported code for
+        wavefront64 correctness, CUDA remnants, and compilation safety.
         System prompt already defines role + JSON contract.
         """
-        prompt = f"Review this ported HIP kernel (iteration {iteration}/{max_iterations}).\n\n"
+        prompt = f"Evaluate this ported HIP kernel (iteration {iteration}/{max_iterations}).\n\n"
 
         prompt += (
             "Checks:\n"
@@ -437,11 +479,12 @@ class ModelRouter:
             "- __syncwarp() → __syncthreads()\n"
             "- shared memory sized for 64, not 32\n"
             "- No CUDA headers (cuda_runtime.h, helper_cuda.h, device_launch_parameters.h)\n"
-            "- WAVEFRONT_SIZE 64 defined\n\n"
+            "- No .cuh local headers remaining\n"
+            "- WAVEFRONT_SIZE 64 defined or warpSize used dynamically\n\n"
         )
 
-        if glm_analysis:
-            prompt += f"GLM analysis:\n{glm_analysis[:800]}\n\n"
+        if deepseek_plan:
+            prompt += f"Planner's plan (reference):\n{deepseek_plan[:800]}\n\n"
 
         if feedback:
             prompt += f"Previous issues (verify fixed):\n{feedback[:800]}\n\n"
@@ -461,15 +504,14 @@ class ModelRouter:
 
     def route(self, kernel_source: str, patterns: List[Dict],
               max_iterations: int = 3) -> Dict:
-        """Route kernel through best models based on detected patterns.
+        """Route kernel through the loop engineering pipeline.
 
-        Orchestration loop: Kimi generates → DeepSeek orchestrator reviews →
-        loop with feedback → converge (up to max_iterations cycles).
+        Loop: DeepSeek (plan) → Kimi (code) → GLM (evaluate) → feedback → DeepSeek (re-plan)
 
         Args:
             kernel_source: The CUDA kernel source code.
             patterns: List of classifier-detected patterns.
-            max_iterations: Maximum Kimi→DeepSeek cycles (default 3).
+            max_iterations: Maximum Kimi→GLM cycles (default 3).
 
         Returns:
             {"ported_code": ..., "confidence": ..., "changes": [...],
@@ -482,10 +524,6 @@ class ModelRouter:
                     "model_used": "none", "cost": 0,
                     "orchestrator_passed": False, "iterations_used": 0}
 
-        # Determine which patterns need which model
-        pattern_types = [p.get("pattern", "default") for p in patterns]
-        models_needed = set(ROUTING_TABLE.get(pt, "deepseek") for pt in pattern_types)
-
         result = {"ported_code": "", "confidence": 0,
                   "changes": [], "model_used": "", "cost": 0,
                   "orchestrator_passed": False, "iterations_used": 0}
@@ -495,181 +533,179 @@ class ModelRouter:
         coder_success = False
         verify_success = False
         verify_passed = False
-        orchestrator_feedback = ""
+        evaluator_feedback = ""
+        deepseek_plan_output = ""
 
-        # Phase 1: GLM plans the fix (planner, complex warp patterns)
-        glm_plan_output = ""
-        if "glm" in models_needed and any("shfl" in pt for pt in pattern_types):
-            glm_prompt = self._build_glm_plan_prompt(kernel_source, patterns)
-            plan = self._call_model("glm", glm_prompt,
-                                    system_prompt=SYSTEM_PROMPTS.get("glm", ""))
-            if plan.success:
-                planner_success = True
-                glm_plan_output = plan.output
-                result["changes"].append(f"[glm] Planning complete: {plan.output[:120]}")
-                result["changes"].append("[orch] DeepSeek JOB 1: reviewing GLM plan in verify phase")
-            else:
-                result["changes"].append("[glm] Planning FAILED — proceeding without GLM plan")
+        # ── Phase 1: DeepSeek PLANS the port (reasoning model — prose OK) ──
+        ds_prompt = self._build_deepseek_plan_prompt(kernel_source, patterns)
+        plan = self._call_model("deepseek", ds_prompt,
+                                system_prompt=SYSTEM_PROMPTS.get("deepseek", ""))
+        if plan.success:
+            planner_success = True
+            deepseek_plan_output = plan.output
+            result["changes"].append(f"[deepseek] Plan generated ({len(plan.output)} chars)")
+        else:
+            result["changes"].append("[deepseek] Planning FAILED — proceeding without plan")
 
-        # Phase 2: Kimi K2.7 generates initial ported code + orchestration loop
-        if "kimi27" in models_needed:
-            kimi_prompt = self._build_kimi_code_prompt(kernel_source, patterns)
-            code = self._call_model("kimi27", kimi_prompt,
-                                    system_prompt=SYSTEM_PROMPTS.get("kimi27", ""))
-            if code.success:
-                coder_success = True
-                extracted = self._extract_code(code.output)
-                extracted = self._fix_ported_code(extracted)
-                result["ported_code"] = extracted
-                result["changes"].append("[kimi27] Generated ported kernel")
-                result["model_used"] = "kimi27"
+        # ── Phase 2: Kimi CODES the initial port ──
+        kimi_prompt = self._build_kimi_code_prompt(kernel_source, patterns,
+                                                   deepseek_plan=deepseek_plan_output)
+        code = self._call_model("kimi27", kimi_prompt,
+                                system_prompt=SYSTEM_PROMPTS.get("kimi27", ""))
+        if code.success:
+            coder_success = True
+            extracted = self._extract_code(code.output)
+            extracted = self._fix_ported_code(extracted)
+            result["ported_code"] = extracted
+            result["changes"].append("[kimi27] Generated ported kernel")
+            result["model_used"] = "kimi27"
+        else:
+            result["changes"].append("[kimi27] Code generation FAILED")
+            # Can't proceed without initial code
+            result["cost"] = round(self.total_cost, 4)
+            return result
 
-                # ── Orchestration Loop: Kimi → DeepSeek → loop → Kimi → DeepSeek ──
-                for iteration in range(1, max_iterations + 1):
-                    if not result["ported_code"]:
-                        break
+        # ── Phase 3: GLM EVALUATES → loop → Kimi refines → GLM re-evaluates ──
+        for iteration in range(1, max_iterations + 1):
+            if not result["ported_code"]:
+                break
 
-                    verify_prompt = self._build_deepseek_verify_prompt(
-                        result["ported_code"], patterns,
-                        glm_analysis=glm_plan_output,
-                        feedback=orchestrator_feedback,
-                        iteration=iteration,
-                        max_iterations=max_iterations,
-                    )
-                    result["changes"].append(
-                        f"[orch] DeepSeek JOB 2 — verifying code (attempt {iteration}/{max_iterations})")
-                    orchestrator = self._call_model(
-                        "deepseek", verify_prompt,
-                        system_prompt=SYSTEM_PROMPTS.get("deepseek", "")
-                    )
-                    result["iterations_used"] = iteration
+            eval_prompt = self._build_glm_evaluate_prompt(
+                result["ported_code"], patterns,
+                deepseek_plan=deepseek_plan_output,
+                feedback=evaluator_feedback,
+                iteration=iteration,
+                max_iterations=max_iterations,
+            )
+            result["changes"].append(
+                f"[glm] Evaluating code (attempt {iteration}/{max_iterations})")
+            evaluator = self._call_model(
+                "glm", eval_prompt,
+                system_prompt=SYSTEM_PROMPTS.get("glm", "")
+            )
+            result["iterations_used"] = iteration
 
-                    if not orchestrator.success:
-                        result["changes"].append(
-                            f"[deepseek-orch] Call failed (iteration {iteration})")
-                        break
+            if not evaluator.success:
+                result["changes"].append(
+                    f"[glm] Call failed (iteration {iteration})")
+                break
 
-                    # Parse orchestrator JSON response
-                    # DeepSeek-v4-pro is a REASONING model — it may produce
-                    # chain-of-thought prose BEFORE the JSON. Extract from anywhere.
-                    raw = orchestrator.output.strip()
-                    parsed = None
+            # Parse GLM evaluator JSON response
+            # GLM follows json_schema — should be clean JSON, but keep fallbacks
+            raw = evaluator.output.strip()
+            parsed = None
 
-                    # Strategy 1: response is pure JSON
-                    if raw.startswith("{"):
-                        try: parsed = json.loads(raw)
-                        except: pass
+            # Strategy 1: pure JSON
+            if raw.startswith("{"):
+                try: parsed = json.loads(raw)
+                except: pass
 
-                    # Strategy 2: JSON inside ```json ... ``` markdown
+            # Strategy 2: JSON inside ```json ... ``` markdown
+            if parsed is None:
+                m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
+                if m:
+                    try: parsed = json.loads(m.group(1))
+                    except: pass
+
+            # Strategy 3: find {"pass" ... anywhere (safety net)
+            if parsed is None:
+                m = re.search(r'\{"pass"\s*:', raw)
+                if m:
+                    candidate = raw[m.start():]
+                    try: parsed = json.loads(candidate)
+                    except: pass
                     if parsed is None:
-                        m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
-                        if m:
-                            try: parsed = json.loads(m.group(1))
-                            except: pass
-
-                    # Strategy 3: find {"pass" ... anywhere in response (reasoning models)
-                    if parsed is None:
-                        m = re.search(r'\{"pass"\s*:', raw)
-                        if m:
-                            candidate = raw[m.start():]
-                            # Try full remainder
-                            try: parsed = json.loads(candidate)
-                            except: pass
-                            # Try adding closing brace if truncated
-                            if parsed is None and not candidate.rstrip().endswith('}'):
-                                try: parsed = json.loads(candidate.rstrip() + '}')
-                                except: pass
-                            # Try balanced braces (handles nested objects in values)
-                            if parsed is None:
-                                depth = 0
-                                in_string = False
+                        # balanced braces
+                        depth = 0
+                        in_string = False
+                        escape = False
+                        for ci, ch in enumerate(candidate):
+                            if escape:
                                 escape = False
-                                for ci, ch in enumerate(candidate):
-                                    if escape:
-                                        escape = False
-                                        continue
-                                    if ch == '\\':
-                                        escape = True
-                                        continue
-                                    if ch == '"' and not escape:
-                                        in_string = not in_string
-                                    if not in_string:
-                                        if ch == '{': depth += 1
-                                        elif ch == '}':
-                                            depth -= 1
-                                            if depth == 0:
-                                                try: parsed = json.loads(candidate[:ci+1])
-                                                except: pass
-                                                break
+                                continue
+                            if ch == '\\':
+                                escape = True
+                                continue
+                            if ch == '"' and not escape:
+                                in_string = not in_string
+                            if not in_string:
+                                if ch == '{': depth += 1
+                                elif ch == '}':
+                                    depth -= 1
+                                    if depth == 0:
+                                        try: parsed = json.loads(candidate[:ci+1])
+                                        except: pass
+                                        break
 
-                    # Strategy 4: last-resort regex extract pass/issues/feedback fields
-                    if parsed is None:
-                        pass_match = re.search(r'"pass"\s*:\s*(true|false)', raw, re.IGNORECASE)
-                        if pass_match:
-                            issues_match = re.findall(r'"issues"\s*:\s*\[(.*?)\]', raw, re.DOTALL)
-                            feedback_match = re.search(r'"feedback"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
-                            verdict_match = re.search(r'"verdict"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
-                            parsed = {
-                                "pass": pass_match.group(1).lower() == "true",
-                                "issues": [s.strip().strip('"') for s in issues_match[0].split(',')] if issues_match else [],
-                                "feedback": feedback_match.group(1) if feedback_match else "",
-                                "verdict": verdict_match.group(1) if verdict_match else "",
-                            }
+            # Strategy 4: regex field extraction (last resort)
+            if parsed is None:
+                pass_match = re.search(r'"pass"\s*:\s*(true|false)', raw, re.IGNORECASE)
+                if pass_match:
+                    issues_match = re.findall(r'"issues"\s*:\s*\[(.*?)\]', raw, re.DOTALL)
+                    feedback_match = re.search(r'"feedback"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+                    verdict_match = re.search(r'"verdict"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+                    parsed = {
+                        "pass": pass_match.group(1).lower() == "true",
+                        "issues": [s.strip().strip('"') for s in issues_match[0].split(',')] if issues_match else [],
+                        "feedback": feedback_match.group(1) if feedback_match else "",
+                        "verdict": verdict_match.group(1) if verdict_match else "",
+                    }
 
-                    if parsed is None:
-                        result["changes"].append(
-                            f'[deepseek-orch] JSON parse error (iter {iteration}): '
-                            f'raw[:200]={raw[:200]}')
-                        break
+            if parsed is None:
+                result["changes"].append(
+                    f'[glm] JSON parse error (iter {iteration}): '
+                    f'raw[:200]={raw[:200]}')
+                break
 
-                    if parsed.get("pass", False):
-                        verify_success = True
-                        verify_passed = True
-                        result["orchestrator_passed"] = True
-                        result["changes"].append(
-                            f"[deepseek-orch] Passed verification (iteration {iteration})")
-                        break  # Converged — exit loop
+            if parsed.get("pass", False):
+                verify_success = True
+                verify_passed = True
+                result["orchestrator_passed"] = True
+                result["changes"].append(
+                    f"[glm] Passed evaluation (iteration {iteration})")
+                break  # Converged — exit loop
 
-                    # Verification failed — extract feedback for refinement
-                    verify_success = True
-                    orchestrator_feedback = parsed.get("feedback", "")
-                    issues = parsed.get("issues", [])
-                    if issues:
-                        result["changes"].append(
-                            f"[deepseek-orch] Iteration {iteration}: "
-                            f"{' | '.join(issues[:3])}")
+            # Evaluation failed — extract feedback for refinement
+            verify_success = True
+            evaluator_feedback = parsed.get("feedback", "")
+            issues = parsed.get("issues", [])
+            if issues:
+                result["changes"].append(
+                    f"[glm] Iteration {iteration}: "
+                    f"{' | '.join(issues[:3])}")
 
-                    if iteration < max_iterations:
-                        # Loop back: Kimi refines with orchestrator-specific feedback
-                        refine_prompt = self._build_kimi_refine_prompt(
-                            kernel_source, result["ported_code"],
-                            orchestrator_feedback, patterns, iteration + 1
-                        )
-                        refine = self._call_model(
-                            "kimi27", refine_prompt,
-                            system_prompt=SYSTEM_PROMPTS.get("kimi27", "")
-                        )
-                        if refine.success:
-                            extracted = self._extract_code(refine.output)
-                            extracted = self._fix_ported_code(extracted)
-                            result["ported_code"] = extracted
-                            result["changes"].append(
-                                f"[kimi27] Refined with orchestrator feedback "
-                                f"(iteration {iteration} → {iteration + 1})")
-                        else:
-                            result["changes"].append(
-                                f"[kimi27] Refinement failed (iteration {iteration})")
-                            break
-                    # else: max iterations reached, accept current output
+            if iteration < max_iterations:
+                # Loop back: Kimi refines with GLM evaluator feedback
+                refine_prompt = self._build_kimi_refine_prompt(
+                    kernel_source, result["ported_code"],
+                    evaluator_feedback, patterns,
+                    deepseek_plan=deepseek_plan_output,
+                    iteration=iteration + 1,
+                )
+                refine = self._call_model(
+                    "kimi27", refine_prompt,
+                    system_prompt=SYSTEM_PROMPTS.get("kimi27", "")
+                )
+                if refine.success:
+                    extracted = self._extract_code(refine.output)
+                    extracted = self._fix_ported_code(extracted)
+                    result["ported_code"] = extracted
+                    result["changes"].append(
+                        f"[kimi27] Refined with evaluator feedback "
+                        f"(iteration {iteration} → {iteration + 1})")
+                else:
+                    result["changes"].append(
+                        f"[kimi27] Refinement failed (iteration {iteration})")
+                    break
+            # else: max iterations reached, accept current output
 
-        # Phase 3: Gemma 4 final verification (local AMD GPU via vLLM)
-        if result["ported_code"] and "gemma4" in models_needed:
-            # Try Gemma locally first, fallback to DeepSeek via Fireworks
-            verify_prompt = self._build_deepseek_verify_prompt(
+        # ── Phase 4: Gemma 4 final verification (local AMD GPU via vLLM) ──
+        if result["ported_code"]:
+            gemma_prompt = self._build_glm_evaluate_prompt(
                 result["ported_code"], patterns
             )
-            verify = self._call_model("gemma4", verify_prompt,
-                                      system_prompt=SYSTEM_PROMPTS.get("deepseek", ""))
+            verify = self._call_model("gemma4", gemma_prompt,
+                                      system_prompt=SYSTEM_PROMPTS.get("glm", ""))
             if verify.success:
                 verify_success = verify_success or True
                 result["model_used"] = "gemma4"
@@ -692,32 +728,8 @@ class ModelRouter:
                         result["changes"].append(
                             f"[gemma4] Issues found: {verify.output[:200]}")
             else:
-                # Fallback: DeepSeek via Fireworks
                 result["changes"].append(
-                    "[gemma4] Local AMD GPU unavailable -- falling back to DeepSeek")
-                result["model_used"] = "deepseek-fallback"
-                verify = self._call_model("deepseek", verify_prompt,
-                                          system_prompt=SYSTEM_PROMPTS.get("deepseek", ""))
-                if verify.success:
-                    verify_success = verify_success or True
-                    try:
-                        parsed = json.loads(verify.output)
-                        if parsed.get("pass", False):
-                            verify_passed = verify_passed or True
-                            result["changes"].append(
-                                "[deepseek] Verified -- no issues found")
-                        else:
-                            issues = parsed.get("issues", [])
-                            result["changes"].append(
-                                f"[deepseek] Issues found: {'; '.join(issues[:3])}")
-                    except (json.JSONDecodeError, TypeError):
-                        if "PASS" in verify.output.upper()[:10]:
-                            verify_passed = verify_passed or True
-                            result["changes"].append(
-                                "[deepseek] Verified -- no issues found")
-                        else:
-                            result["changes"].append(
-                                f"[deepseek] Issues found: {verify.output[:200]}")
+                    "[gemma4] Local AMD GPU unavailable")
 
         # Rubric-based scoring
         result["confidence"] = self._rubric_score_pipeline(
