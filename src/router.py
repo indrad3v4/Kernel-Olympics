@@ -11,6 +11,7 @@ TRIZ: Use risk classifier output as routing resource (no extra LLM call to decid
 """
 
 import json
+import re
 import os
 import socket
 import time
