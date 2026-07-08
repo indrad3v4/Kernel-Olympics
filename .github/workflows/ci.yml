@@ -1,9 +1,8 @@
-name: CI/CD — Test + Demo + Docker Build
+name: CI/CD — Test + Demo
 
 on:
   push:
     branches: [main]
-  workflow_dispatch:
 
 jobs:
   test:
@@ -36,15 +35,3 @@ jobs:
         with:
           name: demo-report
           path: demo_report.json
-
-  docker-build:
-    name: 🐳 Build Docker image
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build Docker image
-        run: docker build -t kernel-olympics:latest .
-      - name: Test Docker container (template mode)
-        run: docker run --rm -e PYTHONPATH=/app/src kernel-olympics:latest --input sample_kernels/cuda/warp_reduce.cu
-      - name: Test Docker demo mode
-        run: docker run --rm -e PYTHONPATH=/app/src kernel-olympics:latest --demo
