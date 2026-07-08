@@ -238,11 +238,42 @@ class KernelOlympics:
                 # Always save ported kernel to ported_kernels/
                 manual_dir = Path.cwd() / "ported_kernels"
                 manual_dir.mkdir(parents=True, exist_ok=True)
-                manual_path = manual_dir / f"{Path(cr['file']).stem}.hip.cpp"
+                manual_path = manual_dir / (Path(cr["file"]).stem + ".hip.cpp")
+                kernel_code = port_result.get("ported_code", source)
+                # Wrap in minimal harness so it's compilable standalone
+                harness = (
+                    "#include <iostream>\n"
+                    "#include <hip/hip_runtime.h>\n"
+                    "#include <cmath>\n"
+                    "#include <vector>\n\n"
+                    f"{kernel_code}\n\n"
+                    "int main() {\n"
+                    "    const int N = 256;\n"
+                    "    std::vector<float> input(N, 1.0f);\n"
+                    "    std::vector<float> output(N, 0.0f);\n"
+                    "    float *d_in, *d_out;\n"
+                    "    hipMalloc(&d_in, N * sizeof(float));\n"
+                    "    hipMalloc(&d_out, N * sizeof(float));\n"
+                    "    hipMemcpy(d_in, input.data(), N * sizeof(float), hipMemcpyHostToDevice);\n"
+                    "    warp_reduce_test<<<4, 64>>>(d_in, d_out, N);\n"
+                    "    hipDeviceSynchronize();\n"
+                    "    hipMemcpy(output.data(), d_out, 4 * sizeof(float), hipMemcpyDeviceToHost);\n"
+                    "    for (int i = 0; i < 4; i++) {\n"
+                    "        printf(\"Block %d sum: %.0f\\n\", i, output[i]);\n"
+                    "    }\n"
+                    "    bool pass = true;\n"
+                    "    for (int i = 0; i < 4; i++) {\n"
+                    "        if (fabs(output[i] - 64.0f) > 0.001f) pass = false;\n"
+                    "    }\n"
+                    "    printf(\"TEST: %s\\n\", pass ? \"PASSED ✅\" : \"FAILED ❌\");\n"
+                    "    hipFree(d_in); hipFree(d_out);\n"
+                    "    return pass ? 0 : 1;\n"
+                    "}\n"
+                )
                 try:
-                    manual_path.write_text(port_result.get("ported_code", source))
-                except Exception:
-                    pass
+                    manual_path.write_text(harness)
+                except Exception as e:
+                    print(f"  ⚠️ Failed to save: {e}")
 
                 if ver_result.get("passed"):
                     self.memory.store(
