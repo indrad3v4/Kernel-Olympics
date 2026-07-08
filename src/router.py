@@ -216,6 +216,11 @@ class ModelRouter:
         code = re.sub(r'#include\s*<cuda_runtime\.h>', '#include <hip/hip_runtime.h>', code)
         code = re.sub(r'#include\s*<cuda_runtime_api\.h>', '#include <hip/hip_runtime.h>', code)
         code = re.sub(r'#include\s*"cuda_runtime\.h"', '#include <hip/hip_runtime.h>', code)
+        # Remove NVIDIA helper headers — not available in ROCm
+        code = re.sub(r'#include\s*<helper_cuda\.h>\n?', '', code)
+        code = re.sub(r'#include\s*<helper_functions\.h>\n?', '', code)
+        code = re.sub(r'#include\s*"helper_cuda\.h"\n?', '', code)
+        code = re.sub(r'#include\s*"helper_functions\.h"\n?', '', code)
         # Remove device_launch_parameters.h — not needed in HIP
         code = re.sub(r'#include\s*<device_launch_parameters\.h>\n?', '', code)
         # Fix __shfl masks: 32-bit 0xffffffff → 64-bit for wavefront64
@@ -817,12 +822,16 @@ class ModelRouter:
                         return AgentResult(model_key, True, content, self._rubric_score_response(content),
                                            0, round((time.perf_counter()-t0)*1000, 1))
                 else:  # Fireworks
-                    data_bytes = json.dumps({
+                    payload = {
                         "model": model_id,
                         "messages": messages,
                         "max_tokens": 1024,
                         "temperature": 0.2,
-                    }).encode()
+                    }
+                    # Force JSON output for models that support it
+                    if model_key in ("deepseek", "glm", "kimi27"):
+                        payload["response_format"] = {"type": "json_object"}
+                    data_bytes = json.dumps(payload).encode()
                     req = urllib.request.Request(
                         f"{self.base_url}/chat/completions",
                         data=data_bytes,
@@ -855,7 +864,41 @@ class ModelRouter:
                                            tokens, round((time.perf_counter()-t0)*1000, 1))
             except Exception as e:
                 source = "local-vllm" if endpoint == "local" else "fireworks"
-                self.call_log.append({"model": model_key, "source": source, "error": str(e)[:80]})
+                err_msg = str(e)[:80]
+                self.call_log.append({"model": model_key, "source": source, "error": err_msg})
+                # If response_format caused a 400, retry without it
+                fw_payload = payload if endpoint == "fireworks" else {}
+                if endpoint == "fireworks" and "400" in err_msg and "response_format" in str(fw_payload):
+                    try:
+                        fallback_payload = dict(fw_payload)
+                        fallback_payload.pop("response_format", None)
+                        data_bytes = json.dumps(fallback_payload).encode()
+                        req = urllib.request.Request(
+                            f"{self.base_url}/chat/completions",
+                            data=data_bytes,
+                            headers={
+                                "Authorization": f"Bearer {self.api_key}",
+                                "Content-Type": "application/json"
+                            }
+                        )
+                        with urllib.request.urlopen(req, timeout=60) as resp:
+                            raw = resp.read()
+                            data = json.loads(raw)
+                            content = data["choices"][0]["message"]["content"]
+                            usage = data.get("usage", {})
+                            tokens = (
+                                usage.get("total_tokens", 0)
+                                or usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+                            )
+                            cost = tokens / 1000 * model_info["cost_per_1k"]
+                            self.total_cost += cost
+                            self.call_log.append({"model": model_key, "tokens": tokens, "cost": cost,
+                                                  "note": "response_format not supported, retried without"})
+                            return AgentResult(model_key, True, content, self._rubric_score_response(content),
+                                               tokens, round((time.perf_counter()-t0)*1000, 1))
+                    except Exception as e2:
+                        self.call_log.append({"model": model_key, "source": "fireworks",
+                                              "error": f"fallback also failed: {str(e2)[:60]}"})
                 continue  # Try next endpoint
 
         return AgentResult(model_key, False, "All endpoints failed", 0.0)
