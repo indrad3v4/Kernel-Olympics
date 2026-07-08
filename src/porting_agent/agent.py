@@ -230,6 +230,7 @@ Output format: JSON with:
         lines = source_code.split('\n')
         result_lines = []
         wavefront_header_added = False
+        has_added_wave64_shfl = False
 
         # Template transformations (only on non-comment lines)
         shared_32_re = re.compile(r'(__shared__[^;]*?\[\s*)32(\s*\])')
@@ -282,6 +283,18 @@ Output format: JSON with:
 
             # Fix 5: __shfl_down_sync — no safe automatic fix for offset semantics
             # (The actual fix depends on algorithm context; LLM handles this best)
+            # But we CAN prepend offset=32 for wavefront64 (6 steps → 64 elements)
+            
+            # Fix 5b: Insert 6th shuffle offset for wavefront64
+            if 'shfl_down' in stripped and 'val += __shfl' in line:
+                if not has_added_wave64_shfl:
+                    has_added_wave64_shfl = True
+                    indent = line[:len(line) - len(line.lstrip())]
+                    new_line = f"{indent}val += __shfl_down_sync(0xffffffffffffffffULL, val, 32);  // ADDED: wavefront64 offset\n{line}"
+                    result_lines[-1] = new_line
+                    if "wavefront64_offset32" not in str(changes):
+                        changes.append("wavefront64: added offset=32 shuffle step (6-step reduction for 64 lanes)")
+                    continue
 
             # Fix 6: 0x1f (warp mask 32) → 0x3f (wavefront mask 64)
             if '0x1f' in line and not stripped.startswith('//'):
