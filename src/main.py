@@ -207,15 +207,16 @@ class KernelOlympics:
                 else:
                     pipeline_state["llm_calls"] += 1
                     self.disp.llm_call()
-                    self.disp.file_done(Path(cr['file']).name, "3-model pipeline...", ok=False)
                     self.disp.status("Porting", f"Kimi(planner) → GLM(coder) → Gemma(verifier)")
                     t0 = time.perf_counter()
                     port_result = self.router.route(source, cr.get("findings", []))
                     llm_elapsed = time.perf_counter() - t0
                     if not port_result.get("ported_code"):
-                        # Router failed — fallback to porting agent
                         port_result = self.porting_agent.port_kernel(source)
                         llm_elapsed = time.perf_counter() - t0
+                    self.disp.file_done(Path(cr['file']).name, f"3-model pipeline ✅ ({port_result.get('confidence', 0)}%, {llm_elapsed:.0f}s)", ok=True)
+                    save_path = Path.cwd() / "ported_kernels" / (Path(cr["file"]).stem + ".hip.cpp")
+                    print(f"║  📁 Ported kernel → {bold(str(save_path)):<47}║")
                     self.memory.record_llm_time(llm_elapsed)
                     total_llm_time += llm_elapsed
                     port_result["from_cache"] = False
