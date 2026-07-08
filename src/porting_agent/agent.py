@@ -64,8 +64,11 @@ Output format: JSON with:
                     cached_pattern: Optional[Dict] = None) -> Dict:
         """Port a CUDA kernel to ROCm/HIP using LLM."""
         
+        # TRIZ: Fix source code BEFORE any LLM/template processing
+        fixed_source = self._fix_ported_code(source_code)
+        
         # Build prompt with context
-        user_prompt = f"Port this CUDA kernel to AMD ROCm/HIP:\n\n```cuda\n{source_code}\n```\n"
+        user_prompt = f"Port this CUDA kernel to AMD ROCm/HIP:\n\n```cuda\n{fixed_source}\n```\n"
         
         if context:
             user_prompt += f"\nAdditional context:\n{context}\n"
@@ -77,12 +80,12 @@ Output format: JSON with:
                 f"Verified fix: {cached_pattern.get('verified_fix', '')}\n"
                 f"Apply similar approach if applicable.\n"
             )
-
+        
         user_prompt += "\nRespond ONLY with valid JSON matching the expected format."
-
+        
         # For hackathon: if no API key, use template-based porting
         if not self.api_key or self.api_key == "test":
-            return self._template_port(source_code, cached_pattern)
+            return self._template_port(fixed_source, cached_pattern)
 
         models_to_try = [self.model] + [m for m in self.FALLBACK_MODELS if m != self.model]
 
