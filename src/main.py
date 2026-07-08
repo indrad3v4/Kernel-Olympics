@@ -587,8 +587,16 @@ def main():
             print(cyan(f"  ↓ Downloaded: {filename} ({lines} lines)\n"))
             args.input = [str(local_path)]
         except Exception as e:
-            print(red(f"  ✗ Failed to download sample: {e}"))
-            return 1
+            print(yellow(f"  ⚠️ Download failed ({e}) — trying local copy..."))
+            # Fallback: use local copy from repo
+            local_repo_path = Path(f"sample_kernels/cuda/nvidia_{filename}")
+            if local_repo_path.exists():
+                lines = len(local_repo_path.read_text(encoding="utf-8").splitlines())
+                print(cyan(f"  ✓ Using local copy: {local_repo_path} ({lines} lines)\n"))
+                args.input = [str(local_repo_path)]
+            else:
+                print(red(f"  ✗ No local copy either. Download manually and save to sample_kernels/cuda/"))
+                return 1
 
     ko = KernelOlympics(fresh=args.fresh)
     report = ko.run(args.input, args.reference)
