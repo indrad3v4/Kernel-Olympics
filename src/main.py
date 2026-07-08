@@ -211,7 +211,7 @@ class KernelOlympics:
                 else:
                     pipeline_state["llm_calls"] += 1
                     self.disp.llm_call()
-                    self.disp.status("Porting", f"GLM(planner) → Kimi K2.7(coder) → DeepSeek(verifier)")
+                    self.disp.status("Porting", f"GLM(planner) → Kimi K2.7(coder) → Gemma 4/DeepSeek(verifier)")
                     t0 = time.perf_counter()
                     port_result = self.router.route(source, cr.get("findings", []))
                     llm_elapsed = time.perf_counter() - t0

@@ -36,18 +36,27 @@ MODEL_CATALOG = {
         "role": "planner",
         "strength": "kernel analysis, pattern detection, warp/wavefront reasoning",
         "cost_per_1k": 0.0014,
+        "local_first": False,
     },
     "kimi27": {
         "id": "accounts/fireworks/models/kimi-k2p7-code",  # ✅ VERIFIED WORKING
         "role": "coder",
         "strength": "code generation, struct-aware HIP porting",
         "cost_per_1k": 0.00095,
+        "local_first": False,
     },
     "deepseek": {
         "id": "accounts/fireworks/models/deepseek-v4-pro",  # ✅ VERIFIED WORKING
-        "role": "verifier",
-        "strength": "correctness checking, fallback when primary models fail",
+        "role": "verifier_fallback",
+        "strength": "correctness checking, fallback when local Gemma unavailable",
         "cost_per_1k": 0.0012,
+        "local_first": False,
+    },
+    "gemma4": {
+        "id": "accounts/fireworks/models/gemma-4-31b-it",  # Real Gemma on AMD GPU via vLLM
+        "role": "verifier",
+        "strength": "AMD-native verification via local vLLM on MI300X",
+        "local_first": True,  # Try localhost:8000 first, then Fireworks
     },
 }
 
@@ -62,9 +71,8 @@ ROUTING_TABLE = {
     "shared_mem_warp_count": "kimi27",
     "lane_id_mask": "kimi27",
     "tile_size_warp": "kimi27",
-    # Simple patterns → DeepSeek (verifier/catch-all)
-    "__syncthreads": "deepseek",
-    "default": "deepseek",
+    # Verification → Gemma 4 locally, fallback DeepSeek
+    "default": "gemma4",
 }
 
 
@@ -237,9 +245,10 @@ class ModelRouter:
                 result["ported_code"] = extracted
                 result["changes"].append(f"[glm] Generated ported kernel")
 
-        # Phase 3: DeepSeek verifies the output
-        if result["ported_code"] and "deepseek" in models_needed:
-            verify = self._call_model("deepseek",
+        # Phase 3: Gemma 4 verifies the output (local AMD GPU via vLLM)
+        if result["ported_code"] and "gemma4" in models_needed:
+            # Try Gemma locally first, fallback to DeepSeek via Fireworks
+            verify = self._call_model("gemma4",
                 f"Review this HIP kernel for correctness. "
                 f"Check: wavefront64 compatibility, correct __shfl usage, "
                 f"shared memory sizing, and sync semantics.\n\n"
@@ -247,11 +256,30 @@ class ModelRouter:
                 f"Output: 'PASS' or 'ISSUES: ...'")
             if verify.success:
                 verify_success = True
+                verify_source = "local-gemma4"
+                result["model_used"] = "gemma4"
                 if "PASS" in verify.output.upper()[:10]:
                     verify_passed = True
-                    result["changes"].append(f"[deepseek] Verified — no issues found")
+                    result["changes"].append(f"[gemma4] Verified — no issues found (local AMD GPU)")
                 else:
-                    result["changes"].append(f"[deepseek] Issues found: {verify.output[:200]}")
+                    result["changes"].append(f"[gemma4] Issues found: {verify.output[:200]}")
+            else:
+                # Fallback: DeepSeek via Fireworks
+                result["changes"].append(f"[gemma4] Local AMD GPU unavailable — falling back to DeepSeek")
+                result["model_used"] = "deepseek-fallback"
+                verify = self._call_model("deepseek",
+                    f"Review this HIP kernel for correctness. "
+                    f"Check: wavefront64 compatibility, correct __shfl usage, "
+                    f"shared memory sizing, and sync semantics.\n\n"
+                    f"```hip\n{result['ported_code'][:2000]}\n```\n\n"
+                    f"Output: 'PASS' or 'ISSUES: ...'")
+                if verify.success:
+                    verify_success = True
+                    if "PASS" in verify.output.upper()[:10]:
+                        verify_passed = True
+                        result["changes"].append(f"[deepseek] Verified — no issues found")
+                    else:
+                        result["changes"].append(f"[deepseek] Issues found: {verify.output[:200]}")
 
         # Rubric-based scoring replaces the old additive confidence model
         result["confidence"] = self._rubric_score_pipeline(
@@ -267,58 +295,67 @@ class ModelRouter:
         return result
 
     def _call_model(self, model_key: str, prompt: str) -> AgentResult:
-        model_id = MODEL_CATALOG[model_key]["id"]
+        model_info = MODEL_CATALOG[model_key]
+        model_id = model_info["id"]
+        local_first = model_info.get("local_first", False)
         t0 = time.perf_counter()
 
-        # Try Fireworks API first
-        try:
-            data_bytes = json.dumps({
-                "model": model_id,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 1024,
-                "temperature": 0.2,
-            }).encode()
-            req = urllib.request.Request(
-                f"{self.base_url}/chat/completions",
-                data=data_bytes,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json"
-                }
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read())
-                content = data["choices"][0]["message"]["content"]
-                tokens = data.get("usage", {}).get("total_tokens", 0)
-                cost = tokens / 1000 * MODEL_CATALOG[model_key]["cost_per_1k"]
-                self.total_cost += cost
-                self.call_log.append({"model": model_key, "tokens": tokens, "cost": cost})
-                return AgentResult(model_key, True, content, self._rubric_score_response(content), tokens, round((time.perf_counter()-t0)*1000, 1))
-        except Exception:
-            pass
+        # Try in order: local-first for Gemma, Fireworks-first for others
+        endpoints = []
+        if local_first:
+            endpoints = ["local", "fireworks"]
+        else:
+            endpoints = ["fireworks", "local"]
 
-        # Fallback: try local vLLM endpoint (for Gemma on AMD GPU)
-        try:
-            data_bytes = json.dumps({
-                "model": model_id,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 512,
-            }).encode()
-            local_req = urllib.request.Request(
-                "http://localhost:8000/v1/chat/completions",
-                data=data_bytes,
-                headers={"Content-Type": "application/json"}
-            )
-            with urllib.request.urlopen(local_req, timeout=30) as resp:
-                data = json.loads(resp.read())
-                content = data["choices"][0]["message"]["content"]
-                cost = 0  # local = free
-                self.call_log.append({"model": model_key, "source": "local-vllm", "cost": cost})
-                return AgentResult(model_key, True, content, self._rubric_score_response(content), 0, round((time.perf_counter()-t0)*1000, 1))
-        except Exception:
-            pass
+        for endpoint in endpoints:
+            try:
+                if endpoint == "local":
+                    data_bytes = json.dumps({
+                        "model": model_id,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 512,
+                    }).encode()
+                    req = urllib.request.Request(
+                        "http://localhost:8000/v1/chat/completions",
+                        data=data_bytes,
+                        headers={"Content-Type": "application/json"}
+                    )
+                    with urllib.request.urlopen(req, timeout=30) as resp:
+                        data = json.loads(resp.read())
+                        content = data["choices"][0]["message"]["content"]
+                        self.call_log.append({"model": model_key, "source": "local-vllm", "cost": 0})
+                        return AgentResult(model_key, True, content, self._rubric_score_response(content),
+                                           0, round((time.perf_counter()-t0)*1000, 1))
+                else:  # Fireworks
+                    data_bytes = json.dumps({
+                        "model": model_id,
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": 1024,
+                        "temperature": 0.2,
+                    }).encode()
+                    req = urllib.request.Request(
+                        f"{self.base_url}/chat/completions",
+                        data=data_bytes,
+                        headers={
+                            "Authorization": f"Bearer {self.api_key}",
+                            "Content-Type": "application/json"
+                        }
+                    )
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        data = json.loads(resp.read())
+                        content = data["choices"][0]["message"]["content"]
+                        tokens = data.get("usage", {}).get("total_tokens", 0)
+                        cost = tokens / 1000 * model_info["cost_per_1k"]
+                        self.total_cost += cost
+                        self.call_log.append({"model": model_key, "tokens": tokens, "cost": cost})
+                        return AgentResult(model_key, True, content, self._rubric_score_response(content),
+                                           tokens, round((time.perf_counter()-t0)*1000, 1))
+            except Exception as e:
+                source = "local-vllm" if endpoint == "local" else "fireworks"
+                self.call_log.append({"model": model_key, "source": source, "error": str(e)[:80]})
+                continue  # Try next endpoint
 
-        return AgentResult(model_key, False, f"Model {model_id} unavailable", 0)
+        return AgentResult(model_key, False, "All endpoints failed", 0.0)
 
     def get_stats(self) -> Dict:
         calls = len(self.call_log)
