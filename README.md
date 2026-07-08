@@ -2,12 +2,13 @@
 
 **CUDA→ROCm Migration Copilot** — Ship AMD-ready code in minutes, not months.
 
----
+<div align="center">
 
+[![AMD Compatible](docs/amd-compatible.svg)](https://github.com/indrad3v4/Kernel-Olympics)
 [![CI](https://github.com/indrad3v4/Kernel-Olympics/actions/workflows/ci.yml/badge.svg)](https://github.com/indrad3v4/Kernel-Olympics/actions)
 [![License: MIT](https://img.shields.io/badge/License-MIT-purple.svg)](LICENSE)
 
----
+</div>
 
 ## The $10B Problem
 
