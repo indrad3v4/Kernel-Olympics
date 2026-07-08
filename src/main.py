@@ -169,6 +169,12 @@ class KernelOlympics:
                 file_sources[fp] = Path(fp).read_text(encoding="utf-8")
             except:
                 pass
+
+        if not file_sources:
+            print("\033[91m✖ ERROR: no readable input files found — nothing scanned.\033[0m")
+            print("\033[91m  Check the path(s) passed to --input.\033[0m")
+            return {"error": "no_input", "files_scanned": 0}
+
         classifier_results = self.classifier.classify_batch(file_sources)
         red = [r for r in classifier_results if r.get("risk_level") == "red"]
         ylw = [r for r in classifier_results if r.get("risk_level") == "yellow"]
@@ -577,6 +583,10 @@ def main():
 
     ko = KernelOlympics(fresh=args.fresh)
     report = ko.run(args.input, args.reference)
+
+    if report.get("error") == "no_input":
+        print(red("✖ Pipeline failed — no input files."))
+        return 1
 
     output_path = Path(args.output)
     with open(output_path, 'w', encoding="utf-8") as f:
