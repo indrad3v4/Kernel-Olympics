@@ -240,36 +240,43 @@ class KernelOlympics:
                 manual_dir.mkdir(parents=True, exist_ok=True)
                 manual_path = manual_dir / (Path(cr["file"]).stem + ".hip.cpp")
                 kernel_code = port_result.get("ported_code", source)
+                # Auto-detect kernel function name from ported code
+                import re as _re
+                _km = _re.search(r'__global__\s+void\s+(\w+)\s*\(', kernel_code)
+                _kname = _km.group(1) if _km else "warp_reduce_kernel"
                 # Wrap in minimal harness so it's compilable standalone
-                harness = (
-                    "#include <iostream>\n"
-                    "#include <hip/hip_runtime.h>\n"
-                    "#include <cmath>\n"
-                    "#include <vector>\n\n"
-                    f"{kernel_code}\n\n"
-                    "int main() {\n"
-                    "    const int N = 256;\n"
-                    "    std::vector<float> input(N, 1.0f);\n"
-                    "    std::vector<float> output(N, 0.0f);\n"
-                    "    float *d_in, *d_out;\n"
-                    "    hipMalloc(&d_in, N * sizeof(float));\n"
-                    "    hipMalloc(&d_out, N * sizeof(float));\n"
-                    "    hipMemcpy(d_in, input.data(), N * sizeof(float), hipMemcpyHostToDevice);\n"
-                    "    warp_reduce_test<<<4, 64>>>(d_in, d_out, N);\n"
-                    "    hipDeviceSynchronize();\n"
-                    "    hipMemcpy(output.data(), d_out, 4 * sizeof(float), hipMemcpyDeviceToHost);\n"
-                    "    for (int i = 0; i < 4; i++) {\n"
-                    "        printf(\"Block %d sum: %.0f\\n\", i, output[i]);\n"
-                    "    }\n"
-                    "    bool pass = true;\n"
-                    "    for (int i = 0; i < 4; i++) {\n"
-                    "        if (fabs(output[i] - 64.0f) > 0.001f) pass = false;\n"
-                    "    }\n"
-                    "    printf(\"TEST: %s\\n\", pass ? \"PASSED ✅\" : \"FAILED ❌\");\n"
-                    "    hipFree(d_in); hipFree(d_out);\n"
-                    "    return pass ? 0 : 1;\n"
-                    "}\n"
-                )
+                lines = [
+                    "#include <iostream>",
+                    "#include <hip/hip_runtime.h>",
+                    "#include <cmath>",
+                    "#include <vector>",
+                    "",
+                    kernel_code,
+                    "",
+                    "int main() {",
+                    "    const int N = 256;",
+                    "    std::vector<float> input(N, 1.0f);",
+                    "    std::vector<float> output(N, 0.0f);",
+                    "    float *d_in, *d_out;",
+                    "    hipMalloc(&d_in, N * sizeof(float));",
+                    "    hipMalloc(&d_out, N * sizeof(float));",
+                    "    hipMemcpy(d_in, input.data(), N * sizeof(float), hipMemcpyHostToDevice);",
+                    f"    {_kname}<<<4, 64>>>(d_in, d_out, N);",
+                    "    hipDeviceSynchronize();",
+                    "    hipMemcpy(output.data(), d_out, 4 * sizeof(float), hipMemcpyDeviceToHost);",
+                    "    for (int i = 0; i < 4; i++) {",
+                    '        printf("Block %d sum: %.0f\\n", i, output[i]);',
+                    "    }",
+                    "    bool pass = true;",
+                    "    for (int i = 0; i < 4; i++) {",
+                    "        if (fabs(output[i] - 64.0f) > 0.001f) pass = false;",
+                    "    }",
+                    '    printf("TEST: %s\\n", pass ? "PASSED ✅" : "FAILED ❌");',
+                    "    hipFree(d_in); hipFree(d_out);",
+                    "    return pass ? 0 : 1;",
+                    "}",
+                ]
+                harness = "\n".join(lines)
                 try:
                     manual_path.write_text(harness)
                 except Exception as e:
