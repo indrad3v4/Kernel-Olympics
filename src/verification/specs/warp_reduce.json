@@ -1,0 +1,15 @@
+{
+  "kernel_function": "warp_reduce_kernel",
+  "launch": {
+    "grid": {"x": 4, "y": 1, "z": 1},
+    "block": {"x": 64, "y": 1, "z": 1}
+  },
+  "params": [
+    {"name": "input", "type": "float*", "direction": "in", "size_expr": "256"},
+    {"name": "output", "type": "float*", "direction": "out", "size_expr": "256"},
+    {"name": "n", "type": "int", "direction": "scalar", "value": 256}
+  ],
+  "input_setup": {"count": 256, "linear_ramp": true},
+  "output_readback": {"count": 256, "element_type": "float", "format": "float_per_line"},
+  "reference_output": "sample_kernels/reference/warp_reduce_output.txt"
+}

@@ -1,0 +1,17 @@
+{
+  "kernel_function": "conv2d_kernel",
+  "launch": {
+    "grid": {"x": 8, "y": 8, "z": 1},
+    "block": {"x": 16, "y": 16, "z": 1}
+  },
+  "params": [
+    {"name": "input", "type": "float*", "direction": "in", "size_expr": "16384"},
+    {"name": "output", "type": "float*", "direction": "out", "size_expr": "16384"},
+    {"name": "width", "type": "int", "direction": "scalar", "value": 128},
+    {"name": "height", "type": "int", "direction": "scalar", "value": 128},
+    {"name": "channels", "type": "int", "direction": "scalar", "value": 1}
+  ],
+  "input_setup": {"count": 16384, "linear_ramp": true},
+  "output_readback": {"count": 256, "element_type": "float", "format": "float_per_line"},
+  "reference_output": "sample_kernels/reference/conv2d_output.txt"
+}

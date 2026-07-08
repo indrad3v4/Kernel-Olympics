@@ -1,0 +1,17 @@
+{
+  "kernel_function": "histogram_kernel",
+  "launch": {
+    "grid": {"x": 1, "y": 1, "z": 1},
+    "block": {"x": 256, "y": 1, "z": 1}
+  },
+  "dynamic_shared_mem": 1024,
+  "params": [
+    {"name": "input", "type": "int*", "direction": "in", "size_expr": "256"},
+    {"name": "histogram", "type": "int*", "direction": "out", "size_expr": "8"},
+    {"name": "n", "type": "int", "direction": "scalar", "value": 256},
+    {"name": "num_bins", "type": "int", "direction": "scalar", "value": 8}
+  ],
+  "input_setup": {"count": 256, "linear_ramp": true},
+  "output_readback": {"count": 8, "element_type": "int", "format": "int_per_line"},
+  "reference_output": "sample_kernels/reference/histogram_output.txt"
+}

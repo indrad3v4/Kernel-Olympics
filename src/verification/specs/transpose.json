@@ -1,0 +1,16 @@
+{
+  "kernel_function": "transpose_kernel",
+  "launch": {
+    "grid": {"x": 3, "y": 3, "z": 1},
+    "block": {"x": 32, "y": 32, "z": 1}
+  },
+  "params": [
+    {"name": "input", "type": "float*", "direction": "in", "size_expr": "9216"},
+    {"name": "output", "type": "float*", "direction": "out", "size_expr": "9216"},
+    {"name": "width", "type": "int", "direction": "scalar", "value": 96},
+    {"name": "height", "type": "int", "direction": "scalar", "value": 96}
+  ],
+  "input_setup": {"count": 9216, "linear_ramp": true},
+  "output_readback": {"count": 96, "element_type": "float", "format": "float_per_line"},
+  "reference_output": "sample_kernels/reference/transpose_output.txt"
+}

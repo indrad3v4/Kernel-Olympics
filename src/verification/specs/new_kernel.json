@@ -1,0 +1,15 @@
+{
+  "kernel_function": "warp_scan_kernel",
+  "launch": {
+    "grid": {"x": 1, "y": 1, "z": 1},
+    "block": {"x": 64, "y": 1, "z": 1}
+  },
+  "params": [
+    {"name": "input", "type": "float*", "direction": "in", "size_expr": "64"},
+    {"name": "output", "type": "float*", "direction": "out", "size_expr": "64"},
+    {"name": "n", "type": "int", "direction": "scalar", "value": 64}
+  ],
+  "input_setup": {"count": 64, "linear_ramp": true},
+  "output_readback": {"count": 4, "element_type": "float", "format": "float_per_line"},
+  "reference_output": "sample_kernels/reference/new_kernel_output.txt"
+}
