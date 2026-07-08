@@ -24,7 +24,7 @@ from pathlib import Path
 # Auto-load .env file if present
 _env_path = Path(__file__).parent.parent / ".env"
 if _env_path.exists():
-    with open(_env_path) as _f:
+    with open(_env_path, encoding="utf-8") as _f:
         for _line in _f:
             _line = _line.strip()
             if _line and not _line.startswith("#") and "=" in _line:
@@ -33,6 +33,10 @@ if _env_path.exists():
                 os.environ.setdefault(_k.strip(), _v)
 
 sys.path.insert(0, str(Path(__file__).parent))
+
+# Force UTF-8 stdout/stderr (with ASCII fallback) before any glyphs print.
+from utf8_console import enable_utf8_console
+enable_utf8_console()
 
 from scanner.scanner import Scanner
 from risk_classifier.classifier import RiskClassifier
@@ -128,10 +132,13 @@ class Display:
 class KernelOlympics:
     """Orchestrates the full CUDA→ROCm migration pipeline."""
 
-    def __init__(self):
+    def __init__(self, fresh: bool = False):
         self.scanner = Scanner()
         self.classifier = RiskClassifier()
         self.memory = PatternMemory()
+        if fresh:
+            # Start with an empty pattern cache (T3.2: --fresh)
+            self.memory.clear()
         self.porting_agent = PortingAgent(
             deepseek_key=os.getenv("DEEPSEEK_API_KEY", ""),
             deepseek_model=os.getenv("DEEPSEEK_MODEL", "deepseek-reasoner")
@@ -159,7 +166,7 @@ class KernelOlympics:
         file_sources = {}
         for fp in input_paths:
             try:
-                file_sources[fp] = Path(fp).read_text()
+                file_sources[fp] = Path(fp).read_text(encoding="utf-8")
             except:
                 pass
         classifier_results = self.classifier.classify_batch(file_sources)
@@ -232,7 +239,7 @@ class KernelOlympics:
                 # Phase 5: Verification
                 self.disp.phase("Verifying", "✅")
                 ref_path = Path(reference_dir) / f"{Path(cr['file']).stem}_output.txt"
-                reference_output = ref_path.read_text() if ref_path.exists() else ""
+                reference_output = ref_path.read_text(encoding="utf-8") if ref_path.exists() else ""
 
                 ver_result = self.verifier.verify(
                     hip_source=port_result.get("ported_code", source),
@@ -285,7 +292,7 @@ class KernelOlympics:
                 ]
                 harness = "\n".join(lines)
                 try:
-                    manual_path.write_text(harness)
+                    manual_path.write_text(harness, encoding="utf-8")
                 except Exception as e:
                     print(f"  ⚠️ Failed to save: {e}")
 
@@ -347,11 +354,19 @@ def doctor():
     checks = []
     all_ok = True
 
-    def _check(name, ok, detail=""):
+    def _check(name, ok, detail="", warn=False):
+        """Record a check. warn=True marks an optional check: it shows a
+        yellow '!' when absent but does NOT fail the preflight, so the
+        doctor stays green on a machine without a GPU or API keys."""
         nonlocal all_ok
-        all_ok = all_ok and ok
-        mark = green("✓") if ok else red("✗")
-        checks.append((name, ok, detail))
+        if ok:
+            mark = green("✓")
+        elif warn:
+            mark = yellow("!")
+        else:
+            all_ok = False
+            mark = red("✗")
+        checks.append((name, ok, detail, warn))
         print(f"  {mark} {bold(name):<30} {dim(detail)}")
 
     print()
@@ -381,11 +396,8 @@ def doctor():
             _check(f"stdlib: {mod_name}", not required, "MISSING — may affect runtime")
 
     # 3. Optional pip package check
+    # Core pipeline is pure-stdlib; pytest is the only (dev/CI) pip dep.
     pip_packages = [
-        "flask",
-        "numpy",
-        "requests",
-        "chromadb",
         "pytest",
     ]
     for pkg in pip_packages:
@@ -393,7 +405,7 @@ def doctor():
             __import__(pkg.replace("-", "_"))
             _check(f"pip: {pkg}", True, "installed")
         except ImportError:
-            _check(f"pip: {pkg}", False, "not installed — 'pip install -r requirements.txt'")
+            _check(f"pip: {pkg}", False, "not installed — 'pip install -r requirements.txt'", warn=True)
 
     # 4. Project module imports (from src/)
     project_modules = [
@@ -430,7 +442,8 @@ def doctor():
         elif optional:
             _check(f"env: {var_name}", True, f"not set (optional — using default)")
         else:
-            _check(f"env: {var_name}", False, "NOT SET — required for LLM calls")
+            _check(f"env: {var_name}", False,
+                   "not set — LLM porting disabled, template fallback used", warn=True)
 
     # 6. Directory structure
     required_dirs = [
@@ -447,28 +460,32 @@ def doctor():
         _check(f"dir: {dir_name}", exists or not required,
                "found" if exists else ("MISSING" if required else "not found (created on demand)"))
 
-    # 7. GPU / hipify-clang
+    # 7. GPU tooling (optional — the tool runs without a GPU via template
+    #    porting + unverified storage, so absence is a warning, not a failure)
     hipify_path = shutil.which("hipify-clang")
     _check("hipify-clang", bool(hipify_path),
-           f"at {hipify_path}" if hipify_path else "NOT FOUND — scanner will fall back")
+           f"at {hipify_path}" if hipify_path else "not found — scanner falls back", warn=True)
 
     hipcc_path = shutil.which("hipcc")
     _check("hipcc (ROCm)", bool(hipcc_path),
-           f"at {hipcc_path}" if hipcc_path else "NOT FOUND — verification requires ROCm")
+           f"at {hipcc_path}" if hipcc_path else "not found — GPU verification unavailable", warn=True)
 
-    # 8. Network connectivity (to Fireworks API)
-    try:
-        import urllib.request
-        req = urllib.request.Request(
-            "https://api.fireworks.ai/v1/models",
-            method="HEAD",
-            headers={"Authorization": f"Bearer {os.getenv('FIREWORKS_API_KEY', '')}"}
-        )
-        urllib.request.urlopen(req, timeout=5)
-        _check("network: Fireworks API", True, "reachable")
-    except Exception as e:
-        _check("network: Fireworks API", bool(os.getenv("FIREWORKS_API_KEY")),
-               f"unreachable ({type(e).__name__})" if os.getenv("FIREWORKS_API_KEY") else "no API key — skip")
+    # 8. Network connectivity (to Fireworks API) — skipped cleanly without a key
+    if not os.getenv("FIREWORKS_API_KEY"):
+        _check("network: Fireworks API", True, "skipped — no API key")
+    else:
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                "https://api.fireworks.ai/v1/models",
+                method="HEAD",
+                headers={"Authorization": f"Bearer {os.getenv('FIREWORKS_API_KEY', '')}"}
+            )
+            urllib.request.urlopen(req, timeout=5)
+            _check("network: Fireworks API", True, "reachable")
+        except Exception as e:
+            _check("network: Fireworks API", False,
+                   f"unreachable ({type(e).__name__})", warn=True)
 
     # 9. SQLite write test (pattern memory)
     try:
@@ -492,14 +509,19 @@ def doctor():
         _check("disk: free space", True, "unable to check")
 
     # ── Summary ──────────────────────────────────────────────────
+    failed = [n for n, ok, _, warn in checks if not ok and not warn]
+    warnings = [(n, d) for n, ok, d, warn in checks if not ok and warn]
     print()
     if all_ok:
-        print(f"  {bold(green('RESULT: ALL CHECKS PASSED'))}")
+        print(f"  {bold(green('RESULT: ALL REQUIRED CHECKS PASSED'))}")
     else:
-        failed = [n for n, ok, _ in checks if not ok]
-        print(f"  {bold(red(f'RESULT: {len(failed)} check(s) FAILED'))}")
+        print(f"  {bold(red(f'RESULT: {len(failed)} required check(s) FAILED'))}")
         for n in failed:
             print(f"         {red('✗')} {n}")
+    if warnings:
+        print(f"  {yellow(f'{len(warnings)} optional check(s) not available (safe to proceed):')}")
+        for n, d in warnings:
+            print(f"         {yellow('!')} {n} {dim('— ' + d) if d else ''}")
     print()
     print(bold("╚════════════════════════════════════════════════════════╝"))
     return 0 if all_ok else 1
@@ -512,6 +534,7 @@ def main():
     parser.add_argument("--output", default="portability_report.json", help="Output path for JSON report")
     parser.add_argument("--demo", action="store_true", help="Run 'second kernel is faster' speedup demo")
     parser.add_argument("--reset", action="store_true", help="With --demo, clear pattern memory before running")
+    parser.add_argument("--fresh", action="store_true", help="Start with an empty pattern memory (clears the cache DB before running)")
     parser.add_argument("--doctor", action="store_true", help="Run pre-flight environment check and exit")
     args = parser.parse_args()
 
@@ -525,11 +548,11 @@ def main():
         parser.error("--input is required unless --demo or --doctor is used")
         return 1
 
-    ko = KernelOlympics()
+    ko = KernelOlympics(fresh=args.fresh)
     report = ko.run(args.input, args.reference)
 
     output_path = Path(args.output)
-    with open(output_path, 'w') as f:
+    with open(output_path, 'w', encoding="utf-8") as f:
         json.dump(report, f, indent=2, default=str)
     print(f"Report saved to: {output_path}")
 
@@ -572,7 +595,7 @@ def run_demo(reset: bool = False):
 
     # First kernel: warp_reduce.cu
     print(bold("╠════════════════════════════════════════════════════════╣"))
-    warp_source = Path("sample_kernels/cuda/warp_reduce.cu").read_text()
+    warp_source = Path("sample_kernels/cuda/warp_reduce.cu").read_text(encoding="utf-8")
 
     # Check if warp_reduce is already cached
     warp_cached = demo_memory.retrieve(warp_source)
@@ -620,7 +643,7 @@ def run_demo(reset: bool = False):
 
     # Second kernel: histogram.cu (similar patterns)
     print(bold("╠════════════════════════════════════════════════════════╣"))
-    hist_source = Path("sample_kernels/cuda/histogram.cu").read_text()
+    hist_source = Path("sample_kernels/cuda/histogram.cu").read_text(encoding="utf-8")
     print(f"║ {bold('Kernel 2:')} histogram.cu — {green('cache lookup...')}        ")
     cached = demo_memory.retrieve(hist_source)
 
@@ -692,7 +715,7 @@ def run_demo(reset: bool = False):
         "patterns_in_cache": existing_count,
         "warp_first_time": not bool(warp_cached and not reset)
     }
-    Path("demo_report.json").write_text(json.dumps(report, indent=2))
+    Path("demo_report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     print(f"├{'─'*66}┤")
     print(f"║ {dim('Demo report saved to: demo_report.json')}")
     print(bold("╚════════════════════════════════════════════════════════╝"))
@@ -700,4 +723,4 @@ def run_demo(reset: bool = False):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

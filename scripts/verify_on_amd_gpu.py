@@ -21,6 +21,10 @@ import os
 import json
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from utf8_console import enable_utf8_console
+enable_utf8_console()
+
 REPO_URL = "https://github.com/indrad3v4/Kernel-Olympics.git"
 WORK_DIR = Path("/workspace/kernel-olympics")
 FIREWORKS_KEY = os.environ.get("FIREWORKS_API_KEY", "")  # Set via environment variable!
@@ -111,7 +115,7 @@ int main() {
 }
 """
     src_file = WORK_DIR / "/tmp/test_kernel.hip.cpp"
-    src_file.write_text(SRC)
+    src_file.write_text(SRC, encoding="utf-8")
     
     print("\n  Compiling with hipcc...")
     rc, out, err = run("hipcc -o /tmp/test_kernel /tmp/test_kernel.hip.cpp -std=c++17 -O2 --offload-arch=gfx942")
@@ -138,7 +142,7 @@ int main() {
         "pipeline_report": "/tmp/ko_report.json"
     }
     proof_path = WORK_DIR / "AMD_GPU_PROOF.json"
-    proof_path.write_text(json.dumps(proof, indent=2))
+    proof_path.write_text(json.dumps(proof, indent=2), encoding="utf-8")
     print(f"\n  Proof saved to: {proof_path}")
 
     # Git config + commit

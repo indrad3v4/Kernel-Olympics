@@ -10,6 +10,7 @@ __pycache__/
 *.json
 !sample_kernels/reference/*.json
 !sample_kernels/reference/*_output.txt
+!src/verification/specs/*.json
 
 # Environment
 .env

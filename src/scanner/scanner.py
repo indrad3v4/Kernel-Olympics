@@ -32,12 +32,12 @@ class Scanner:
             )
             output = result.stdout + result.stderr
         except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-            total_lines = len(path.read_text().splitlines())
+            total_lines = len(path.read_text(encoding="utf-8").splitlines())
             return {"file": filepath, "error": str(e), "hipify_coverage_pct": 0,
                     "total_lines": total_lines, "flagged_lines": []}
 
         # Parse hipify output for coverage info
-        total_lines = len(path.read_text().splitlines())
+        total_lines = len(path.read_text(encoding="utf-8").splitlines())
         unconverted = self._count_unconverted(output)
         coverage = max(0, ((total_lines - unconverted) / total_lines) * 100) if total_lines > 0 else 0
 
