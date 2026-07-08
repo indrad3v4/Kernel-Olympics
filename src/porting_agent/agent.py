@@ -16,14 +16,19 @@ from pathlib import Path
 
 
 def _force_ipv4():
-    """Monkey-patch socket to prefer IPv4 for Fireworks connections.
+    """Monkey-patch socket to prefer IPv4 for HTTP connections.
     
-    Python's urllib tries IPv6 first, but Fireworks IPv6 endpoint is slow
-    on some Jupyter nodes. This forces IPv4-only resolution."""
+    Python's urllib tries IPv6 first, which is slow/unreachable on some
+    Jupyter nodes. Forces IPv4 but only for SOCK_STREAM (HTTP/HTTPS)."""
     orig = socket.getaddrinfo
-    def ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
-        return orig(host, port, socket.AF_INET, type, proto, flags)
-    socket.getaddrinfo = ipv4_only
+    def ipv4_safe(host, port, family=0, type=0, proto=0, flags=0):
+        results = orig(host, port, family, type, proto, flags)
+        # Prefer IPv4 (AF_INET) over IPv6 (AF_INET6) for TCP connections
+        v4 = [r for r in results if r[0] == socket.AF_INET and r[1] == socket.SOCK_STREAM]
+        if v4:
+            return v4 + [r for r in results if r not in v4]
+        return results
+    socket.getaddrinfo = ipv4_safe
 
 
 _force_ipv4()
