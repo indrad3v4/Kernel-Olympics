@@ -65,6 +65,23 @@ Output format: JSON with:
         self.api_base = "https://api.fireworks.ai/inference/v1"
         self.deepseek_base = "https://api.deepseek.com/v1"
 
+    def _fireworks_api_available(self) -> bool:
+        """Quick health check to see if Fireworks API is reachable.
+
+        Uses a short HEAD request with 3s timeout. Returns False when the
+        API is unreachable, DNS fails, connection hangs, or any network error
+        occurs — so the caller can skip directly to template fallback instead
+        of waiting for per-model 5s timeouts.
+        """
+        try:
+            import urllib.request
+            req = urllib.request.Request(self.api_base, method="HEAD")
+            req.add_header("Authorization", f"Bearer {self.api_key}")
+            with urllib.request.urlopen(req, timeout=3):
+                return True
+        except Exception:
+            return False
+
     def port_kernel(self, source_code: str, context: str = "",
                     cached_pattern: Optional[Dict] = None) -> Dict:
         """Port a CUDA kernel to ROCm/HIP using LLM."""
@@ -92,6 +109,14 @@ Output format: JSON with:
         if not self.api_key or self.api_key == "test":
             return self._template_port(fixed_source, cached_pattern)
 
+        # ⏱️ Early health check — skip to template if Fireworks is unreachable
+        if not self._fireworks_api_available():
+            print("║ ⏱️ Fireworks API unreachable — using template fallback")
+            result = self._template_port(source_code, cached_pattern)
+            if "ported_code" in result:
+                result["ported_code"] = self._fix_ported_code(result["ported_code"])
+            return result
+
         models_to_try = [self.model] + [m for m in self.FALLBACK_MODELS if m != self.model]
 
         for model in models_to_try:
@@ -116,7 +141,7 @@ Output format: JSON with:
                         "Content-Type": "application/json"
                     }
                 )
-                with urllib.request.urlopen(req, timeout=30) as resp:
+                with urllib.request.urlopen(req, timeout=5) as resp:
                     result = _json.loads(resp.read())
                 content = result["choices"][0]["message"]["content"]
                 try:
@@ -136,55 +161,11 @@ Output format: JSON with:
                         }
                     raise
             except Exception as e:
-                print(f"║ ⚠️ Model {model} failed: {e}")
+                print(f"║ ⏱️ Model {model} failed in <5s: {e}")
                 continue  # Try next model
 
-        # Last resort: try DeepSeek (your Hermes main provider)
-        if self.deepseek_key:
-            try:
-                import urllib.request
-                import json as _json
-                data = _json.dumps({
-                    "model": self.deepseek_model,
-                    "messages": [
-                        {"role": "system", "content": self.SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    "temperature": 0.1,
-                    "max_tokens": 2048,
-                    "response_format": {"type": "json_object"}
-                }).encode()
-                req = urllib.request.Request(
-                    f"{self.deepseek_base}/chat/completions",
-                    data=data,
-                    headers={
-                        "Authorization": f"Bearer {self.deepseek_key}",
-                        "Content-Type": "application/json"
-                    }
-                )
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    result = _json.loads(resp.read())
-                content = result["choices"][0]["message"]["content"]
-                try:
-                    parsed = _json.loads(content)
-                    if "ported_code" in parsed:
-                        parsed["ported_code"] = self._fix_ported_code(parsed["ported_code"])
-                    return parsed
-                except _json.JSONDecodeError:
-                    code_text = self._extract_code_from_text(content)
-                    if code_text:
-                        return {
-                            "ported_code": self._fix_ported_code(code_text),
-                            "confidence": self._rubric_score_extracted(code_text),
-                            "changes": ["DeepSeek returned text — extracted code"],
-                            "explanation": "Code extracted from DeepSeek text output"
-                        }
-                    raise
-            except Exception as e:
-                print(f"║ ⚠️ DeepSeek model {self.deepseek_model} failed: {e}")
-                pass  # Fall through to template
-
-        # All models failed — use template fallback
+        # All Fireworks models timed out → skip DeepSeek, go straight to template
+        print("║ ⏱️ All Fireworks models timed out — using template fallback")
         result = self._template_port(source_code, cached_pattern)
         if "ported_code" in result:
             result["ported_code"] = self._fix_ported_code(result["ported_code"])
