@@ -10,8 +10,23 @@ Confidence-gated: if confidence < threshold, flag for human review.
 
 import os
 import json
+import socket
 from typing import Dict, Optional
 from pathlib import Path
+
+
+def _force_ipv4():
+    """Monkey-patch socket to prefer IPv4 for Fireworks connections.
+    
+    Python's urllib tries IPv6 first, but Fireworks IPv6 endpoint is slow
+    on some Jupyter nodes. This forces IPv4-only resolution."""
+    orig = socket.getaddrinfo
+    def ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
+        return orig(host, port, socket.AF_INET, type, proto, flags)
+    socket.getaddrinfo = ipv4_only
+
+
+_force_ipv4()
 
 
 class PortingAgent:
