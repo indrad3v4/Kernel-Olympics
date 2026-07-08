@@ -99,13 +99,19 @@ SYSTEM_PROMPTS = {
         "Output ONLY valid JSON. No prose, no explanation, no markdown outside the json block."
     ),
     "deepseek": (
-        "You are DeepSeek-Orchestrator, the central orchestrator of the "
-        "CUDA→HIP migration pipeline. Your role is to verify ported HIP kernels "
-        "for correctness — checking wavefront64 compatibility, __shfl masks, "
-        "shared memory sizing, and HIP API usage — and to coordinate iterative "
-        "refinement with Kimi-Coder. When verification fails, provide specific, "
-        "actionable, line-level feedback so Kimi can fix the issues. "
-        "Output ONLY valid JSON. No prose, no praise, no explanation."
+        "You are DeepSeek-Orchestrator. You manage 2 subordinate agents:\n"
+        "  1. GLM-Planner — analyzes kernels for warp→wavefront issues\n"
+        "  2. Kimi-Coder — generates HIP kernel code\n\n"
+        "YOUR 2 JOBS:\n"
+        "  JOB 1 (Orchestrator): Read the GLM analysis below. Decide if it's complete.\n"
+        "    - If GLM missed issues → note them in your issues list\n"
+        "    - Kimi will receive your feedback before coding\n"
+        "  JOB 2 (Evaluator): Verify Kimi's ported code for correctness.\n"
+        "    - Check wavefront64 compatibility, __shfl masks, shared memory\n"
+        "    - If PASS → output {\"pass\":true,\"verdict\":\"All checks passed\"}\n"
+        "    - If FAIL → output {\"pass\":false,\"issues\":[...],\"feedback\":\"line-level fix instruction\"}\n\n"
+        "CRITICAL: You are the FINAL AUTHORITY. Do not pass code with issues.\n"
+        "Output ONLY valid JSON. No prose."
     ),
 }
 
@@ -424,6 +430,7 @@ class ModelRouter:
 
     def _build_deepseek_verify_prompt(self, ported_code: str,
                                       patterns: List[Dict],
+                                      glm_analysis: str = "",
                                       feedback: str = "",
                                       iteration: int = 1,
                                       max_iterations: int = 3) -> str:
@@ -451,6 +458,15 @@ class ModelRouter:
             "- HIP API usage (not deprecated CUDA APIs)\n"
             "- __ballot_sync used correctly for HIP\n"
         )
+
+        # As orchestrator, review GLM-Planner's analysis
+        if glm_analysis:
+            prompt += (
+                f"\nGLM-PLANNER ANALYSIS (under your authority as orchestrator):\n"
+                f"{glm_analysis[:1000]}\n\n"
+                "As orchestrator, verify GLM's analysis is complete. "
+                "Note any missed issues.\n"
+            )
 
         if feedback:
             prompt += (
@@ -543,12 +559,14 @@ class ModelRouter:
         orchestrator_feedback = ""
 
         # Phase 1: GLM plans the fix (planner, complex warp patterns)
+        glm_plan_output = ""
         if "glm" in models_needed and any("shfl" in pt for pt in pattern_types):
             glm_prompt = self._build_glm_plan_prompt(kernel_source, patterns)
             plan = self._call_model("glm", glm_prompt,
                                     system_prompt=SYSTEM_PROMPTS.get("glm", ""))
             if plan.success:
                 planner_success = True
+                glm_plan_output = plan.output
                 result["changes"].append(f"[glm] Plan: {plan.output[:200]}")
 
         # Phase 2: Kimi K2.7 generates initial ported code + orchestration loop
@@ -571,6 +589,7 @@ class ModelRouter:
 
                     verify_prompt = self._build_deepseek_verify_prompt(
                         result["ported_code"], patterns,
+                        glm_analysis=glm_plan_output,
                         feedback=orchestrator_feedback,
                         iteration=iteration,
                         max_iterations=max_iterations,
