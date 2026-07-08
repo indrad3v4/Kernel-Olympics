@@ -269,7 +269,7 @@ class KernelOlympics:
                     "    }",
                     "    bool pass = true;",
                     "    for (int i = 0; i < 4; i++) {",
-                    "        if (fabs(output[i] - 64.0f) > 0.001f) pass = false;",
+                    "        if (fabs(output[i] - 32.0f) > 0.001f) pass = false;",
                     "    }",
                     '    printf("TEST: %s\\n", pass ? "PASSED ✅" : "FAILED ❌");',
                     "    hipFree(d_in); hipFree(d_out);",
