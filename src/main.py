@@ -536,6 +536,9 @@ def main():
     parser.add_argument("--reset", action="store_true", help="With --demo, clear pattern memory before running")
     parser.add_argument("--fresh", action="store_true", help="Start with an empty pattern memory (clears the cache DB before running)")
     parser.add_argument("--doctor", action="store_true", help="Run pre-flight environment check and exit")
+    parser.add_argument("--nvidia-sample", type=str, nargs="?",
+                        const="cpp/2_Concepts_and_Techniques/shfl_scan/shfl_scan.cu",
+                        help="Download and test a sample from NVIDIA/cuda-samples (default: shfl_scan)")
     args = parser.parse_args()
 
     if args.doctor:
@@ -544,9 +547,33 @@ def main():
     if args.demo:
         return run_demo(reset=args.reset)
 
-    if not args.input:
-        parser.error("--input is required unless --demo or --doctor is used")
+    if not args.input and not args.nvidia_sample:
+        parser.error("--input or --nvidia-sample is required unless --demo or --doctor is used")
         return 1
+
+    if args.nvidia_sample:
+        sample_path = args.nvidia_sample
+        url = f"https://raw.githubusercontent.com/NVIDIA/cuda-samples/master/{sample_path}"
+        filename = Path(sample_path).name
+        local_path = Path(f"/tmp/nvidia_{filename}")
+        
+        print(green(f"\n  ┌─ NVIDIA CUDA SAMPLE ─────────────────────────────────────┐"))
+        print(green(f"  │ Source: NVIDIA/cuda-samples"))
+        print(green(f"  │ File:   {sample_path}"))
+        print(green(f"  │ URL:    {url}"))
+        print(green(f"  └──────────────────────────────────────────────────────────┘\n"))
+        
+        import urllib.request
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Kernel-Olympics/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                local_path.write_bytes(resp.read())
+            lines = len(local_path.read_text(encoding="utf-8").splitlines())
+            print(cyan(f"  ↓ Downloaded: {filename} ({lines} lines)\n"))
+            args.input = [str(local_path)]
+        except Exception as e:
+            print(red(f"  ✗ Failed to download sample: {e}"))
+            return 1
 
     ko = KernelOlympics(fresh=args.fresh)
     report = ko.run(args.input, args.reference)
