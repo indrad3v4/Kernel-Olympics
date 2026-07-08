@@ -226,7 +226,16 @@ class KernelOlympics:
                 else:
                     pipeline_state["llm_calls"] += 1
                     self.disp.llm_call()
-                    self.disp.status("Porting", f"GLM(planner) → Kimi K2.7(coder) → Gemma 4(verifier)")
+                    # Show which verifier is actually being used
+                    import urllib.request
+                    gemma_online = False
+                    try:
+                        urllib.request.urlopen("http://localhost:8000/v1/models", timeout=1)
+                        gemma_online = True
+                    except Exception:
+                        pass
+                    verifier_name = "Gemma 4(AMD)" if gemma_online else "DeepSeek(fallback)"
+                    self.disp.status("Porting", f"GLM(planner) → Kimi K2.7(coder) → {verifier_name}")
                     t0 = time.perf_counter()
                     port_result = self.router.route(source, cr.get("findings", []))
                     llm_elapsed = time.perf_counter() - t0
