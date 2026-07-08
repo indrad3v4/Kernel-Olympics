@@ -1,36 +1,17 @@
 """
 Pattern Memory — signature-keyed cache of verified CUDA→ROCm migrations.
 
-The cache answers one question:
+The cache answers "have we already solved this collection of migration problems
+before?" It is keyed on the **pattern signature** from the risk classifier — the
+canonical set of ``(pattern, severity)`` problems in a kernel, independent of
+source text, whitespace, comments and identifier names — so a hit always returns
+an applicable fix. Lookup is an exact O(1) match. See
+:mod:`pattern_memory.signature`.
 
-    "Have we already solved this collection of migration problems before?"
-
-It is keyed on the **pattern signature** produced by the risk classifier — the
-canonical set of ``(pattern, severity)`` problems in a kernel — *not* on
-source-text similarity. See :mod:`pattern_memory.signature`.
-
-Why this replaces the previous trigram / Jaccard design
--------------------------------------------------------
-The old cache compared character trigrams of the first ~500 characters of
-source and accepted any match above a 0.25 Jaccard threshold. Unrelated kernels
-share large amounts of CUDA boilerplate (``#include``, ``__global__``, launch
-configuration, ``threadIdx`` arithmetic), so their trigram sets overlapped and
-the cache returned the **wrong** ported kernel — e.g. a warp-reduction fix
-served for a histogram kernel. That silently breaks correctness.
-
-A signature depends only on migration *semantics*. It is invariant to
-whitespace, comments, identifier names and code ordering. Two kernels are a hit
-only when they present the same migration problems, so a hit always returns an
-applicable fix. Lookup is an exact O(1) dict / primary-key match: deterministic,
-reproducible, and free of any fuzzy threshold to tune.
-
-Signature source of truth
---------------------------
-Callers should pass the classifier ``findings`` (or a precomputed signature) to
-:meth:`store` / :meth:`retrieve`. When only raw source is supplied the module
-derives the signature by running the classifier itself — this keeps older
-call-sites working, but note that a *truncated* snippet may yield an incomplete
-signature, so passing ``findings`` computed on the full source is preferred.
+Prefer passing the classifier ``findings`` (or a precomputed signature) to
+:meth:`store` / :meth:`retrieve`. When only raw source is supplied the signature
+is derived by classifying it, but a *truncated* snippet may yield an incomplete
+signature — so ``findings`` computed on the full source is the reliable path.
 """
 
 from __future__ import annotations
