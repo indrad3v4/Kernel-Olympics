@@ -103,6 +103,17 @@ class ModelRouter:
         # Fallback: return as-is (might be code without markers)
         return text.strip()
 
+    @staticmethod
+    def _fix_ported_code(code: str) -> str:
+        """Fix AMD-specific issues in ported code."""
+        import re
+        code = re.sub(
+            r'(__shfl_\w+_sync\()0x[fF]{8}(,)',
+            r'\g<1>0xffffffffffffffffULL\g<2>',
+            code
+        )
+        return code
+
     def route(self, kernel_source: str, patterns: List[Dict]) -> Dict:
         """Route kernel through best models based on detected patterns.
 
@@ -143,6 +154,7 @@ class ModelRouter:
                 f"Output ONLY the ported kernel code, no explanation.")
             if code.success:
                 extracted = self._extract_code(code.output)
+                extracted = self._fix_ported_code(extracted)
                 result["ported_code"] = extracted
                 result["changes"].append(f"[glm] Generated ported kernel")
                 result["confidence"] += 0.4
