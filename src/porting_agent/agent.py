@@ -85,7 +85,7 @@ Output format: JSON with:
                     "Content-Type": "application/json"
                 }
             )
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read())
                 return "choices" in data
         except Exception:
@@ -150,7 +150,7 @@ Output format: JSON with:
                         "Content-Type": "application/json"
                     }
                 )
-                with urllib.request.urlopen(req, timeout=5) as resp:
+                with urllib.request.urlopen(req, timeout=15) as resp:
                     result = _json.loads(resp.read())
                 content = result["choices"][0]["message"]["content"]
                 try:
