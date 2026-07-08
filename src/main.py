@@ -345,11 +345,19 @@ def doctor():
     checks = []
     all_ok = True
 
-    def _check(name, ok, detail=""):
+    def _check(name, ok, detail="", warn=False):
+        """Record a check. warn=True marks an optional check: it shows a
+        yellow '!' when absent but does NOT fail the preflight, so the
+        doctor stays green on a machine without a GPU or API keys."""
         nonlocal all_ok
-        all_ok = all_ok and ok
-        mark = green("✓") if ok else red("✗")
-        checks.append((name, ok, detail))
+        if ok:
+            mark = green("✓")
+        elif warn:
+            mark = yellow("!")
+        else:
+            all_ok = False
+            mark = red("✗")
+        checks.append((name, ok, detail, warn))
         print(f"  {mark} {bold(name):<30} {dim(detail)}")
 
     print()
@@ -391,7 +399,7 @@ def doctor():
             __import__(pkg.replace("-", "_"))
             _check(f"pip: {pkg}", True, "installed")
         except ImportError:
-            _check(f"pip: {pkg}", False, "not installed — 'pip install -r requirements.txt'")
+            _check(f"pip: {pkg}", False, "not installed — 'pip install -r requirements.txt'", warn=True)
 
     # 4. Project module imports (from src/)
     project_modules = [
@@ -428,7 +436,8 @@ def doctor():
         elif optional:
             _check(f"env: {var_name}", True, f"not set (optional — using default)")
         else:
-            _check(f"env: {var_name}", False, "NOT SET — required for LLM calls")
+            _check(f"env: {var_name}", False,
+                   "not set — LLM porting disabled, template fallback used", warn=True)
 
     # 6. Directory structure
     required_dirs = [
@@ -445,28 +454,32 @@ def doctor():
         _check(f"dir: {dir_name}", exists or not required,
                "found" if exists else ("MISSING" if required else "not found (created on demand)"))
 
-    # 7. GPU / hipify-clang
+    # 7. GPU tooling (optional — the tool runs without a GPU via template
+    #    porting + unverified storage, so absence is a warning, not a failure)
     hipify_path = shutil.which("hipify-clang")
     _check("hipify-clang", bool(hipify_path),
-           f"at {hipify_path}" if hipify_path else "NOT FOUND — scanner will fall back")
+           f"at {hipify_path}" if hipify_path else "not found — scanner falls back", warn=True)
 
     hipcc_path = shutil.which("hipcc")
     _check("hipcc (ROCm)", bool(hipcc_path),
-           f"at {hipcc_path}" if hipcc_path else "NOT FOUND — verification requires ROCm")
+           f"at {hipcc_path}" if hipcc_path else "not found — GPU verification unavailable", warn=True)
 
-    # 8. Network connectivity (to Fireworks API)
-    try:
-        import urllib.request
-        req = urllib.request.Request(
-            "https://api.fireworks.ai/v1/models",
-            method="HEAD",
-            headers={"Authorization": f"Bearer {os.getenv('FIREWORKS_API_KEY', '')}"}
-        )
-        urllib.request.urlopen(req, timeout=5)
-        _check("network: Fireworks API", True, "reachable")
-    except Exception as e:
-        _check("network: Fireworks API", bool(os.getenv("FIREWORKS_API_KEY")),
-               f"unreachable ({type(e).__name__})" if os.getenv("FIREWORKS_API_KEY") else "no API key — skip")
+    # 8. Network connectivity (to Fireworks API) — skipped cleanly without a key
+    if not os.getenv("FIREWORKS_API_KEY"):
+        _check("network: Fireworks API", True, "skipped — no API key")
+    else:
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                "https://api.fireworks.ai/v1/models",
+                method="HEAD",
+                headers={"Authorization": f"Bearer {os.getenv('FIREWORKS_API_KEY', '')}"}
+            )
+            urllib.request.urlopen(req, timeout=5)
+            _check("network: Fireworks API", True, "reachable")
+        except Exception as e:
+            _check("network: Fireworks API", False,
+                   f"unreachable ({type(e).__name__})", warn=True)
 
     # 9. SQLite write test (pattern memory)
     try:
@@ -490,14 +503,19 @@ def doctor():
         _check("disk: free space", True, "unable to check")
 
     # ── Summary ──────────────────────────────────────────────────
+    failed = [n for n, ok, _, warn in checks if not ok and not warn]
+    warnings = [(n, d) for n, ok, d, warn in checks if not ok and warn]
     print()
     if all_ok:
-        print(f"  {bold(green('RESULT: ALL CHECKS PASSED'))}")
+        print(f"  {bold(green('RESULT: ALL REQUIRED CHECKS PASSED'))}")
     else:
-        failed = [n for n, ok, _ in checks if not ok]
-        print(f"  {bold(red(f'RESULT: {len(failed)} check(s) FAILED'))}")
+        print(f"  {bold(red(f'RESULT: {len(failed)} required check(s) FAILED'))}")
         for n in failed:
             print(f"         {red('✗')} {n}")
+    if warnings:
+        print(f"  {yellow(f'{len(warnings)} optional check(s) not available (safe to proceed):')}")
+        for n, d in warnings:
+            print(f"         {yellow('!')} {n} {dim('— ' + d) if d else ''}")
     print()
     print(bold("╚════════════════════════════════════════════════════════╝"))
     return 0 if all_ok else 1
@@ -699,4 +717,4 @@ def run_demo(reset: bool = False):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
