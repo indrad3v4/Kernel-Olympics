@@ -1,7 +1,6 @@
-flask>=3.0       # Optional: web UI for demo dashboard
-numpy>=1.24      # Numerical computation in reference outputs
-requests>=2.31   # HTTP client for Fireworks / DeepSeek API calls
-chromadb>=0.4    # Optional: production-grade vector store (SQLite default)
+# Kernel Olympics has no third-party *runtime* dependencies — the pipeline
+# runs on the Python standard library (urllib for HTTP, sqlite3 for the
+# pattern store). The packages below are for development / CI only.
 
 # AMD ROCm / HIP deps (installed via Docker image, not pip)
 #   - hipcc, rocm-dev, rocm-libs

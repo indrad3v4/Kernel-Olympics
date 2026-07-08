@@ -387,11 +387,8 @@ def doctor():
             _check(f"stdlib: {mod_name}", not required, "MISSING — may affect runtime")
 
     # 3. Optional pip package check
+    # Core pipeline is pure-stdlib; pytest is the only (dev/CI) pip dep.
     pip_packages = [
-        "flask",
-        "numpy",
-        "requests",
-        "chromadb",
         "pytest",
     ]
     for pkg in pip_packages:
