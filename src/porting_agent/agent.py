@@ -68,17 +68,26 @@ Output format: JSON with:
     def _fireworks_api_available(self) -> bool:
         """Quick health check to see if Fireworks API is reachable.
 
-        Uses a short HEAD request with 3s timeout. Returns False when the
-        API is unreachable, DNS fails, connection hangs, or any network error
-        occurs — so the caller can skip directly to template fallback instead
-        of waiting for per-model 5s timeouts.
+        Uses a lightweight 1-token chat completion to verify the key works.
         """
         try:
-            import urllib.request
-            req = urllib.request.Request(self.api_base, method="HEAD")
-            req.add_header("Authorization", f"Bearer {self.api_key}")
-            with urllib.request.urlopen(req, timeout=3):
-                return True
+            import urllib.request, json
+            data = json.dumps({
+                "model": "accounts/fireworks/models/deepseek-v4-pro",
+                "messages": [{"role": "user", "content": "ok"}],
+                "max_tokens": 1
+            }).encode()
+            req = urllib.request.Request(
+                f"{self.api_base}/chat/completions",
+                data=data,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json"
+                }
+            )
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read())
+                return "choices" in data
         except Exception:
             return False
 
