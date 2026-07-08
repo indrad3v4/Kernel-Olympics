@@ -89,6 +89,13 @@ Put ONLY the ```json ... ``` block in your response — no surrounding prose.
         "accounts/fireworks/models/deepseek-v4-pro",              # 3rd: DeepSeek (works ✅)
     ]
 
+    # Cost per 1000 tokens for Fireworks models (for cost tracking)
+    MODEL_COST_MAP = {
+        "accounts/fireworks/models/kimi-k2p7-code": 0.00095,
+        "accounts/fireworks/models/glm-5p2": 0.0014,
+        "accounts/fireworks/models/deepseek-v4-pro": 0.0012,
+    }
+
     def __init__(self, api_key: Optional[str] = None, model: str = "accounts/fireworks/models/kimi-k2p7-code",
                  deepseek_key: str = "", deepseek_model: str = "deepseek-reasoner"):
         self.api_key = api_key or os.getenv("FIREWORKS_API_KEY", "")
@@ -187,10 +194,19 @@ Put ONLY the ```json ... ``` block in your response — no surrounding prose.
                     raw_body = resp.read()
                     result = _json.loads(raw_body)
                 content = result["choices"][0]["message"]["content"]
+                # Extract token usage for cost tracking
+                usage = result.get("usage", {})
+                tokens_used = (
+                    usage.get("total_tokens", 0)
+                    or usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+                )
+                cost_per_1k = self.MODEL_COST_MAP.get(model, 0.0012)
+                call_cost = tokens_used / 1000 * cost_per_1k
                 # Try JSON extraction first (handles prose-wrapped JSON)
                 parsed = self._extract_json_from_text(content)
                 if parsed and "ported_code" in parsed:
                     parsed["ported_code"] = self._fix_ported_code(parsed["ported_code"])
+                    parsed["cost"] = round(call_cost, 4)
                     return parsed
                 # Fallback: extract HIP code from text output
                 code_text = self._extract_code_from_text(content)
@@ -199,7 +215,8 @@ Put ONLY the ```json ... ``` block in your response — no surrounding prose.
                         "ported_code": self._fix_ported_code(code_text),
                         "confidence": self._rubric_score_extracted(code_text),
                         "changes": ["LLM returned text without valid JSON — extracted code block"],
-                        "explanation": "Code extracted from LLM text output"
+                        "explanation": "Code extracted from LLM text output",
+                        "cost": round(call_cost, 4),
                     }
                 raise ValueError(f"No usable code or JSON found in LLM response: {content[:200]}")
             except urllib.request.HTTPError as e:
@@ -270,25 +287,65 @@ Put ONLY the ```json ... ``` block in your response — no surrounding prose.
         # Try markdown code blocks (cuda, hip, cpp, or unlabeled)
         blocks = re.findall(r'```(?:cuda|hip|cpp|cu|cl)?\n(.*?)```', text, re.DOTALL)
         if blocks:
-            # Pick the longest block (usually the real code)
-            return max(blocks, key=len).strip()
+            return PortingAgent._strip_prose_lines(max(blocks, key=len).strip())
         # Try generic ``` blocks
         blocks = re.findall(r'```\n(.*?)```', text, re.DOTALL)
         if blocks:
-            return max(blocks, key=len).strip()
+            return PortingAgent._strip_prose_lines(max(blocks, key=len).strip())
         # Try to find __global__ kernel definition
         match = re.search(r'(__global__\s+void\s+\w+\s*\(.*?)(?=\n\n|\Z)', text, re.DOTALL)
         if match:
-            return match.group(1).strip()
-        # Try to find from #include to end
+            return PortingAgent._strip_prose_lines(match.group(1).strip())
+        # Try to find from #include to end, then strip prose
         match = re.search(r'(#include\s+<.*)', text, re.DOTALL)
         if match:
-            return match.group(1).strip()
+            return PortingAgent._strip_prose_lines(match.group(1).strip())
         # Look for __device__ function definitions
         match = re.search(r'(__device__\s+\w+\s+\w+\s*\(.*?)(?=\n\n|\Z)', text, re.DOTALL)
         if match:
-            return match.group(1).strip()
+            return PortingAgent._strip_prose_lines(match.group(1).strip())
         return ""
+
+    @staticmethod
+    def _strip_prose_lines(code: str) -> str:
+        """Remove non-code prose lines from extracted code.
+        
+        Filters out lines that look like LLM analysis/commentary
+        rather than actual HIP/C++ code. Also cleans up include
+        directives contaminated by inline prose."""
+        import re
+        clean = []
+        for line in code.split('\n'):
+            stripped = line.strip()
+            # Skip empty lines at start
+            if not stripped and not clean:
+                continue
+            # Fix: `#include <...> prose` → `#include <...>`
+            if stripped.startswith('#include'):
+                inc_match = re.match(r'(#include\s+<[^>]+>)', stripped)
+                if inc_match:
+                    clean.append(inc_match.group(1))
+                    continue
+                # Try match with backtick-garbled end
+                inc_match2 = re.match(r'(#include\s+<[^`>]+[`>])', stripped)
+                if inc_match2:
+                    clean.append(inc_match2.group(1).replace('`', ''))
+                    continue
+            # Skip lines that are clearly prose (not code)
+            prose_patterns = [
+                r'^(Let\'?s|Need|Should|Maybe|Consider|Note:|Question:|Answer:|Step\s+\d)',
+                r'^(Here\'?s|This |The |We |I |For |In |As |A |An )',
+                r'^(First|Second|Third|Finally|Next|Then|After)',
+                r'^Output:|^Input:',
+                r'explanation|explain|analysis|decid(e|ing|es)',
+            ]
+            is_prose = any(re.match(p, stripped, re.IGNORECASE) for p in prose_patterns)
+            if is_prose and not any(c in stripped for c in ['{', '}', ';', '__global__', '__device__']):
+                continue
+            # Remove trailing inline prose (backtick contamination)
+            clean.append(stripped.rstrip('`').rstrip())
+        result = '\n'.join(clean).strip()
+        return result if result else code
 
     @staticmethod
     def _rubric_score(source_code: str, ported_code: str, changes: list,
