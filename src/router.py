@@ -611,12 +611,24 @@ class ModelRouter:
                         break
 
                     # Parse orchestrator JSON response
-                    try:
-                        parsed = json.loads(orchestrator.output)
-                    except (json.JSONDecodeError, TypeError) as e:
+                    raw = orchestrator.output.strip()
+                    parsed = None
+                    if raw.startswith("{"):
+                        try: parsed = json.loads(raw)
+                        except: pass
+                    if parsed is None:
+                        m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
+                        if m:
+                            try: parsed = json.loads(m.group(1))
+                            except: pass
+                    if parsed is None:
+                        m = re.search(r'\{"pass":[^}]*\}', raw)
+                        if m:
+                            try: parsed = json.loads(m.group(0))
+                            except: pass
+                    if parsed is None:
                         result["changes"].append(
-                            f"[deepseek-orch] JSON parse error (iteration {iteration}): "
-                            f"{str(e)[:60]}")
+                            f'[deepseek-orch] JSON parse error (iter {iteration}): raw={raw[:80]}')
                         break
 
                     if parsed.get("pass", False):

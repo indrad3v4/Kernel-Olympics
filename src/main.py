@@ -180,14 +180,14 @@ class KernelOlympics:
             return {"error": "no_input", "files_scanned": 0}
 
         classifier_results = self.classifier.classify_batch(file_sources)
-        red = [r for r in classifier_results if r.get("risk_level") == "red"]
+        red_kernels = [r for r in classifier_results if r.get("risk_level") == "red"]
         ylw = [r for r in classifier_results if r.get("risk_level") == "yellow"]
         for cr in classifier_results:
             findings = cr.get("findings", [])
             if findings:
                 levels = ", ".join(f"[{f['severity']}] L{f['line']}: {f['pattern']}" for f in findings[:3])
                 self.disp.file_done(Path(cr['file']).name, levels, ok=cr.get("risk_level") != "red")
-        self.disp.status("Classifying", f"RED: {len(red)}  YELLOW: {len(ylw)}  GREEN: {len(classifier_results)-len(red)-len(ylw)}")
+        self.disp.status("Classifying", f"RED: {len(red_kernels)}  YELLOW: {len(ylw)}  GREEN: {len(classifier_results)-len(red_kernels)-len(ylw)}")
 #since there is a potential correlation between coverage and the ris k atribution, maybe we can try to make the risk assesment dynamic later on if we get some good runs. 
         
         # Phase 3: Pattern Memory
