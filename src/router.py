@@ -239,7 +239,7 @@ class ModelRouter:
                 f"```cuda\n{kernel_source[:2000]}\n```\n\n"
                 f"Output ONLY the ported kernel code, no explanation.")
             if code.success:
-                glm_success = True
+                coder_success = True
                 extracted = self._extract_code(code.output)
                 extracted = self._fix_ported_code(extracted)
                 result["ported_code"] = extracted
@@ -283,8 +283,8 @@ class ModelRouter:
 
         # Rubric-based scoring replaces the old additive confidence model
         result["confidence"] = self._rubric_score_pipeline(
-            kimi_success=planner_success,
-            glm_success=coder_success,
+            kimi_success=coder_success,
+            glm_success=planner_success,
             verify_success=verify_success,
             verify_passed=verify_passed,
             has_ported_code=bool(result["ported_code"]),
@@ -321,7 +321,16 @@ class ModelRouter:
                         headers={"Content-Type": "application/json"}
                     )
                     with urllib.request.urlopen(req, timeout=30) as resp:
-                        data = json.loads(resp.read())
+                        raw = resp.read()
+                        try:
+                            data = json.loads(raw)
+                        except json.JSONDecodeError as e:
+                            source = "local-vllm"
+                            raw_preview = raw[:500].decode(errors="replace")
+                            self.call_log.append({"model": model_key, "source": source,
+                                                  "error": f"JSON parse failed: {e}",
+                                                  "raw_response": raw_preview[:200]})
+                            continue
                         content = data["choices"][0]["message"]["content"]
                         self.call_log.append({"model": model_key, "source": "local-vllm", "cost": 0})
                         return AgentResult(model_key, True, content, self._rubric_score_response(content),
@@ -342,7 +351,16 @@ class ModelRouter:
                         }
                     )
                     with urllib.request.urlopen(req, timeout=15) as resp:
-                        data = json.loads(resp.read())
+                        raw = resp.read()
+                        try:
+                            data = json.loads(raw)
+                        except json.JSONDecodeError as e:
+                            source = "fireworks"
+                            raw_preview = raw[:500].decode(errors="replace")
+                            self.call_log.append({"model": model_key, "source": source,
+                                                  "error": f"JSON parse failed: {e}",
+                                                  "raw_response": raw_preview[:200]})
+                            continue
                         content = data["choices"][0]["message"]["content"]
                         tokens = data.get("usage", {}).get("total_tokens", 0)
                         cost = tokens / 1000 * model_info["cost_per_1k"]

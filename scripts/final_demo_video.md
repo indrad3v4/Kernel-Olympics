@@ -64,7 +64,7 @@ python3 src/main.py --nvidia-sample --fresh
 ║ 🔍 Scanning → coverage: 99.8%                   ║
 ║ ⚠️ Classifying → RED: shfl_up_sync (high)        ║
 ║ 🧠 Memory Cache → 0 cached (first run)           ║
-║ 🤖 Porting → GLM → Kimi K2.7 → DeepSeek(fallback)║
+║ 🤖 Porting → GLM → Kimi K2.7 → DeepSeek V4 Pro(fallback)║
 ║ ✓ 3-model pipeline ✅ (35%, 13s)                 ║
 ║ 📁 Ported → ported_kernels/nvidia_shfl_scan.hip.cpp   ║
 ╚══════════════════════════════════════════════════╝

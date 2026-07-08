@@ -120,7 +120,7 @@ class Display:
         print(f"║ {green('●')} Cache: {bold(str(hits))} hits  LLM: {bold(str(calls))} calls  {cyan(f'{hit_rate:.0f}%')} hit rate")
         print(f"║ {green('●')} Fastest: {cache_ms}ms  LLM avg: {llm_s}s  {cyan(speedup)} faster with cache")
         print(f"║ {green('●')} Patterns: {pipeline_state.get('patterns_before',0)} → {bold(str(pipeline_state.get('patterns_after',0)))} stored")
-        print(f"║ {green('●')} Cost: {bold(cost_str)} ({calls} LLM call{'s' if calls != 1 else ''})")
+        print(f"║ {green('●')} Cost: {bold(cost_str)}")
         print(f"║ {green('●')} Elapsed: {elapsed:.1f}s total")
         print(f"╚{'═'*66}╝")
 
@@ -477,13 +477,41 @@ def doctor():
 
     # 7. GPU tooling (optional — the tool runs without a GPU via template
     #    porting + unverified storage, so absence is a warning, not a failure)
+    import subprocess as _sp
     hipify_path = shutil.which("hipify-clang")
     _check("hipify-clang", bool(hipify_path),
            f"at {hipify_path}" if hipify_path else "not found — scanner falls back", warn=True)
 
-    hipcc_path = shutil.which("hipcc")
-    _check("hipcc (ROCm)", bool(hipcc_path),
-           f"at {hipcc_path}" if hipcc_path else "not found — GPU verification unavailable", warn=True)
+    # Thorough hipcc detection — check common paths, which, and command -v
+    hipcc_candidates = ["hipcc", "/opt/rocm/bin/hipcc", "/opt/rocm/lib/llvm/bin/hipcc",
+                        "/opt/rocm-7.2.1/bin/hipcc", "/opt/rocm-7.2.1/lib/llvm/bin/hipcc",
+                        "/usr/bin/hipcc"]
+    hipcc_found = None
+    for cmd in hipcc_candidates:
+        try:
+            _r = _sp.run([cmd, "--version"], capture_output=True, text=True, timeout=5)
+            if _r.returncode == 0:
+                hipcc_found = cmd
+                break
+        except (FileNotFoundError, _sp.TimeoutExpired):
+            continue
+    if not hipcc_found:
+        try:
+            _r = _sp.run("which hipcc 2>/dev/null || command -v hipcc 2>/dev/null",
+                         shell=True, capture_output=True, text=True, timeout=5)
+            if _r.stdout.strip():
+                hipcc_found = _r.stdout.strip()
+        except _sp.TimeoutExpired:
+            pass
+    if not hipcc_found:
+        try:
+            _r = _sp.run("hipcc --version", shell=True, capture_output=True, text=True, timeout=5)
+            if _r.returncode == 0:
+                hipcc_found = "hipcc"
+        except _sp.TimeoutExpired:
+            pass
+    _check("hipcc (ROCm)", bool(hipcc_found),
+           f"at {hipcc_found}" if hipcc_found else "not found — GPU verification unavailable", warn=True)
 
     # 8. Network connectivity (to Fireworks API) — skipped cleanly without a key
     if not os.getenv("FIREWORKS_API_KEY"):
