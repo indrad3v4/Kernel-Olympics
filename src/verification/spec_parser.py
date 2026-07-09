@@ -204,7 +204,26 @@ def generate_spec_from_source(kernel_name: str, source: str) -> Optional[dict]:
         "kernel_function": primary["kernel_function"],
         "description": f"Auto-generated spec for {kernel_name}",
         "params": primary["params"],
+        # Bug 5: distinguishes specs this parser wrote from hand-tuned ones
+        # (conv2d.json, softmax.json, new_kernel.json carry real
+        # reference_output paths) — save_spec() refuses to overwrite a spec
+        # file that lacks this marker.
+        "auto_generated": True,
     }
+
+    # Bug 4: anchored so a comment or string literal containing "int main("
+    # mid-line can't false-positive (the two call sites in verifier.py that
+    # this flag feeds already anchor the same check with ^ + MULTILINE).
+    self_contained = bool(re.search(r'^\s*int\s+main\s*\(', source, re.MULTILINE))
+    if self_contained:
+        spec["self_contained"] = True
+        # launch/input_setup/output_readback are dead config for a
+        # self-contained program: _generate_harness() (verifier.py) returns
+        # the ported source unwrapped and never consults them. Leaving
+        # fabricated values here — a hardcoded (float*,float*,int) launch
+        # guess for a kernel whose real params are (int*,int,int*) — is
+        # misleading config a future reader would reasonably trust.
+        return spec
 
     # Generate launch config
     spec["launch"] = _guess_grid_block()
@@ -217,26 +236,52 @@ def generate_spec_from_source(kernel_name: str, source: str) -> Optional[dict]:
         "default_value": 1.0,
     }
 
+    # Infer output element_type from the primary kernel's own output-
+    # direction param (falling back to the first pointer param) instead of
+    # hardcoding "float" — a kernel whose params are all int* previously got
+    # an output_readback claiming float, contradicting its own params list.
+    out_param = next((p for p in primary["params"] if p["direction"] == "out"), None)
+    if out_param is None:
+        out_param = next((p for p in primary["params"] if "*" in p["type"]), None)
+    element_type = "float"
+    if out_param is not None:
+        base_type = out_param["type"].replace("*", "").replace("const ", "").strip()
+        element_type = _CUDA_TO_HIP_TYPES.get(base_type, base_type)
+
     spec["output_readback"] = {
         "count": 4,
-        "element_type": "float",
-        "format": "float_per_line",
+        "element_type": element_type,
+        "format": "int_per_line" if element_type.startswith("int") else "float_per_line",
     }
-
-    # If the kernel source has int main(...), mark as self-contained
-    if re.search(r'int\s+main\s*\(', source):
-        spec["self_contained"] = True
 
     return spec
 
 
-def save_spec(kernel_name: str, spec: dict) -> Path:
-    """Save a spec dict to the specs/ directory."""
+def save_spec(kernel_name: str, spec: dict) -> tuple[Path, bool]:
+    """Save a spec dict to the specs/ directory.
+
+    Bug 5: refuses to overwrite an existing spec file that lacks the
+    ``"auto_generated": true`` marker. Previously this always overwrote
+    unconditionally, and route() calls this on every run — silently
+    destroying any hand-tuned spec (conv2d.json, softmax.json,
+    new_kernel.json carry real reference_output paths that make the
+    verifier's diff step meaningful; a fresh guessed spec has none).
+
+    Returns (path, written) — ``written`` is False when a hand-written
+    spec blocked the write; the existing file on disk is left untouched.
+    """
     _SPEC_DIR.mkdir(parents=True, exist_ok=True)
     path = _SPEC_DIR / f"{kernel_name}.json"
+    if path.exists():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            existing = {}
+        if not existing.get("auto_generated", False):
+            return path, False
     with open(path, "w", encoding="utf-8") as f:
         json.dump(spec, f, indent=2)
-    return path
+    return path, True
 
 
 def auto_generate_spec(kernel_name: str, source: str) -> Optional[dict]:
@@ -244,9 +289,17 @@ def auto_generate_spec(kernel_name: str, source: str) -> Optional[dict]:
 
     The loop convergence point: if compile fails with harness errors,
     call this to generate a spec, then re-port with the correct harness.
+
+    Returns None if no __global__ kernel was found. If a hand-written spec
+    already exists for *kernel_name* (see save_spec), the freshly parsed
+    spec is still returned but carries ``spec["_persisted"] = False`` (an
+    in-memory-only key, never written to disk) so callers can tell "wrote a
+    fresh auto-generated spec" from "left the existing hand-written one
+    alone" — see router.py's route() for how this is logged.
     """
     spec = generate_spec_from_source(kernel_name, source)
     if spec is None:
         return None
-    save_spec(kernel_name, spec)
+    _, written = save_spec(kernel_name, spec)
+    spec["_persisted"] = written
     return spec
