@@ -156,6 +156,18 @@ class Display:
         print(f"║ {green('●')} Patterns: {pipeline_state.get('patterns_before',0)} → {bold(str(pipeline_state.get('patterns_after',0)))} stored")
         print(f"║ {green('●')} Cost: {bold(cost_str)}")
         print(f"║ {green('●')} Elapsed: {elapsed:.1f}s total")
+        # T0.3: top-line verdict for the whole run.
+        verdict = pipeline_state.get("result", "")
+        if verdict:
+            if verdict == "PASSED":
+                vtxt = green(bold("RESULT: PASSED"))
+            elif verdict == "FAILED":
+                vtxt = red(bold("RESULT: FAILED"))
+            elif verdict.startswith("PARTIAL") or verdict.startswith("UNVERIFIED"):
+                vtxt = yellow(bold(f"RESULT: {verdict}"))
+            else:
+                vtxt = bold(f"RESULT: {verdict}")
+            print(f"║ {vtxt}")
         print(f"╚{'═'*66}╝")
 
     def _flush(self):
@@ -565,6 +577,29 @@ class KernelOlympics:
             hours_per_fix=4.0
         )
         report["pipeline_state"] = pipeline_state
+
+        # T0.3: a single honest verdict for the whole run. "no GPU" is NOT a
+        # failure of the port — it means we couldn't test it — so it's kept
+        # distinct from a real FAILED (compiled+crashed / diffed / failed to
+        # compile with a GPU present).
+        def _no_gpu(v):
+            return (not v.get("hipcc_available", True)) or \
+                   ("hipcc not found" in v.get("compile_output", ""))
+        attempted = len(verification_results)
+        passed = sum(1 for v in verification_results if v.get("passed"))
+        if attempted == 0:
+            verdict, exit_fail = "NO PORTS NEEDED", False
+        elif all(_no_gpu(v) for v in verification_results):
+            verdict, exit_fail = "UNVERIFIED (no GPU)", False
+        elif passed == 0:
+            verdict, exit_fail = "FAILED", True
+        elif passed == attempted:
+            verdict, exit_fail = "PASSED", False
+        else:
+            verdict, exit_fail = f"PARTIAL ({passed}/{attempted} verified)", False
+        report["result"] = verdict
+        pipeline_state["result"] = verdict
+        pipeline_state["exit_fail"] = exit_fail
         self.disp.status("Report", "Generated", ok=True)
 
         # Final display
@@ -864,6 +899,11 @@ def main():
     with open(output_path, 'w', encoding="utf-8") as f:
         json.dump(report, f, indent=2, default=str)
     print(f"Report saved to: {output_path}")
+
+    # T0.3: exit non-zero when a real port failed verification, so CI and
+    # scripts can detect it. "no GPU" / "no ports needed" are not failures.
+    if report.get("pipeline_state", {}).get("exit_fail"):
+        return 1
 
 
 def run_demo(reset: bool = False):
