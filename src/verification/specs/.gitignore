@@ -1,0 +1,2 @@
+# Ignore test-generated specs (router tests create specs for test_kernel, test_refine, test_stagnation)
+test_*.json
