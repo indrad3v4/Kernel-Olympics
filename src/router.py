@@ -1046,7 +1046,7 @@ class ModelRouter:
                     error_history.append(current_err_count)
                     result["changes"].append(
                         f"[hipcc] Iter {iteration}: {current_err_count} errors "
-                        f"(delta: {error_delta:+d}, new: {len(new_errors)}, "
+                        f"(delta: {error_delta:+d}, new: {len(new_errors_norm)}, "
                         f"resolved: {len(resolved_errors)})")
 
                     # LIVE VISIBILITY: Print error details during loop, not after
@@ -1056,7 +1056,7 @@ class ModelRouter:
                         clean = err_line.strip()[:60]
                         if clean:
                             print(f"║  │  ⚠ {clean:<58}║")
-                    trend = f"{'↓' if error_delta > 0 else '↑' if error_delta < 0 else '→'} {current_err_count} errs (Δ{error_delta:+d}, new:{len(new_errors)})"
+                    trend = f"{'↓' if error_delta > 0 else '↑' if error_delta < 0 else '→'} {current_err_count} errs (Δ{error_delta:+d}, new:{len(new_errors_norm)})"
                     print(f"║  │  📊 {trend:<58}║")
 
                     # TRIZ #15: Detect stagnation — 3 iterations with no improvement
@@ -1088,11 +1088,22 @@ class ModelRouter:
                     result["changes"].append(
                         f"[hipcc] Compile-first check {iteration}: FAILED: {err_summary[:120]}")
 
-                    # TRIZ #22: Feed only NEW errors to Kimi (throw away repeated ones)
-                    if new_errors:
-                        compile_err_lines = list(new_errors)[:5]
+                    # TRIZ #22/#28: Feed only NEW (semantically) errors to Kimi.
+                    # Use normalized diff for the decision; raw errors for display.
+                    if new_errors_norm:
+                        # Genuinely new error type/message — show raw form
+                        compile_err_lines = list(new_errors)[:5] if new_errors else compile_errs[:5]
                         feedback_intro = (
                             f"REAL COMPILER ERRORS (hipcc) — NEW errors since last iteration (iteration {iteration}):\n"
+                        )
+                    elif new_errors and not new_errors_norm:
+                        # Raw diff shows "new" but normalized diff shows 0 → same
+                        # error at a different line number.  Tell Kimi explicitly.
+                        compile_err_lines = compile_errs[:3] if compile_errs else [cc["compile_output"][:300]]
+                        feedback_intro = (
+                            f"REAL COMPILER ERRORS (hipcc) — SAME error persists (possibly at different line) (iteration {iteration}).\n"
+                            f"The error type and message are identical to last iteration; only the line number shifted.\n"
+                            f"You MUST try a DIFFERENT approach. Previous fix did not work.\n"
                         )
                     else:
                         # All errors are the same as before — send them all but flag stagnation
