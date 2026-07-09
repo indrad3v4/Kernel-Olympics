@@ -60,6 +60,43 @@ def bold(s): return _c(s, 1)
 def dim(s): return _c(s, 2)
 
 
+def gate_confidence(port_confidence, passed: bool):
+    """T0.2: confidence is a claim about a VERIFIED port.
+
+    The authoritative verifier's ``passed`` (compiled + ran + diffed) is the
+    only gate — deliberately stricter than the orchestrator's in-loop
+    compile_ok / orch_passed. So a kernel that compiled in-loop but did not
+    verify (crashed, diffed, or the orchestrator bailed) reports 0, not the
+    porter's optimistic self-score.
+    """
+    return port_confidence if passed else 0
+
+
+def compute_run_verdict(verification_results: list) -> tuple:
+    """T0.3: a single honest verdict for a run → (verdict_str, exit_fail).
+
+    "no GPU" is NOT a failure of the port — it means we could not test it —
+    so it is kept distinct from a real FAILED (compiled+crashed / diffed /
+    failed to compile with a GPU present). exit_fail is True only when a real
+    port was verified and failed.
+    """
+    def _no_gpu(v):
+        return (not v.get("hipcc_available", True)) or \
+               ("hipcc not found" in v.get("compile_output", ""))
+
+    attempted = len(verification_results)
+    passed = sum(1 for v in verification_results if v.get("passed"))
+    if attempted == 0:
+        return "NO PORTS NEEDED", False
+    if all(_no_gpu(v) for v in verification_results):
+        return "UNVERIFIED (no GPU)", False
+    if passed == 0:
+        return "FAILED", True
+    if passed == attempted:
+        return "PASSED", False
+    return f"PARTIAL ({passed}/{attempted} verified)", False
+
+
 def verification_failure_label(ver_result: dict) -> str:
     """Pick the failure label for a verify() result that did not pass.
 
@@ -153,9 +190,23 @@ class Display:
         print(f"║ {bold('Summary')}")
         print(f"║ {green('●')} Cache: {bold(str(hits))} hits  LLM: {bold(str(calls))} calls  {cyan(f'{hit_rate:.0f}%')} hit rate")
         print(f"║ {green('●')} Fastest: {cache_ms}ms  LLM avg: {llm_s}s  {cyan(speedup)} faster with cache")
-        print(f"║ {green('●')} Patterns: {pipeline_state.get('patterns_before',0)} → {bold(str(pipeline_state.get('patterns_after',0)))} stored")
+        quarantined = pipeline_state.get('patterns_quarantined', 0)
+        q_txt = f"  {yellow(f'(+{quarantined} quarantined)')}" if quarantined else ""
+        print(f"║ {green('●')} Patterns: {pipeline_state.get('patterns_before',0)} → {bold(str(pipeline_state.get('patterns_after',0)))} verified{q_txt}")
         print(f"║ {green('●')} Cost: {bold(cost_str)}")
         print(f"║ {green('●')} Elapsed: {elapsed:.1f}s total")
+        # T0.3: top-line verdict for the whole run.
+        verdict = pipeline_state.get("result", "")
+        if verdict:
+            if verdict == "PASSED":
+                vtxt = green(bold("RESULT: PASSED"))
+            elif verdict == "FAILED":
+                vtxt = red(bold("RESULT: FAILED"))
+            elif verdict.startswith("PARTIAL") or verdict.startswith("UNVERIFIED"):
+                vtxt = yellow(bold(f"RESULT: {verdict}"))
+            else:
+                vtxt = bold(f"RESULT: {verdict}")
+            print(f"║ {vtxt}")
         print(f"╚{'═'*66}╝")
 
     def _flush(self):
@@ -225,7 +276,7 @@ class KernelOlympics:
         
         # Phase 3: Pattern Memory
         self.disp.phase("Memory Cache", "🧠")
-        pipeline_state["patterns_before"] = self.memory.count()
+        pipeline_state["patterns_before"] = self.memory.count(verified_only=True)
         count = self.memory.count()
         self.disp.status("Memory Cache", f"{count} cached patterns ready" if count > 0 else "0 cached patterns (first run)", ok=count > 0)
 
@@ -332,8 +383,19 @@ class KernelOlympics:
                         for ch in orch_changes[-5:]:
                             print(f"║  🧠 {dim(ch[:70]):<64}║")
                     compile_ok = port_result.get("compile_passed", False)
-                    tag = "✅ PASSED" if orch_passed else (f"✅ COMPILED" if compile_ok else f"🔁 {iters}/10 iterations")
-                    self.disp.file_done(Path(cr['file']).name, f"GLM-eval {tag} ({port_result.get('confidence', 0)}%, {llm_elapsed:.0f}s)", ok=orch_passed)
+                    # T0.1: the porting phase runs an in-loop compile of the bare
+                    # kernel — it is NOT the authoritative verdict. The verifier
+                    # (next phase) compiles + runs + diffs and owns the real
+                    # PASSED/FAILED. So this line must never claim a bare
+                    # "COMPILED"; it reports in-loop progress only. One source of
+                    # truth for the verdict = the Verifying phase below.
+                    tag = ("⏳ orchestrator ok, verifying" if orch_passed
+                           else ("⏳ compiles in-loop, verifying" if compile_ok
+                                 else f"🔁 {iters}/{port_result.get('max_iterations', 10)} iterations"))
+                    # T0.2: no confidence % here — it is a pre-verify porter score
+                    # and printing it reads as a final grade. The gated confidence
+                    # appears after verification (report + verify status).
+                    self.disp.file_done(Path(cr['file']).name, f"GLM-eval {tag} ({llm_elapsed:.0f}s)", ok=orch_passed)
                     save_path = Path.cwd() / "ported_kernels" / (Path(cr["file"]).stem + ".hip.cpp")
                     print(f"║  📁 Ported kernel → {bold(str(save_path)):<47}║")
                     self.memory.record_llm_time(llm_elapsed)
@@ -388,7 +450,11 @@ class KernelOlympics:
                 sys.stdout.write("\r" + " " * 80 + "\r")  # clear progress bar
                 sys.stdout.flush()
 
-                ver_result["confidence"] = port_result.get("confidence", 0)
+                # T0.2: confidence only survives a real verification pass (see
+                # gate_confidence). Gated on the authoritative verifier — so
+                # compile-in-loop-but-not-verified also lands at 0.
+                ver_result["confidence"] = gate_confidence(
+                    port_result.get("confidence", 0), ver_result.get("passed"))
                 # Attach in-loop compile errors to verification result
                 if port_result.get("compile_errors"):
                     ver_result["in_loop_compile_errors"] = port_result["compile_errors"]
@@ -442,25 +508,32 @@ class KernelOlympics:
                     print(f"  ⚠️ Failed to save: {e}")
 
                 if ver_result.get("passed"):
+                    # T0.4: only this branch — an actual verification pass — writes
+                    # a verified fix that retrieve() will serve on a cache hit.
                     self.memory.store(
                         pattern_snippet=source[:500],
                         verified_fix=port_result.get("ported_code", "")[:500],
                         confidence=port_result.get("confidence", 80) / 100.0,
                         verification_run_id=ver_result.get("compile_output", "")[:20],
                         llm_time_s=port_result.get("llm_time_s", 0.0),
-                        findings=cr.get("findings", [])
+                        findings=cr.get("findings", []),
+                        verified=True,
                     )
                     self.disp.status("Verifying", f"{Path(cr['file']).name} {green('VERIFIED')}", ok=True)
                 elif not ver_result.get("compile_success") and "hipcc not found" in ver_result.get("compile_output", ""):
-                    # GPU unavailable — store as unverified template fix for the
-                    # "second kernel is faster" demo. Uses lower confidence.
+                    # GPU unavailable — the port was never compiled or run, so it is
+                    # UNVERIFIED. T0.4: store it quarantined (verified=False) so it is
+                    # never served on a hit; a later real verification can promote it.
+                    # Review: confidence 0.0, not 0.70 — nothing compiled or ran, so a
+                    # non-zero score here would be as much a fiction as the old 47%.
                     self.memory.store(
                         pattern_snippet=source[:500],
                         verified_fix=port_result.get("ported_code", "")[:500],
-                        confidence=0.70,  # lower confidence — unverified
+                        confidence=0.0,
                         verification_run_id="template_unverified",
                         llm_time_s=port_result.get("llm_time_s", 0.0),
-                        findings=cr.get("findings", [])
+                        findings=cr.get("findings", []),
+                        verified=False,
                     )
                     self.disp.status("Verifying", f"{Path(cr['file']).name} {yellow('stored (unverified — no GPU)')}", ok=False)
                 else:
@@ -511,18 +584,21 @@ class KernelOlympics:
                     best_iter = port_result.get("best_attempt_iteration", 0)
                     if best_code:
                         best_confidence = port_result.get("best_attempt_confidence", 0.15)
+                        # T0.4: quarantined (verified=False) — kept so a re-run can
+                        # resume from the closest attempt, but NEVER served on a hit.
                         self.memory.store(
                             pattern_snippet=source[:500],
                             verified_fix=best_code[:500],
                             confidence=best_confidence,
                             verification_run_id=f"best_attempt_iter_{best_iter}",
                             llm_time_s=port_result.get("llm_time_s", 0.0),
-                            findings=cr.get("findings", [])
+                            findings=cr.get("findings", []),
+                            verified=False,
                         )
-                        print(f"║  {'📦 Cached best attempt (iter ' + str(best_iter) + ') @ ' + str(best_confidence*100) + '% confidence':<64}║")
+                        print(f"║  {'📦 Quarantined best attempt (iter ' + str(best_iter) + ') — resume only, not served':<64}║")
                     else:
-                        # No best-attempt code either — still cache the ported_code
-                        # with a token confidence so re-runs have a starting point.
+                        # No best-attempt code either — quarantine the ported_code so a
+                        # re-run has a starting point. Still verified=False (unserved).
                         fallback_code = port_result.get("ported_code", "")
                         if fallback_code:
                             self.memory.store(
@@ -531,13 +607,19 @@ class KernelOlympics:
                                 confidence=0.10,
                                 verification_run_id="best_attempt_fallback",
                                 llm_time_s=port_result.get("llm_time_s", 0.0),
-                                findings=cr.get("findings", [])
+                                findings=cr.get("findings", []),
+                                verified=False,
                             )
-                            print(f"║  {'📦 Cached fallback code @ 10% confidence (no compile success)':<64}║")
+                            print(f"║  {'📦 Quarantined fallback code — resume only, not served on hits':<64}║")
             else:
                 self.disp.file_done(Path(cr['file']).name, f"{cr.get('risk_level')} — no porting needed", ok=True)
 
-        pipeline_state["patterns_after"] = self.memory.count()
+        # T0.5: "stored" counts verified patterns only; quarantined unverified
+        # attempts are reported separately, never as a win.
+        pipeline_state["patterns_after"] = self.memory.count(verified_only=True)
+        pipeline_state["patterns_quarantined"] = (
+            self.memory.count() - self.memory.count(verified_only=True)
+        )
 
         # Phase 6: Report Generator
         self.disp.divider()
@@ -550,6 +632,12 @@ class KernelOlympics:
             hours_per_fix=4.0
         )
         report["pipeline_state"] = pipeline_state
+
+        # T0.3: a single honest verdict for the whole run (see compute_run_verdict).
+        verdict, exit_fail = compute_run_verdict(verification_results)
+        report["result"] = verdict
+        pipeline_state["result"] = verdict
+        pipeline_state["exit_fail"] = exit_fail
         self.disp.status("Report", "Generated", ok=True)
 
         # Final display
@@ -849,6 +937,11 @@ def main():
     with open(output_path, 'w', encoding="utf-8") as f:
         json.dump(report, f, indent=2, default=str)
     print(f"Report saved to: {output_path}")
+
+    # T0.3: exit non-zero when a real port failed verification, so CI and
+    # scripts can detect it. "no GPU" / "no ports needed" are not failures.
+    if report.get("pipeline_state", {}).get("exit_fail"):
+        return 1
 
 
 def run_demo(reset: bool = False):
