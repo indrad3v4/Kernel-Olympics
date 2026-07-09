@@ -1302,16 +1302,34 @@ class ModelRouter:
     def _build_glm_error_analysis_prompt(self, ported_code: str,
                                          compile_errors: List[str],
                                          iteration: int,
-                                         patterns: List[Dict]) -> str:
+                                         patterns: List[Dict],
+                                         error_delta: int = 0,
+                                         stagnation_count: int = 0) -> str:
         """Build GLM prompt for compile-error analysis (TRIZ #28).
 
         When hipcc fails, GLM analyzes the compile errors + code and tells
         Kimi WHAT to fix structurally — not just "error: undefined hipMalloc"
         but "you forgot #include <hip/hip_runtime.h>, that's why hipMalloc is undefined."
 
-        This is the lightweight error-analyst mode, not full semantic evaluation.
+        error_delta: prev - current (positive = improvement, negative = regression).
+        stagnation_count: how many consecutive iterations without improvement.
+        Both are derived from normalized error sets for stable tracking.
         """
         err_text = "\n".join(compile_errors[:10])
+
+        regression_hint = ""
+        if error_delta < 0:
+            regression_hint = (
+                f"\n\n⚠️ REGRESSION: The error count INCREASED by {abs(error_delta)}\n"
+                f"since the last iteration. Your previous recommendation(s) may have made\n"
+                f"things worse. Re-examine ALL errors — do NOT repeat the same fixes.\n"
+                f"The root cause may be different from what the error messages suggest.\n"
+            )
+        elif stagnation_count >= 2:
+            regression_hint = (
+                f"\n\n⚠️ STAGNATION: {stagnation_count} iterations without improvement.\n"
+                f"The current approach is not working. Try a COMPLETELY different strategy.\n"
+            )
 
         prompt = (
             f"You are a HIP/ROCm compile error analyst. Kimi generated code that fails to compile.\n"
@@ -1336,6 +1354,7 @@ class ModelRouter:
             "error references something that does NOT appear in that code block, do not\n"
             "invent a plausible-sounding root cause for it — set that fix's root_cause to\n"
             "\"NOT FOUND IN PROVIDED CODE\" and exact_fix to \"unknown\" instead of guessing.\n\n"
+            f"{regression_hint}"
             'Respond with JSON: {"fixes": [{"error": str, "root_cause": str, '
             '"exact_fix": str, "priority": int}], "summary": str, '
             '"missing_includes": [str], "wrong_apis": [{"cuda": str, "hip": str}]}.'
@@ -1798,7 +1817,8 @@ class ModelRouter:
                             f"analyzing compile errors for Kimi (iter {iteration})")
                         print(f"║  │  🔍 GLM analyzing {len(compile_errs)} compile errors for Kimi{'':<30}║")
                         glm_err_prompt = self._build_glm_error_analysis_prompt(
-                            result["ported_code"], compile_errs, iteration, patterns)
+                            result["ported_code"], compile_errs, iteration, patterns,
+                            error_delta=error_delta, stagnation_count=stagnation_count)
                         glm_err = self._call_model(
                             "glm", glm_err_prompt,
                             system_prompt="You are a HIP/ROCm compile error analyst. Respond ONLY with JSON.",
