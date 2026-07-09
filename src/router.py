@@ -2379,6 +2379,23 @@ class ModelRouter:
         result["compile_passed"] = compile_passed
         result["prompt_versions"] = opt.get_stats()  # TRIZ #15/#23: prompt evolution summary
 
+        # ── TRIZ #20 (Continuation): explicit handling for natural end of loop ──
+        # Before this block, the for-loop exited because range() ended. If compile
+        # never passed AND no abort_reason was set, that's the "limit cycle hits the
+        # ceiling, return stale code" failure mode. Make it visible: set the reason
+        # and print the line so the UI shows the loop didn't bail silently.
+        if not compile_passed and "abort_reason" not in result:
+            result["abort_reason"] = "max_iterations_exhausted"
+            result["iterations_used"] = iteration
+            result["changes"].append(
+                f"[hipcc] Loop exhausted max_iterations={max_iterations} "
+                f"without compile pass — returning best_attempt as fallback."
+            )
+            print(f"║  │  ⏱ MAX ITERATIONS REACHED ({max_iterations}) "
+                  f"— returning best attempt{'':<12}║")
+            print(f"║  │  💡 To force more loops: increase --iter or "
+                  f"fix the underlying strategy{'':<4}║")
+
         # ── Phase 4: Gemma 4 final verification ──
         if result["ported_code"]:
             if on_phase: on_phase("verify", "Gemma 4", "final verification")

@@ -261,14 +261,18 @@ class KernelOlympics:
                     except Exception:
                         pass
                     verifier_name = "Gemma 4(AMD)" if gemma_online else "DeepSeek V4 Pro(Gemma fallback)"
-                    self.disp.status("Porting", "DeepSeek-v4-pro (plan) → Kimi K2.7 (code) → GLM-5.2 (evaluate) ⟲ loop")
+                    self.disp.status("Porting", "DeepSeek-v4-pro (plan) → Kimi K2.7 (code) → GLM-5.2 (evaluate) ⟲ loop till compile")
                     t0 = time.perf_counter()
 
                     # Live progress: phase callback only (no spinner thread)
-                    import threading
-                    _phase_state = {"phase": None, "model": "", "detail": "", "phase_t0": t0}
+                    _phase_state = {"phase": None, "model": "", "detail": "", "phase_t0": t0,
+                                    "iteration": 0, "max_iter": 10}
 
                     def _on_phase(phase, model, detail):
+                        # Track iteration when phase="code" or "refine" sets it
+                        if phase == "code" or phase == "refine":
+                            # Detail now contains "iter N/M" set by router
+                            _phase_state["iteration"] = 1 if phase == "code" else 0
                         # Close out previous phase with its duration
                         if _phase_state["phase"] is not None:
                             prev_dur = time.perf_counter() - _phase_state["phase_t0"]
@@ -283,7 +287,8 @@ class KernelOlympics:
                         _phase_state["detail"] = detail
 
                     icons = {"plan": "🧠", "code": "⚡", "evaluate": "🔬",
-                             "refine": "🔁", "verify": "✅", "compile": "🔨"}
+                             "refine": "🔁", "verify": "✅", "compile": "🔨",
+                             "analyze": "🔍", "replan": "🔄"}
 
                     port_result = self.router.route(
                         source, cr.get("findings", []),
