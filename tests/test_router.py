@@ -419,3 +419,48 @@ class TestFixPortedCodeHelperShims:
         once = router._fix_ported_code(code)
         twice = router._fix_ported_code(once)
         assert twice.count("struct StopWatchInterface") == 1
+
+    def test_shim_compiles_standalone_hipSetDevice_declared_before_use(self, router):
+        """Regression for the 2026-07-09 notebook run (col-56 errors).
+
+        403601d moved the shim BEFORE the code's first #include so its
+        symbols are declared before use — but the shim's findCudaDevice body
+        calls hipSetDevice, declared only in hip/hip_runtime.h, which then
+        comes AFTER the shim. Every self-contained port failed with
+        'use of undeclared identifier' at the exact column of hipSetDevice
+        (56), re-injected on every refine iteration. The shim must be
+        position-independent: it includes hip/hip_runtime.h itself.
+        """
+        # NVIDIA samples open with a long copyright banner before includes.
+        code = (
+            "/*\n * Copyright NVIDIA...\n */\n"
+            "#include <hip/hip_runtime.h>\n"
+            "__global__ void k(int* d) {}\n"
+            "int main() { findCudaDevice(0, nullptr); return 0; }\n"
+        )
+        fixed = router._fix_ported_code(code)
+        use_pos = fixed.find("hipSetDevice")
+        assert use_pos != -1
+        decl_pos = fixed.find("#include <hip/hip_runtime.h>")
+        assert decl_pos != -1 and decl_pos < use_pos, (
+            "shim calls hipSetDevice before any hip/hip_runtime.h include — "
+            "this is the 'use of undeclared identifier' at col 56")
+        assert "#pragma once" not in fixed  # meaningless in a main file; clang warns
+
+    def test_warpSize_substitution_must_not_corrupt_define(self, router):
+        """Regression for the 2026-07-09 notebook run (29:9 macro error).
+
+        Kimi plausibly emits '#define warpSize 64'; the blanket
+        warpSize→64 regex turned it into '#define 64 64' →
+        'error: macro name must be an identifier' at col 9.
+        """
+        code = (
+            "#include <hip/hip_runtime.h>\n"
+            "#define warpSize 64\n"
+            "__global__ void k(int* d) { int lane = threadIdx.x % warpSize; }\n"
+        )
+        fixed = router._fix_ported_code(code)
+        assert "#define 64" not in fixed
+        # The non-define use should still be substituted (or resolve to 64
+        # via the surviving macro) — either way, no corrupted macro name.
+        assert "macro" not in fixed  # sanity: no error text leaked in
