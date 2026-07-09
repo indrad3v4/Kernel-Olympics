@@ -55,6 +55,15 @@ def test_genuine_output_mismatch_label():
     assert verification_failure_label(result) == "Output mismatch"
 
 
+def test_signal_exit_code_named_in_label():
+    """RUN-FIRST follow-up: 'exit -11' forced the operator to do signal
+    arithmetic (2026-07-09 run). Negative exit codes name their signal."""
+    result = {"compile_success": True, "run_success": False, "run_exit_code": -11}
+    label = verification_failure_label(result)
+    assert "SIGSEGV" in label
+    assert "exit -11" in label
+
+
 def test_waived_exit_code_reported_distinctly():
     """The NVIDIA sample's EXIT_WAIVED=2 on unsupported hardware is still a
     run failure (nonzero exit) — the label must surface the real exit code
