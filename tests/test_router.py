@@ -164,9 +164,13 @@ class TestConvergenceLoop:
             AgentResult("gemma4", True, '{"pass": true}', 0.1),
         ]
         mock_verifier = MagicMock()
-        mock_verifier.quick_compile_check.return_value = {
-            "compile_success": True, "errors": [], "output": ""
-        }
+        # First: hipify preprocessor fails → falls through to LLM pipeline
+        mock_verifier.quick_compile_check.side_effect = [
+            {"compile_success": False, "errors": ["hipify not enough"], "output": "",
+             "error_context": []},  # hipify preprocessor check
+            {"compile_success": True, "errors": [], "output": ""},   # pre-loop pass
+            {"compile_success": True, "errors": [], "output": ""},   # iter1 pass
+        ]
         mock_verifier.verify.return_value = {
             "compile_success": True, "passed": True,
             "compile_output": "", "output": ""
@@ -210,8 +214,10 @@ class TestConvergenceLoop:
         mock_call.side_effect = call_side_effect
 
         mock_verifier = MagicMock()
-        # [pre-loop] compile fail → [loop iter1] compile fail → [loop iter1 refine] pass → enough passes
+        # [hipify] fail → [pre-loop] compile fail → [loop iter1] compile fail → [loop iter1 refine] pass → enough passes
         mock_verifier.quick_compile_check.side_effect = [
+            {"compile_success": False, "errors": ["hipify not enough"], "output": "",
+             "error_context": []},  # hipify preprocessor check (new)
             {"compile_success": False, "errors": ["error: use of undeclared identifier 'cudaMalloc'"], "output": ""},
             {"compile_success": False, "errors": ["error: use of undeclared identifier 'cudaMalloc'"], "output": ""},
             {"compile_success": True, "errors": [], "output": ""},
@@ -267,8 +273,10 @@ class TestConvergenceLoop:
         mock_call.side_effect = call_side_effect
 
         mock_verifier = MagicMock()
-        # [pre-loop] fail + [loop iter1] fail + [loop iter2] fail + [loop iter3] fail + pass for after re-plan
+        # [hipify] fail → [pre-loop] fail → [loop iter1] fail + [loop iter2] fail + [loop iter3] fail + pass for after re-plan
         mock_verifier.quick_compile_check.side_effect = [
+            {"compile_success": False, "errors": ["hipify not enough"], "output": "",
+             "error_context": []},  # hipify preprocessor check (new)
             {"compile_success": False, "errors": ["error: cudaMalloc undeclared"], "output": ""},
             {"compile_success": False, "errors": ["error: cudaMalloc undeclared"], "output": ""},
             {"compile_success": False, "errors": ["error: cudaMalloc undeclared"], "output": ""},
@@ -320,9 +328,14 @@ class TestRunFirstLoop:
         not break — then converge once the binary runs clean."""
         mock_call.side_effect = self._call_side_effect
         mock_verifier = MagicMock()
-        mock_verifier.quick_compile_check.return_value = {
-            "compile_success": True, "errors": [], "output": ""
-        }
+        # First: hipify preprocessor fails → falls through to LLM pipeline
+        mock_verifier.quick_compile_check.side_effect = [
+            {"compile_success": False, "errors": ["hipify not enough"], "output": "",
+             "error_context": []},  # hipify preprocessor check
+            {"compile_success": True, "errors": [], "output": ""},   # pre-loop pass
+            {"compile_success": True, "errors": [], "output": ""},   # iter1 pass
+            {"compile_success": True, "errors": [], "output": ""},   # iter2 pass (GLM eval)
+        ]
         mock_verifier.quick_run_check.side_effect = [
             {"run_success": False, "run_exit_code": -11, "signal": "SIGSEGV", "run_output": ""},
             {"run_success": True, "run_exit_code": 0, "signal": "", "run_output": "TEST PASSED"},
@@ -344,9 +357,15 @@ class TestRunFirstLoop:
         the full iteration budget."""
         mock_call.side_effect = self._call_side_effect
         mock_verifier = MagicMock()
-        mock_verifier.quick_compile_check.return_value = {
-            "compile_success": True, "errors": [], "output": ""
-        }
+        # First: hipify preprocessor fails → falls through to LLM pipeline
+        mock_verifier.quick_compile_check.side_effect = [
+            {"compile_success": False, "errors": ["hipify not enough"], "output": "",
+             "error_context": []},  # hipify preprocessor check
+            {"compile_success": True, "errors": [], "output": ""},   # pre-loop pass
+            {"compile_success": True, "errors": [], "output": ""},   # iter1 pass
+            {"compile_success": True, "errors": [], "output": ""},   # iter2 pass
+            {"compile_success": True, "errors": [], "output": ""},   # iter3 pass
+        ]
         mock_verifier.quick_run_check.return_value = {
             "run_success": False, "run_exit_code": -11, "signal": "SIGSEGV", "run_output": ""
         }
@@ -365,9 +384,13 @@ class TestRunFirstLoop:
         preserving the old convergence behavior."""
         mock_call.side_effect = self._call_side_effect
         mock_verifier = MagicMock()
-        mock_verifier.quick_compile_check.return_value = {
-            "compile_success": True, "errors": [], "output": ""
-        }
+        # First: hipify preprocessor fails → falls through to LLM pipeline
+        mock_verifier.quick_compile_check.side_effect = [
+            {"compile_success": False, "errors": ["hipify not enough"], "output": "",
+             "error_context": []},  # hipify preprocessor check
+            {"compile_success": True, "errors": [], "output": ""},   # pre-loop pass
+            {"compile_success": True, "errors": [], "output": ""},   # iter1 pass
+        ]
         # quick_run_check left as bare MagicMock → returns MagicMock, not dict
         result = router.route(
             kernel_source=CUDA_KERNEL_EXAMPLE, patterns=[],

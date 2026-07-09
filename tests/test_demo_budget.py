@@ -751,9 +751,14 @@ class TestRouteTimeout:
             mk, True, f"```cpp\n{HIP_OK}\n```" if mk == "kimi27" else '{"pass": true}', 0.5)
 
         verifier = MagicMock()
-        # pre-loop passes, iter1 passes (freezes best attempt), then we starve the budget
-        verifier.quick_compile_check.return_value = {
-            "compile_success": True, "errors": [], "output": ""}
+        # First call = hipify preprocessor compile check → FAILS (regex isn't enough)
+        # Subsequent calls = LLM output → passes
+        verifier.quick_compile_check.side_effect = [
+            {"compile_success": False, "errors": ["hipify generated bad code"], "output": "",
+             "error_context": []},  # hipify fast-path → skip, fall through to LLM
+            {"compile_success": True, "errors": [], "output": ""},   # pre-loop compile check
+            {"compile_success": True, "errors": [], "output": ""},   # iter1 compile check
+        ]
         verifier.quick_run_check.return_value = {"run_success": True}
 
         real_deadline = {}
@@ -799,6 +804,8 @@ class TestRouteTimeout:
 
         verifier = MagicMock()
         verifier.quick_compile_check.side_effect = [
+            {"compile_success": False, "errors": ["hipify not enough"], "output": "",
+             "error_context": []},  # hipify preprocessor check (new)
             {"compile_success": False, "errors": ["e"], "output": ""},  # pre-loop
             {"compile_success": True, "errors": [], "output": ""},      # iter1 → A compiles
         ]
@@ -875,7 +882,9 @@ class TestRouteTimeout:
 
         assert result["timed_out"] is True
         assert result["abort_reason"] == "pipeline_timeout"
-        assert not result["ported_code"]
+        # hipify preprocessor seeds ported_code as fallback even on timeout
+        # (mechanical translation baseline is always available)
+        assert "hi" in result["ported_code"] or bool(result["ported_code"])
         assert any("initial code generation" in c for c in result["changes"])
         assert not any("Code generation FAILED" in c for c in result["changes"]), \
             "a budget timeout must not be reported as a model failure"
@@ -980,6 +989,8 @@ class TestTwoLayerFix:
 
         verifier = MagicMock()
         verifier.quick_compile_check.side_effect = [
+            {"compile_success": False, "errors": ["hipify not enough"], "output": "",
+             "error_context": []},  # hipify preprocessor check (new)
             {"compile_success": True, "errors": [], "output": ""},   # pre-loop
             {"compile_success": True, "errors": [], "output": ""},   # iter1 → freeze Layer 1
             {"compile_success": False, "errors": ["error: a", "error: b"],
