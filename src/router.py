@@ -836,6 +836,16 @@ class ModelRouter:
                         f"(delta: {error_delta:+d}, new: {len(new_errors)}, "
                         f"resolved: {len(resolved_errors)})")
 
+                    # LIVE VISIBILITY: Print error details during loop, not after
+                    top_errs = compile_errs[:2] if compile_errs else ["(no error lines parsed)"]
+                    for err_line in top_errs:
+                        # Truncate and clean for terminal display
+                        clean = err_line.strip()[:60]
+                        if clean:
+                            print(f"║  │  ⚠ {clean:<58}║")
+                    trend = f"{'↓' if error_delta > 0 else '↑' if error_delta < 0 else '→'} {current_err_count} errs (Δ{error_delta:+d}, new:{len(new_errors)})"
+                    print(f"║  │  📊 {trend:<58}║")
+
                     # TRIZ #15: Detect stagnation — 3 iterations with no improvement
                     if error_delta <= 0:
                         stagnation_count += 1
@@ -847,6 +857,7 @@ class ModelRouter:
                         result["changes"].append(
                             f"[hipcc] Stagnation detected ({stagnation_count} iterations no improvement) "
                             f"— escalating to DeepSeek re-plan")
+                        print(f"║  │  🔄 STAGNATION: {stagnation_count} iters no improvement — re-planning{'':<24}║")
                         if on_phase: on_phase("plan", "DeepSeek-v4-pro",
                             f"re-planning due to stagnation (iter {iteration})")
                         re_plan = self._call_model(
