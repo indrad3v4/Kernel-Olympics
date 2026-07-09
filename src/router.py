@@ -642,7 +642,7 @@ class ModelRouter:
                 '#include <hip/hip_runtime.h>\n'
                 '#include <chrono>\n'
                 'struct StopWatchInterface { std::chrono::steady_clock::time_point start; double elapsed_ms = 0; };\n'
-                'static inline int findCudaDevice(int, const char **) { hipSetDevice(0); return 0; }\n'
+                'static inline int findCudaDevice(int, const char **) { (void)hipSetDevice(0); return 0; }\n'
                 'static inline void sdkCreateTimer(StopWatchInterface **t) { *t = new StopWatchInterface(); }\n'
                 'static inline void sdkStartTimer(StopWatchInterface **t) { (*t)->start = std::chrono::steady_clock::now(); }\n'
                 'static inline void sdkStopTimer(StopWatchInterface **t) {\n'
@@ -1682,6 +1682,7 @@ class ModelRouter:
         error_history = []  # TRIZ #17: cap error context to last 2 iterations
         norm_error_history = []  # A5: track normalized error frozensets for cycle detection
         replan_count = 0  # Bug 7: how many stagnation re-plans we've already used
+        runtime_crash_count = 0  # RUN-FIRST: consecutive compile-pass-but-crash iterations
         kimi_plateau_count = 0  # C1: count consecutive iterations with same error set after Kimi refine
         for iteration in range(1, max_iterations + 1):
             if not result["ported_code"]:
@@ -1691,6 +1692,7 @@ class ModelRouter:
             # TRIZ #13: Reverse the order — compile before evaluate.
             # If compile fails, compile errors ARE the feedback. Skip GLM entirely.
             compile_failed_this_iter = False
+            run_crashed_this_iter = False  # RUN-FIRST: set by the in-loop run check below
             if verifier and hasattr(verifier, 'quick_compile_check'):
                 if on_phase: on_phase("compile", "hipcc", f"compile-first check (attempt {iteration}/{max_iterations})")
                 cc = verifier.quick_compile_check(result["ported_code"], kernel_name=kernel_name)
@@ -1714,6 +1716,56 @@ class ModelRouter:
                         best_attempt_iteration = iteration
                         result["changes"].append(
                             f"[best-attempt] Saved iter {iteration} code as best attempt")
+
+                    # ── RUN-FIRST: compile-pass is not convergence — run the binary ──
+                    # The compile check just linked a real executable into the loop
+                    # build dir; running it costs ~1s and is the highest-authority
+                    # oracle available. The 2026-07-09 run declared victory here,
+                    # then verify() found a SIGSEGV with no feedback path back —
+                    # while GLM's semantic eval had ALREADY flagged the likely
+                    # cause (__shfl_up_sync width) and the loop discarded it.
+                    # isinstance guard: mocked verifiers in tests return MagicMock,
+                    # which must read as "no run info" (pass), not crash.
+                    if verifier and hasattr(verifier, 'quick_run_check'):
+                        rc = verifier.quick_run_check(kernel_name)
+                        if isinstance(rc, dict) and rc.get("run_success") is True:
+                            runtime_crash_count = 0  # consecutive-crash counter
+                            result["changes"].append(
+                                f"[run] Iter {iteration}: binary ran clean (exit 0)")
+                        if isinstance(rc, dict) and rc.get("run_success") is False:
+                            run_crashed_this_iter = True
+                            runtime_crash_count += 1
+                            sig = rc.get("signal") or f"exit {rc.get('run_exit_code')}"
+                            crash_output = (rc.get("run_output") or "").strip()
+                            result["changes"].append(
+                                f"[run] Iter {iteration}: compiled but CRASHED at runtime "
+                                f"({sig}) — crash {runtime_crash_count}/3")
+                            print(f"║  │  💥 RUNTIME CRASH: {sig} — compiled code is not working code{'':<8}║")
+                            # Feed the crash to GLM's semantic eval (Step 2 below
+                            # passes evaluator_feedback into the eval prompt) and,
+                            # through GLM's issues, to Kimi's refine.
+                            evaluator_feedback = (
+                                f"⚠️ RUNTIME CRASH (iteration {iteration}): the code COMPILED but the "
+                                f"binary crashed with {sig}.\n"
+                                + (f"Program output before crash:\n{crash_output[:500]}\n"
+                                   if crash_output else
+                                   "No output was captured — the process died before flushing stdout, "
+                                   "so the crash is likely early (host-side setup, first kernel launch, "
+                                   "or an out-of-bounds access in shared-memory indexing sized for "
+                                   "warp 32 vs wavefront 64).\n")
+                                + "Compilation is NOT the goal — a working binary is. Find the runtime "
+                                  "defect (common: __shfl width/mask semantics on wavefront64, shared "
+                                  "memory sized as blockDim/32 vs blockDim/64, out-of-bounds indexing, "
+                                  "ignored allocation failures) and fix it.\n"
+                            )
+                    if run_crashed_this_iter and runtime_crash_count >= 3:
+                        result["changes"].append(
+                            f"[run] 3 consecutive runtime crashes — aborting; keeping "
+                            f"best compiling attempt (iter {best_attempt_iteration})")
+                        print(f"║  │  🛑 ABORT: 3 runtime crashes — refinement is not converging{'':<12}║")
+                        result["iterations_used"] = iteration
+                        result["abort_reason"] = "runtime_stagnation"
+                        break
                 else:
                     compile_failed_this_iter = True
                     compile_errs = cc.get("errors", [])
@@ -2336,9 +2388,10 @@ class ModelRouter:
                     )
 
             # ── Step 3: Convergence check ───────────────────────────────────
-            # Converged when: compile passed AND GLM passed (or no GLM needed).
-            # If compile passed and GLM says pass → done!
-            if parsed is not None and parsed.get("pass", False):
+            # Converged when: compile passed AND the binary RAN AND GLM passed.
+            # RUN-FIRST: a compile-pass + GLM-pass on a binary that SIGSEGVs is
+            # not convergence — the 2026-07-09 run shipped exactly that.
+            if parsed is not None and parsed.get("pass", False) and not run_crashed_this_iter:
                 verify_success = True
                 verify_passed = True
                 result["changes"].append(
@@ -2346,7 +2399,7 @@ class ModelRouter:
                 # Compile already passed (we only ran GLM because it did),
                 # or there's no verifier (GLM pass is sufficient in that case).
                 result["orchestrator_passed"] = True
-                break  # Truly converged — compile + GLM both passed
+                break  # Truly converged — compile + run + GLM all passed
 
             # ── Step 4: Kimi refines with whatever feedback we have ──────────
             # If compile failed → feedback = compile errors (set in Step 1)
@@ -2362,21 +2415,49 @@ class ModelRouter:
                         f"{' | '.join(issues[:3])}")
 
             # ── TRIZ #20 (Continuation): Only refine when compile FAILED ──
-            # If compile passed but GLM found semantic issues, LOG them
-            # but do NOT refine — refinement always regresses working code
-            # (proven: iter1 compile pass → GLM feedback → iter2 = 6 errors).
-            # The working binary is the goal; semantic issues are tracked.
-            if not compile_failed_this_iter and parsed is not None:
+            # If compile passed, the binary RAN, and GLM found only semantic
+            # issues — LOG them but do NOT refine: a running binary is the
+            # goal, and refining working code risks regression.
+            #
+            # CAVEAT on the old "proven: refine always regresses" claim: that
+            # proof came from the run where _fix_ported_code was CORRUPTING
+            # every refinement (shim before hip include, #define 64 64) —
+            # the regression was the fixer's, not refinement's. The policy
+            # survives, but only for code that actually RUNS.
+            #
+            # RUN-FIRST exception: if the binary crashed, this is NOT working
+            # code — GLM's semantic findings (which flagged __shfl_up_sync
+            # width before the 2026-07-09 segfault, and were discarded here)
+            # plus the crash info become the refine feedback instead.
+            if not compile_failed_this_iter and parsed is not None and not run_crashed_this_iter:
                 if not parsed.get("pass", False):
                     result["changes"].append(
                         f"[glm] Iteration {iteration}: semantic issues found but "
-                        f"compile passed — keeping working code, not refining")
-                # Break: compiled + GLM ran = done. Don't refine.
+                        f"compile passed and binary ran — keeping working code, not refining")
+                # Break: compiled + ran + GLM ran = done. Don't refine.
                 break
+
+            # Runtime crash: merge GLM's semantic findings into the crash
+            # feedback so Kimi refines against BOTH signals.
+            if run_crashed_this_iter and parsed is not None:
+                glm_issues = parsed.get("issues", [])
+                glm_fb = parsed.get("feedback", "")
+                if glm_issues or glm_fb:
+                    evaluator_feedback += (
+                        "\nGLM SEMANTIC FINDINGS on the crashing code (treat these as "
+                        "likely crash causes):\n"
+                        + "\n".join(f"- {i}" for i in glm_issues[:5])
+                        + (f"\n{glm_fb[:400]}" if glm_fb else "")
+                    )
 
             if iteration < max_iterations:
                 # Loop back: Kimi refines with feedback
-                feedback_label = "compile errors" if compile_failed_this_iter else "GLM feedback"
+                if compile_failed_this_iter:
+                    feedback_label = "compile errors"
+                elif run_crashed_this_iter:
+                    feedback_label = "runtime crash + GLM findings"
+                else:
+                    feedback_label = "GLM feedback"
                 if on_phase: on_phase("refine", "Kimi K2.7", f"refining with {feedback_label} (iter {iteration}→{iteration+1})")
                 # TRIZ #15: Evolve prompt based on compile error patterns
                 evolved = opt.evolve_prompt(result.get("compile_errors", []))

@@ -295,6 +295,88 @@ class TestConvergenceLoop:
         assert ds_call_count[0] >= 2, f"DeepSeek called {ds_call_count[0]} times, expected >=2"
 
 
+# ── RUN-FIRST: compile-pass is not convergence — the binary must also run ─────
+
+class TestRunFirstLoop:
+    """The 2026-07-09 run compiled on iteration 1, GLM flagged the likely
+    crash cause, the loop discarded the finding and declared victory — then
+    the binary SIGSEGVed in verify() with no feedback path back. The loop
+    now runs the binary in-loop after every passing compile."""
+
+    @staticmethod
+    def _call_side_effect(model_key, *args, **kwargs):
+        if model_key == "deepseek":
+            return AgentResult("deepseek", True, "Plan: port shfl", 0.1)
+        if model_key == "kimi27":
+            return AgentResult("kimi27", True, f"```cpp\n{HIP_CODE_OK}\n```", 0.1)
+        if model_key == "glm":
+            return AgentResult("glm", True,
+                '{"pass": true, "issues": ["__shfl_up_sync uses width as width param"], "feedback": "check shfl width"}', 0.1)
+        return AgentResult(model_key, True, '{"pass": true}', 0.1)
+
+    @patch.object(ModelRouter, '_call_model')
+    def test_runtime_crash_triggers_refine_not_convergence(self, mock_call, router):
+        """Compile passes but the binary SIGSEGVs → the loop must refine,
+        not break — then converge once the binary runs clean."""
+        mock_call.side_effect = self._call_side_effect
+        mock_verifier = MagicMock()
+        mock_verifier.quick_compile_check.return_value = {
+            "compile_success": True, "errors": [], "output": ""
+        }
+        mock_verifier.quick_run_check.side_effect = [
+            {"run_success": False, "run_exit_code": -11, "signal": "SIGSEGV", "run_output": ""},
+            {"run_success": True, "run_exit_code": 0, "signal": "", "run_output": "TEST PASSED"},
+        ]
+        result = router.route(
+            kernel_source=CUDA_KERNEL_EXAMPLE, patterns=[],
+            max_iterations=3, verifier=mock_verifier, kernel_name="test_runfirst",
+        )
+        assert result["orchestrator_passed"] is True
+        assert result["iterations_used"] == 2, (
+            "loop must NOT declare convergence on the crashing iteration")
+        crash_entries = [c for c in result["changes"] if "CRASHED at runtime" in c]
+        assert crash_entries, "the crash must be recorded in the changes log"
+        assert "SIGSEGV" in crash_entries[0]
+
+    @patch.object(ModelRouter, '_call_model')
+    def test_three_runtime_crashes_abort(self, mock_call, router):
+        """Persistent crashes must abort with runtime_stagnation, not burn
+        the full iteration budget."""
+        mock_call.side_effect = self._call_side_effect
+        mock_verifier = MagicMock()
+        mock_verifier.quick_compile_check.return_value = {
+            "compile_success": True, "errors": [], "output": ""
+        }
+        mock_verifier.quick_run_check.return_value = {
+            "run_success": False, "run_exit_code": -11, "signal": "SIGSEGV", "run_output": ""
+        }
+        result = router.route(
+            kernel_source=CUDA_KERNEL_EXAMPLE, patterns=[],
+            max_iterations=10, verifier=mock_verifier, kernel_name="test_runcrash",
+        )
+        assert result["abort_reason"] == "runtime_stagnation"
+        assert result["orchestrator_passed"] is False
+        assert result["iterations_used"] <= 3
+
+    @patch.object(ModelRouter, '_call_model')
+    def test_mock_verifier_without_run_info_still_converges(self, mock_call, router):
+        """A verifier whose quick_run_check returns a non-dict (MagicMock in
+        every pre-existing test) must read as 'no run info', not a crash —
+        preserving the old convergence behavior."""
+        mock_call.side_effect = self._call_side_effect
+        mock_verifier = MagicMock()
+        mock_verifier.quick_compile_check.return_value = {
+            "compile_success": True, "errors": [], "output": ""
+        }
+        # quick_run_check left as bare MagicMock → returns MagicMock, not dict
+        result = router.route(
+            kernel_source=CUDA_KERNEL_EXAMPLE, patterns=[],
+            max_iterations=2, verifier=mock_verifier, kernel_name="test_norun",
+        )
+        assert result["orchestrator_passed"] is True
+        assert result["iterations_used"] == 1
+
+
 # ── Bug 1: self-contained programs must not be truncated ──────────────────────
 
 SELF_CONTAINED_SOURCE = """
@@ -446,6 +528,10 @@ class TestFixPortedCodeHelperShims:
             "shim calls hipSetDevice before any hip/hip_runtime.h include — "
             "this is the 'use of undeclared identifier' at col 56")
         assert "#pragma once" not in fixed  # meaningless in a main file; clang warns
+        # hipSetDevice is nodiscard — our own injected code must be
+        # warning-clean, or its warnings get displayed under unrelated
+        # failures (2026-07-09: shown beneath a SIGSEGV header).
+        assert "(void)hipSetDevice" in fixed
 
     def test_warpSize_substitution_must_not_corrupt_define(self, router):
         """Regression for the 2026-07-09 notebook run (29:9 macro error).

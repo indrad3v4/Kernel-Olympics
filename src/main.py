@@ -76,6 +76,16 @@ def verification_failure_label(ver_result: dict) -> str:
     if not ver_result.get("run_success"):
         exit_code = ver_result.get("run_exit_code")
         if exit_code is not None:
+            # Negative returncode = killed by signal; name it. 'exit -11'
+            # makes the operator do signal arithmetic; 'SIGSEGV' is the
+            # actionable spelling (2026-07-09 run displayed the raw number).
+            if exit_code < 0:
+                import signal as _signal
+                try:
+                    sig = _signal.Signals(-exit_code).name
+                except (ValueError, AttributeError):
+                    sig = f"signal {-exit_code}"
+                return f"Compiled, but crashed at runtime ({sig}, exit {exit_code})"
             return f"Compiled, but crashed at runtime (exit {exit_code})"
         return "Compiled, but failed to run"
     return "Output mismatch"
@@ -456,13 +466,19 @@ class KernelOlympics:
                 else:
                     reason = verification_failure_label(ver_result)
                     self.disp.status("Verifying", f"{Path(cr['file']).name} {yellow(reason)}", ok=False)
-                    # Show compile errors or hipcc status.
+                    # Show compile errors — but ONLY when compilation is what
+                    # failed. The old unconditional block fell back to
+                    # `or all_lines` and printed compile WARNINGS under a
+                    # runtime-crash header (2026-07-09: the shim's benign
+                    # 'ignoring return value' warning was displayed as if it
+                    # explained a SIGSEGV).
                     # verifier._compile() already strips the temp build-dir prefix from
                     # every line, so a naive line[:N] truncation no longer eats the
                     # path instead of the message — but prioritize actual "error:"
                     # lines over the first 3 raw lines (which used to be path/caret noise).
                     compile_output = ver_result.get("compile_output", "")
-                    if compile_output and "hipcc not found" not in compile_output:
+                    if (not ver_result.get("compile_success")
+                            and compile_output and "hipcc not found" not in compile_output):
                         all_lines = compile_output.strip().splitlines()
                         error_lines = [l for l in all_lines if "error:" in l] or all_lines
                         for line in error_lines[:3]:
@@ -481,6 +497,12 @@ class KernelOlympics:
                         if run_output:
                             for line in run_output.strip().splitlines()[:5]:
                                 print(f"║  ⚠️  {red(line[:65]):<64}║")
+                        else:
+                            # A crashed child loses its buffered stdout — an empty
+                            # capture is itself a diagnostic: the crash happened
+                            # before the first flush (early host-side setup or
+                            # first kernel launch).
+                            print(f"║  ⚠️  {'(no output captured — crashed before stdout flush; early crash)':<64}║")
                     # S3: Cache best-attempt code even when verification fails, so
                     # re-runs can rebuild from the closest-working version instead
                     # of starting from scratch (which costs ~10 min per kernel).
