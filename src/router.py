@@ -67,7 +67,7 @@ MODEL_CATALOG = {
         "strength": "code generation, struct-aware HIP porting",
         "cost_per_1k": 0.00095,
         "local_first": False,
-        "max_tokens": 4096,      # coder needs room for full kernel output
+        "max_tokens": 8192,      # coder needs room for full kernel + JSON wrapper
         "temperature": 0.1,      # code generation needs precision
     },
     "glm": {
@@ -220,21 +220,85 @@ class ModelRouter:
 
     @staticmethod
     def _extract_code(text: str) -> str:
-        """Extract code from LLM output (may include markdown or explanation)."""
-        import re
-        # Try to extract code from markdown code blocks
-        blocks = re.findall(r'```(?:cuda|hip|cpp|python)?\n(.*?)```', text, re.DOTALL)
+        """Extract HIP/C++ code from LLM output.
+
+        Priority:
+          1. JSON {\"ported_code\": \"...\"} — Kimi's expected response format
+          2. Markdown code blocks ```hip/cpp/cuda ... ```
+          3. Raw code starting from #include or __global__
+          4. Fallback: return as-is
+        """
+        import re as _re
+
+        # ── Strategy 1: Parse JSON response (Kimi's expected format) ──
+        # Kimi returns: {"ported_code": "...", "confidence": 80, ...}
+        # The ported_code field contains the actual HIP source.
+        raw = text.strip()
+
+        # 1a: Direct JSON parse
+        if raw.startswith("{"):
+            try:
+                obj = json.loads(raw)
+                if isinstance(obj, dict) and "ported_code" in obj:
+                    return obj["ported_code"].strip()
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # 1b: JSON inside ```json ... ``` block
+        json_block = _re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, _re.DOTALL)
+        if json_block:
+            try:
+                obj = json.loads(json_block.group(1))
+                if isinstance(obj, dict) and "ported_code" in obj:
+                    return obj["ported_code"].strip()
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        # 1c: Find {"ported_code": "..."} anywhere (balanced brace extraction)
+        ported_match = _re.search(r'"ported_code"\s*:\s*"', raw)
+        if ported_match:
+            # Extract the string value with proper escape handling
+            start = ported_match.end()
+            result_chars = []
+            i = start
+            while i < len(raw):
+                if raw[i] == '\\' and i + 1 < len(raw):
+                    next_ch = raw[i + 1]
+                    if next_ch == 'n':
+                        result_chars.append('\n')
+                    elif next_ch == 't':
+                        result_chars.append('\t')
+                    elif next_ch == '"':
+                        result_chars.append('"')
+                    elif next_ch == '\\':
+                        result_chars.append('\\')
+                    else:
+                        result_chars.append(next_ch)
+                    i += 2
+                elif raw[i] == '"':
+                    break  # end of string value
+                else:
+                    result_chars.append(raw[i])
+                    i += 1
+            extracted = ''.join(result_chars).strip()
+            if len(extracted) > 20:  # sanity check
+                return extracted
+
+        # ── Strategy 2: Markdown code blocks ──
+        blocks = _re.findall(r'```(?:cuda|hip|cpp|python)?\n(.*?)```', text, _re.DOTALL)
         if blocks:
-            return blocks[0].strip()
-        # Try to extract from __global__ to end
-        match = re.search(r'__global__\s+void.*', text, re.DOTALL)
+            # Return the largest block (most likely the full kernel)
+            return max(blocks, key=len).strip()
+
+        # ── Strategy 3: Raw code from #include or __global__ ──
+        match = _re.search(r'#include.*', text, _re.DOTALL)
         if match:
             return match.group(0).strip()
-        # Try to extract from #include
-        match = re.search(r'#include.*', text, re.DOTALL)
+        match = _re.search(r'__global__\s+void.*', text, _re.DOTALL)
         if match:
             return match.group(0).strip()
-        # Fallback: return as-is (might be code without markers)
+
+        # ── Strategy 4: Fallback ──
         return text.strip()
 
     @staticmethod
@@ -480,7 +544,10 @@ class ModelRouter:
         prompt += (
             f"```cuda\n{kernel_source[:6000]}\n```\n\n"
             "Respond with JSON: {\"ported_code\": str, \"confidence\": 0-100, "
-            "\"changes\": [str], \"explanation\": str}."
+            "\"changes\": [str], \"explanation\": str}.\n"
+            "IMPORTANT: The ported_code field must contain the COMPLETE HIP kernel source. "
+            "If the kernel is large, minimize explanation to save tokens. "
+            "Prefer full code over partial code with verbose explanation."
         )
         return prompt
 
@@ -652,12 +719,26 @@ class ModelRouter:
                     result["compile_errors"].extend(compile_errs)
                     err_summary = "; ".join(compile_errs[:3]) if compile_errs else cc["compile_output"][:300]
                     result["changes"].append(f"[hipcc] In-loop compile FAILED: {err_summary[:120]}")
+                    # Check if the code was truncated
+                    is_truncated = "TRUNCATED" in extracted
+                    if is_truncated:
+                        result["changes"].append("[kimi27] Output was TRUNCATED — requesting shorter response")
                     # Feed compile errors to GLM evaluator as additional feedback
-                    evaluator_feedback = (
-                        f"REAL COMPILER ERRORS (hipcc) — fix these FIRST:\n"
-                        + "\n".join(compile_errs[:5] if compile_errs else [cc["compile_output"][:500]])
-                        + "\n\nAlso address any static analysis issues below."
-                    )
+                    if is_truncated:
+                        evaluator_feedback = (
+                            "CRITICAL: Your previous response was TRUNCATED (hit token limit). "
+                            "Output ONLY the ported HIP code in a ```hip block. "
+                            "No JSON wrapper, no explanation, no comments. "
+                            "Just the raw C++ code with all CUDA→HIP replacements applied.\n\n"
+                            f"REAL COMPILER ERRORS (hipcc) — fix these FIRST:\n"
+                            + "\n".join(compile_errs[:5] if compile_errs else [cc["compile_output"][:500]])
+                        )
+                    else:
+                        evaluator_feedback = (
+                            f"REAL COMPILER ERRORS (hipcc) — fix these FIRST:\n"
+                            + "\n".join(compile_errs[:5] if compile_errs else [cc["compile_output"][:500]])
+                            + "\n\nAlso address any static analysis issues below."
+                        )
 
             result["changes"].append("[kimi27] Generated ported kernel")
             result["model_used"] = "kimi27"
@@ -952,11 +1033,15 @@ class ModelRouter:
                                                   "raw_response": raw_preview[:200]})
                             continue
                         content = data["choices"][0]["message"]["content"]
+                        finish_reason = data["choices"][0].get("finish_reason", "")
                         usage = data.get("usage", {})
                         tokens = (
                             usage.get("total_tokens", 0)
                             or usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
                         )
+                        # Truncation detection: if finish_reason is "length", the output was cut off
+                        if finish_reason == "length":
+                            content += "\n<!-- TRUNCATED: output hit max_tokens limit -->"
                         cost = tokens / 1000 * model_info["cost_per_1k"]
                         self.total_cost += cost
                         self.call_log.append({"model": model_key, "tokens": tokens, "cost": cost})

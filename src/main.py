@@ -252,11 +252,14 @@ class KernelOlympics:
                         _phase_state["phase"] = phase
                         _phase_state["model"] = model
                         _phase_state["detail"] = detail
+                        # Print phase transition ONCE with \n, then spinner takes over with \r
                         elapsed = time.perf_counter() - t0
                         icons = {"plan": "🧠", "code": "⚡", "evaluate": "🔬",
                                  "refine": "🔁", "verify": "✅", "compile": "🔨"}
                         icon = icons.get(phase, "●")
-                        print(f"║  {icon} {bold(model):<16} {dim(detail):<38} {cyan(f'{elapsed:.1f}s')}")
+                        # Clear spinner line first, then print phase header
+                        sys.stdout.write("\r" + " " * 90 + "\r")  # clear spinner
+                        print(f"║  {icon} {bold(model):<16} {detail:<38} {cyan(f'{elapsed:.1f}s')}")
 
                     def _spinner():
                         spin_idx = 0
@@ -264,17 +267,16 @@ class KernelOlympics:
                             spin_idx = (spin_idx + 1) % 4
                             elapsed = time.perf_counter() - t0
                             phase_elapsed = time.perf_counter() - _phase_state["phase_t0"]
-                            phase = _phase_state["phase"]
                             model = _phase_state["model"] or "..."
                             detail = _phase_state["detail"] or "initializing"
-                            # \r to overwrite the same line
+                            # CRITICAL: use \r without \n so we overwrite the SAME line
                             sys.stdout.write(
                                 f"\r║  {SPINNER[spin_idx]} {bold(model):<16} "
-                                f"{dim(detail):<38} {cyan(f'{elapsed:.1f}s')} "
+                                f"{detail:<38} {cyan(f'{elapsed:.1f}s')} "
                                 f"{dim(f'({phase_elapsed:.1f}s)')}"
                             )
                             sys.stdout.flush()
-                            time.sleep(0.15)
+                            time.sleep(0.3)  # 0.3s = 3x slower = 3x fewer lines
 
                     sp = threading.Thread(target=_spinner, daemon=True)
                     sp.start()
