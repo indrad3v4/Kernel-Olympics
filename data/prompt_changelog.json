@@ -1,6 +1,21 @@
 {
   "versions": [
     {
+      "version": "v2.0.0",
+      "date": "2026-07-10",
+      "author": "fable",
+      "changes": [
+        "Kimi code prompt: edit a mechanically hipified draft instead of re-porting from scratch",
+        "Kimi code prompt: checklist narrowed from 9 items to the 4 wavefront64 semantics a regex cannot do",
+        "Kimi refine prompt: state that the mechanical pass is applied; name cuda* symbols that crept back",
+        "Output-token budget sized to the kernel via _compute_adaptive_max_tokens instead of a flat 16384"
+      ],
+      "files_changed": [
+        "src/router.py"
+      ],
+      "run_results": {}
+    },
+    {
       "version": "v1.0.0",
       "date": "2026-07-09",
       "author": "fable",
@@ -16,5 +31,5 @@
       "run_results": {}
     }
   ],
-  "current": "v1.0.0"
+  "current": "v2.0.0"
 }

@@ -249,8 +249,9 @@ class KernelOlympics:
         self.verifier = VerificationAgent()
         self.reporter = ReportGenerator()
         # T2.1: a second `self.disp = Display()` used to sit here. It printed the
-        # banner a second time AND silently dropped `silent=silent`, so --silent
-        # was ignored for the entire run. Display is constructed once, above.
+        # banner a second time AND silently dropped `silent=silent`, so the only
+        # caller that asks for silence — run_daemon() — got a banner anyway.
+        # Display is constructed once, above.
 
     def run(self, input_paths: list[str], reference_dir: str = "sample_kernels/reference") -> dict:
         pipeline_state = {"phase": "initializing", "patterns_before": 0, "patterns_after": 0,
@@ -374,13 +375,6 @@ class KernelOlympics:
                         verifier=self.verifier,
                         kernel_name=Path(cr['file']).stem
                     )
-                    if port_result.get("timed_out"):
-                        self.disp.file_done(
-                            Path(cr['file']).name,
-                            f"{yellow('TIMEOUT')} {dim('wall-clock budget spent — best attempt kept')}",
-                            ok=False,
-                        )
-
                     # Close out the LAST phase with its duration
                     if _phase_state["phase"] is not None:
                         last_dur = time.perf_counter() - _phase_state["phase_t0"]
@@ -388,6 +382,17 @@ class KernelOlympics:
                         last_model = _phase_state["model"]
                         last_detail = _phase_state["detail"]
                         print(f"║  {last_icon} {bold(last_model):<16} {last_detail:<38} {cyan(f'{last_dur:.1f}s')}")
+
+                    # AFTER the final phase line: each phase's duration is printed when
+                    # the NEXT phase starts, so the last one is still pending here.
+                    # Printing the timeout first put it between DeepSeek's line and
+                    # Kimi's, making it read as though the timeout fired during planning.
+                    if port_result.get("timed_out"):
+                        self.disp.file_done(
+                            Path(cr['file']).name,
+                            f"{yellow('TIMEOUT')} {dim('wall-clock budget spent — best attempt kept')}",
+                            ok=False,
+                        )
 
                     llm_elapsed = time.perf_counter() - t0
                     pipeline_state["total_cost"] += port_result.get("cost", 0)

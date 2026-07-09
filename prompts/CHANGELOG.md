@@ -13,6 +13,31 @@ asserts the three stay in sync.
 
 ---
 
+## v2.0.0 (2026-07-10)
+
+MAJOR: the coder's instructions changed behaviorally. It is now handed a
+mechanically hipified draft and told to **edit** it rather than re-port from
+scratch. See `_hipify_source` in `src/router.py`.
+
+- Kimi code prompt: when a `preprocessed_source` draft is supplied, the checklist
+  drops the 5 mechanical items (headers, `checkCudaErrors`, `cuda*→hip*`,
+  `WAVEFRONT_SIZE`) and keeps only the 4 wavefront64 semantics items a regex
+  cannot do. The draft is embedded as "HIP DRAFT TO EDIT"; the CUDA original is
+  demoted to "reference only — do not port this again".
+- Kimi refine prompt: gains a "MECHANICAL PASS ALREADY APPLIED" note, and names
+  any `cuda*` symbols that crept back into the previous output. The draft itself
+  is deliberately NOT re-embedded — `previous_code` is already the working copy,
+  and re-sending it would grow the prompt this change exists to shrink.
+- Output-token budget is now sized to the kernel (`_compute_adaptive_max_tokens`)
+  instead of always requesting kimi27's 16384-token ceiling.
+
+Rationale: on `nvidia_shfl_scan.cu` the mechanical pass rewrites 53 `cuda*` API
+calls, 2 CUDA includes, 2 NVIDIA helper headers and 38 `checkCudaErrors` sites in
+~19ms. The coder was spending ~90s of LLM time reproducing them one token at a
+time, and a full rewrite is also what reintroduced compile errors on 2026-07-09.
+
+---
+
 ## v1.0.0 (2026-07-09)
 
 Initial versioned baseline. The prompt text is unchanged from what shipped before
