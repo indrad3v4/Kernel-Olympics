@@ -221,8 +221,15 @@ class PatternMemory:
         self._persist(entry)  # persist the retrieval count
         return entry.to_public(retrieval_ms=self._last_cache_time_ms)
 
-    def count(self) -> int:
-        """Number of distinct migration signatures cached."""
+    def count(self, verified_only: bool = False) -> int:
+        """Number of distinct migration signatures cached.
+
+        T0.5: ``verified_only`` counts only entries that would actually be served
+        on a hit (a real fix that passed verification), excluding quarantined
+        unverified attempts and negative placeholders.
+        """
+        if verified_only:
+            return sum(1 for e in self._cache.values() if e.verified and e.verified_fix)
         return len(self._cache)
 
     def get_stats(self) -> Dict:

@@ -153,7 +153,9 @@ class Display:
         print(f"║ {bold('Summary')}")
         print(f"║ {green('●')} Cache: {bold(str(hits))} hits  LLM: {bold(str(calls))} calls  {cyan(f'{hit_rate:.0f}%')} hit rate")
         print(f"║ {green('●')} Fastest: {cache_ms}ms  LLM avg: {llm_s}s  {cyan(speedup)} faster with cache")
-        print(f"║ {green('●')} Patterns: {pipeline_state.get('patterns_before',0)} → {bold(str(pipeline_state.get('patterns_after',0)))} stored")
+        quarantined = pipeline_state.get('patterns_quarantined', 0)
+        q_txt = f"  {yellow(f'(+{quarantined} quarantined)')}" if quarantined else ""
+        print(f"║ {green('●')} Patterns: {pipeline_state.get('patterns_before',0)} → {bold(str(pipeline_state.get('patterns_after',0)))} verified{q_txt}")
         print(f"║ {green('●')} Cost: {bold(cost_str)}")
         print(f"║ {green('●')} Elapsed: {elapsed:.1f}s total")
         # T0.3: top-line verdict for the whole run.
@@ -237,7 +239,7 @@ class KernelOlympics:
         
         # Phase 3: Pattern Memory
         self.disp.phase("Memory Cache", "🧠")
-        pipeline_state["patterns_before"] = self.memory.count()
+        pipeline_state["patterns_before"] = self.memory.count(verified_only=True)
         count = self.memory.count()
         self.disp.status("Memory Cache", f"{count} cached patterns ready" if count > 0 else "0 cached patterns (first run)", ok=count > 0)
 
@@ -573,7 +575,12 @@ class KernelOlympics:
             else:
                 self.disp.file_done(Path(cr['file']).name, f"{cr.get('risk_level')} — no porting needed", ok=True)
 
-        pipeline_state["patterns_after"] = self.memory.count()
+        # T0.5: "stored" counts verified patterns only; quarantined unverified
+        # attempts are reported separately, never as a win.
+        pipeline_state["patterns_after"] = self.memory.count(verified_only=True)
+        pipeline_state["patterns_quarantined"] = (
+            self.memory.count() - self.memory.count(verified_only=True)
+        )
 
         # Phase 6: Report Generator
         self.disp.divider()
