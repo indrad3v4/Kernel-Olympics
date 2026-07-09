@@ -242,44 +242,21 @@ class KernelOlympics:
                     self.disp.status("Porting", "DeepSeek-v4-pro (plan) → Kimi K2.7 (code) → GLM-5.2 (evaluate) ⟲ loop")
                     t0 = time.perf_counter()
 
-                    # Live progress: spinner thread + phase callback
+                    # Live progress: phase callback only (no spinner thread)
                     import threading
                     _phase_state = {"phase": "starting", "model": "", "detail": "", "phase_t0": t0}
-                    _stop_spinner = threading.Event()
 
                     def _on_phase(phase, model, detail):
                         _phase_state["phase_t0"] = time.perf_counter()
                         _phase_state["phase"] = phase
                         _phase_state["model"] = model
                         _phase_state["detail"] = detail
-                        # Print phase transition ONCE with \n, then spinner takes over with \r
                         elapsed = time.perf_counter() - t0
                         icons = {"plan": "🧠", "code": "⚡", "evaluate": "🔬",
                                  "refine": "🔁", "verify": "✅", "compile": "🔨"}
                         icon = icons.get(phase, "●")
-                        # Clear spinner line first, then print phase header
-                        sys.stdout.write("\r" + " " * 90 + "\r")  # clear spinner
+                        # Print ONE clean line per phase change — no spinner thread
                         print(f"║  {icon} {bold(model):<16} {detail:<38} {cyan(f'{elapsed:.1f}s')}")
-
-                    def _spinner():
-                        spin_idx = 0
-                        while not _stop_spinner.is_set():
-                            spin_idx = (spin_idx + 1) % 4
-                            elapsed = time.perf_counter() - t0
-                            phase_elapsed = time.perf_counter() - _phase_state["phase_t0"]
-                            model = _phase_state["model"] or "..."
-                            detail = _phase_state["detail"] or "initializing"
-                            # CRITICAL: use \r without \n so we overwrite the SAME line
-                            sys.stdout.write(
-                                f"\r║  {SPINNER[spin_idx]} {bold(model):<16} "
-                                f"{detail:<38} {cyan(f'{elapsed:.1f}s')} "
-                                f"{dim(f'({phase_elapsed:.1f}s)')}"
-                            )
-                            sys.stdout.flush()
-                            time.sleep(0.3)  # 0.3s = 3x slower = 3x fewer lines
-
-                    sp = threading.Thread(target=_spinner, daemon=True)
-                    sp.start()
 
                     port_result = self.router.route(
                         source, cr.get("findings", []),
@@ -287,11 +264,6 @@ class KernelOlympics:
                         verifier=self.verifier,
                         kernel_name=Path(cr['file']).stem
                     )
-
-                    _stop_spinner.set()
-                    sp.join(timeout=1)
-                    sys.stdout.write("\r" + " " * 78 + "\r")  # clear spinner line
-                    sys.stdout.flush()
 
                     llm_elapsed = time.perf_counter() - t0
                     pipeline_state["total_cost"] += port_result.get("cost", 0)
