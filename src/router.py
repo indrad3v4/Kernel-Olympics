@@ -1844,6 +1844,41 @@ class ModelRouter:
                         # Error set changed after Kimi refine — reset plateau counter
                         kimi_plateau_count = 0
 
+                    # ── TRIZ #13/#24: GLM→DeepSeek escalation BEFORE next Kimi refine ──
+                    # When plateau is detected (kimi_plateau_count >= 1) AND we haven't
+                    # already re-planned, route back through DeepSeek to update the
+                    # CUDA→HIP strategy. The new plan replaces deepseek_plan_output so
+                    # the next Kimi refine uses a different strategy — fixes "stuck"
+                    # runs where GLM keeps recommending the same broken fix.
+                    if (kimi_plateau_count >= 1
+                            and replan_count == 0
+                            and iteration < max_iterations):
+                        result["changes"].append(
+                            f"[orch] GLM→DeepSeek escalation: kimi_plateau={kimi_plateau_count}. "
+                            f"Re-planning CUDA→HIP strategy with GLM error context."
+                        )
+                        print(f"║  │  🔄 GLM→DeepSeek: re-plan with error context "
+                              f"(plateau={kimi_plateau_count}){'':<15}║")
+                        if on_phase: on_phase("plan", "DeepSeek-v4-pro",
+                            f"re-planning from GLM error analysis (plateau {kimi_plateau_count})")
+                        replan_prompt = self._build_deepseek_replan_prompt(
+                            kernel_source, patterns, result["ported_code"],
+                            compile_errs, deepseek_plan_output,
+                        )
+                        re_plan = self._call_model(
+                            "deepseek", replan_prompt,
+                            system_prompt=SYSTEM_PROMPTS.get("deepseek", ""),
+                        )
+                        replan_count += 1
+                        if re_plan.success:
+                            deepseek_plan_output = re_plan.output
+                            result["changes"].append(
+                                f"[deepseek] Re-plan from GLM escalation: fresh strategy "
+                                f"(iter {iteration}, replan_count={replan_count})"
+                            )
+                            # Don't reset kimi_plateau_count — let hard-stagnation
+                            # abort still fire if even the new strategy fails.
+
                     # ── Bug 5, trigger 2 / Bug 7: hard stagnation abort ──
                     # If we already spent our one re-plan attempt on a fresh strategy and
                     # errors are STILL not decreasing, more iterations won't help.
