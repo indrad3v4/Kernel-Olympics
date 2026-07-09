@@ -219,6 +219,28 @@ def test_classify_error_origin_harness_not_misclassified_as_link():
     assert origin == "harness"
 
 
+def test_signal_name_translates_sigsegv():
+    """RUN-FIRST: exit -11 must read as SIGSEGV, not raw signal arithmetic."""
+    assert VerificationAgent._signal_name(-11) == "SIGSEGV"
+    # Signal numbering is platform-specific (SIGABRT is 6 on POSIX, 22 on
+    # Windows) — the deployment target is the Linux notebook, where -6 names
+    # SIGABRT; elsewhere the numeric fallback is the correct answer.
+    assert VerificationAgent._signal_name(-6) in ("SIGABRT", "signal 6")
+    assert VerificationAgent._signal_name(0) == ""
+    assert VerificationAgent._signal_name(1) == ""
+    assert VerificationAgent._signal_name(None) == ""
+
+
+def test_quick_run_check_missing_binary_reports_failure():
+    """quick_run_check on a never-compiled kernel: run_success=False,
+    exit_code None (never launched) — distinct from a real crash."""
+    agent = VerificationAgent()
+    rc = agent.quick_run_check("kernel_that_was_never_compiled")
+    assert rc["run_success"] is False
+    assert rc["run_exit_code"] is None
+    assert rc["signal"] == ""
+
+
 def test_run_returns_exit_code():
     """Bug 0: _run() must surface the real exit code, not just a pass/fail
     bool, so callers can tell 'crashed' from 'ran and returned nonzero for a
