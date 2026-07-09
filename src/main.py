@@ -241,7 +241,54 @@ class KernelOlympics:
                     verifier_name = "Gemma 4(AMD)" if gemma_online else "DeepSeek V4 Pro(Gemma fallback)"
                     self.disp.status("Porting", "DeepSeek-v4-pro (plan) → Kimi K2.7 (code) → GLM-5.2 (evaluate) ⟲ loop")
                     t0 = time.perf_counter()
-                    port_result = self.router.route(source, cr.get("findings", []))
+
+                    # Live progress: spinner thread + phase callback
+                    import threading
+                    _phase_state = {"phase": "starting", "model": "", "detail": "", "phase_t0": t0}
+                    _stop_spinner = threading.Event()
+
+                    def _on_phase(phase, model, detail):
+                        _phase_state["phase_t0"] = time.perf_counter()
+                        _phase_state["phase"] = phase
+                        _phase_state["model"] = model
+                        _phase_state["detail"] = detail
+                        elapsed = time.perf_counter() - t0
+                        icons = {"plan": "🧠", "code": "⚡", "evaluate": "🔬",
+                                 "refine": "🔁", "verify": "✅"}
+                        icon = icons.get(phase, "●")
+                        print(f"║  {icon} {bold(model):<16} {dim(detail):<38} {cyan(f'{elapsed:.1f}s')}")
+
+                    def _spinner():
+                        spin_idx = 0
+                        while not _stop_spinner.is_set():
+                            spin_idx = (spin_idx + 1) % 4
+                            elapsed = time.perf_counter() - t0
+                            phase_elapsed = time.perf_counter() - _phase_state["phase_t0"]
+                            phase = _phase_state["phase"]
+                            model = _phase_state["model"] or "..."
+                            detail = _phase_state["detail"] or "initializing"
+                            # \r to overwrite the same line
+                            sys.stdout.write(
+                                f"\r║  {SPINNER[spin_idx]} {bold(model):<16} "
+                                f"{dim(detail):<38} {cyan(f'{elapsed:.1f}s')} "
+                                f"{dim(f'({phase_elapsed:.1f}s)')}"
+                            )
+                            sys.stdout.flush()
+                            time.sleep(0.15)
+
+                    sp = threading.Thread(target=_spinner, daemon=True)
+                    sp.start()
+
+                    port_result = self.router.route(
+                        source, cr.get("findings", []),
+                        on_phase=_on_phase
+                    )
+
+                    _stop_spinner.set()
+                    sp.join(timeout=1)
+                    sys.stdout.write("\r" + " " * 78 + "\r")  # clear spinner line
+                    sys.stdout.flush()
+
                     llm_elapsed = time.perf_counter() - t0
                     pipeline_state["total_cost"] += port_result.get("cost", 0)
                     if not port_result.get("ported_code"):

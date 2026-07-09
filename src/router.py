@@ -503,15 +503,17 @@ class ModelRouter:
     # ── Main routing logic ──────────────────────────────────────
 
     def route(self, kernel_source: str, patterns: List[Dict],
-              max_iterations: int = 3) -> Dict:
+              max_iterations: int = 3,
+              on_phase=None) -> Dict:
         """Route kernel through the loop engineering pipeline.
 
-        Loop: DeepSeek (plan) → Kimi (code) → GLM (evaluate) → feedback → DeepSeek (re-plan)
+        Loop: DeepSeek (plan) → Kimi (code) → GLM (evaluate) → feedback → Kimi refines
 
         Args:
             kernel_source: The CUDA kernel source code.
             patterns: List of classifier-detected patterns.
             max_iterations: Maximum Kimi→GLM cycles (default 3).
+            on_phase: Optional callback(phase: str, detail: str) for live progress.
 
         Returns:
             {"ported_code": ..., "confidence": ..., "changes": [...],
@@ -537,6 +539,7 @@ class ModelRouter:
         deepseek_plan_output = ""
 
         # ── Phase 1: DeepSeek PLANS the port (reasoning model — prose OK) ──
+        if on_phase: on_phase("plan", "DeepSeek-v4-pro", "planning CUDA→HIP strategy")
         ds_prompt = self._build_deepseek_plan_prompt(kernel_source, patterns)
         plan = self._call_model("deepseek", ds_prompt,
                                 system_prompt=SYSTEM_PROMPTS.get("deepseek", ""))
@@ -548,6 +551,7 @@ class ModelRouter:
             result["changes"].append("[deepseek] Planning FAILED — proceeding without plan")
 
         # ── Phase 2: Kimi CODES the initial port ──
+        if on_phase: on_phase("code", "Kimi K2.7", "generating HIP port from plan")
         kimi_prompt = self._build_kimi_code_prompt(kernel_source, patterns,
                                                    deepseek_plan=deepseek_plan_output)
         code = self._call_model("kimi27", kimi_prompt,
@@ -577,6 +581,7 @@ class ModelRouter:
                 iteration=iteration,
                 max_iterations=max_iterations,
             )
+            if on_phase: on_phase("evaluate", "GLM-5.2", f"evaluating port (attempt {iteration}/{max_iterations})")
             result["changes"].append(
                 f"[glm] Evaluating code (attempt {iteration}/{max_iterations})")
             evaluator = self._call_model(
@@ -676,6 +681,7 @@ class ModelRouter:
 
             if iteration < max_iterations:
                 # Loop back: Kimi refines with GLM evaluator feedback
+                if on_phase: on_phase("refine", "Kimi K2.7", f"refining port with GLM feedback (iter {iteration}→{iteration+1})")
                 refine_prompt = self._build_kimi_refine_prompt(
                     kernel_source, result["ported_code"],
                     evaluator_feedback, patterns,
@@ -701,6 +707,7 @@ class ModelRouter:
 
         # ── Phase 4: Gemma 4 final verification (local AMD GPU via vLLM) ──
         if result["ported_code"]:
+            if on_phase: on_phase("verify", "Gemma 4", "final verification (local AMD GPU)")
             gemma_prompt = self._build_glm_evaluate_prompt(
                 result["ported_code"], patterns
             )
