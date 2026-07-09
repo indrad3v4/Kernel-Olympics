@@ -276,13 +276,100 @@ JSON_SCHEMAS = {
     },
     # DeepSeek is planner — no response_format (prose/reasoning is OK)
 }
+# ── P0: hard wall-clock budget for one route() call ──
+# 5 iterations x ~3 min = the 15-minute run we are trying to kill. max_iterations
+# bounds the iteration COUNT, not wall time: a single Kimi call that times out at
+# 180s and retries at 2x burns ~9 minutes on its own. This bounds wall time.
+#
+# Implemented as a monotonic deadline rather than signal.SIGALRM (which the audit
+# prompt suggested) for two reasons: SIGALRM does not exist on Windows, where this
+# suite is developed, and it only fires on the main thread. A deadline is portable,
+# testable without spawning real timers, and — because _call_model clamps each
+# request timeout to the remaining budget — it actually bounds the blocking socket
+# reads that consume nearly all of the wall time. A signal could not do the latter.
+MAX_PIPELINE_SECONDS = int(os.environ.get("MAX_PIPELINE_SECONDS", "180"))
+
+# Floor for a clamped LLM timeout. Below this a request cannot realistically
+# round-trip, so we fail fast instead of issuing a request doomed to time out.
+MIN_LLM_TIMEOUT_SECONDS = 5
+
+# ── P0: stagnation thresholds ──
+# Each stagnant iteration costs a Kimi refine (~180s) + a GLM analysis (~30s) +
+# a DeepSeek re-plan (~80s). Three of them do not fit in a 3-minute demo, so the
+# loop must give up while there is still budget to return a best attempt.
+#
+# STAGNATION_ABORT_THRESHOLD was effectively 3-with-5-replans, which needed ~6
+# iterations to fire and so never did before the user hit Ctrl+C.
+STAGNATION_ABORT_THRESHOLD = 2   # consecutive iterations with no error reduction
+MAX_REPLANS = 2                  # total DeepSeek re-plans allowed per route() call
+
+
+class PipelineTimeoutError(RuntimeError):
+    """Raised when route() exceeds its wall-clock budget."""
+
+
+class Deadline:
+    """Monotonic wall-clock budget shared by route() and _call_model.
+
+    `budget_s <= 0` means "no limit" — every check passes and remaining() is None,
+    so callers fall back to their configured per-model timeouts.
+    """
+
+    def __init__(self, budget_s: float):
+        self.budget_s = budget_s
+        self._t0 = time.monotonic()
+
+    @property
+    def unlimited(self) -> bool:
+        return self.budget_s <= 0
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self._t0
+
+    def remaining(self) -> Optional[float]:
+        """Seconds left, or None when unlimited."""
+        if self.unlimited:
+            return None
+        return self.budget_s - self.elapsed()
+
+    def expired(self) -> bool:
+        return (not self.unlimited) and self.remaining() <= 0
+
+    def exhausted(self) -> bool:
+        """True when too little budget remains to complete another LLM call.
+
+        Distinct from expired(): with 3s left and a 5s floor, the clock has not
+        run out but every request we could issue is already doomed. Treating that
+        as "still running" makes a timeout look like a model failure.
+        """
+        if self.unlimited:
+            return False
+        return self.remaining() < MIN_LLM_TIMEOUT_SECONDS
+
+    def clamp_timeout(self, timeout_s: float) -> float:
+        """Shrink a per-request timeout so it cannot outlive the budget."""
+        rem = self.remaining()
+        if rem is None:
+            return timeout_s
+        return max(0.0, min(timeout_s, rem))
+
+
+# ── Prompt versioning ──
+# Every system prompt string below carries "[prompt vX.Y.Z]" so a run's output
+# can be correlated with the exact prompt text that produced it. Bump on ANY
+# prompt edit and add an entry to prompts/CHANGELOG.md + data/prompt_changelog.json:
+#   MAJOR — behavioral change (new instructions, removed constraints)
+#   MINOR — context additions (new examples, expanded edge cases)
+#   PATCH — wording, typo, formatting fixes
+PROMPT_VERSION = "v1.0.0"
+
 # ── Role-specific system prompts ──
 # Each model gets its OWN role definition. No shared prompts.
 # These are passed as system messages to the LLM alongside the phase prompt.
 
 SYSTEM_PROMPTS = {
     "deepseek": (
-        "You are a CUDA-to-HIP porting planner. "
+        f"You are a CUDA-to-HIP porting planner. [prompt {PROMPT_VERSION}] "
         "Analyze the CUDA kernel and produce a detailed porting plan: "
         "list every CUDA-specific construct, its HIP replacement, and the order of changes. "
         "Focus on warp(32)→wavefront(64) divergence, __shfl mask widths, shared memory sizing, "
@@ -291,18 +378,24 @@ SYSTEM_PROMPTS = {
         "Reason freely — your plan will be consumed by a coder agent."
     ),
     "kimi27": (
-        "You are a CUDA-to-HIP code porting specialist. "
+        f"You are a CUDA-to-HIP code porting specialist. [prompt {PROMPT_VERSION}] "
         "Port CUDA kernels to AMD ROCm/HIP, fixing warp→wavefront issues. "
         "Respond with JSON: {\"ported_code\":str,\"confidence\":int,\"changes\":[str],\"explanation\":str}."
     ),
     "glm": (
-        "You are a HIP kernel code evaluator. "
+        f"You are a HIP kernel code evaluator. [prompt {PROMPT_VERSION}] "
         "Check ported code for wavefront64 correctness, CUDA remnants, and compilation safety. "
         'Respond with JSON: {"pass":bool,"issues":[str],"feedback":str,"verdict":str}. '
         "CRITICAL: Begin your response with the { character. "
         "DO NOT include reasoning, explanations, greetings, or chain-of-thought. "
         "Output ONLY the JSON object. The first character MUST be {. "
         "No text before or after the JSON."
+    ),
+    # Used by the in-loop GLM error-analysis call. Kept here (not inline at the
+    # call site) so every system prompt carries a version tag from one place.
+    "glm_error_analyst": (
+        f"You are a HIP/ROCm compile error analyst. [prompt {PROMPT_VERSION}] "
+        "Respond ONLY with JSON."
     ),
 }
 
@@ -417,6 +510,9 @@ class ModelRouter:
         self.total_cost = 0.0
         self.call_log: List[Dict] = []
         self.run_id: str = ""  # set by route() for A2AMessage full_ref keys
+        # Replaced by route() with a real budget. Unlimited by default so a
+        # bare _call_model() outside the pipeline keeps its per-model timeout.
+        self._deadline: Deadline = Deadline(0)
 
     @staticmethod
     def _extract_code(text: str) -> str:
@@ -1180,7 +1276,8 @@ class ModelRouter:
                                   iteration: int = 1,
                                   checklist_override: list[str] = None,
                                   stagnation_count: int = 0,
-                                  regex_changelog: Optional[List[str]] = None) -> str:
+                                  regex_changelog: Optional[List[str]] = None,
+                                  frozen_base_code: str = "") -> str:
         """Build the Kimi refinement prompt for orchestration loop iterations.
 
         Kimi receives the original kernel, its previous output, and
@@ -1192,6 +1289,11 @@ class ModelRouter:
         A2A v2 Channels:
           Channel 1 (regex_changelog): deterministic fixes already applied.
           Channel 3 (stagnation): iteration memory — how many failures so far.
+
+        frozen_base_code: P1 two-layer fix. When non-empty, this kernel already
+        compiles and only crashes at runtime. Kimi is told to patch it, not to
+        rewrite it — a full rewrite is what reintroduced compile errors on the
+        2026-07-09 run.
         """
         # TRIZ #15: Use evolved checklist if provided, else fallback to static
         checklist = checklist_override if checklist_override else [
@@ -1254,7 +1356,7 @@ class ModelRouter:
             prompt += (
                 f"\n⚠️ ITERATION MEMORY: This is iteration {iteration}. "
                 f"There have been {stagnation_count} consecutive iterations without "
-                f"compile improvement (stagnation threshold: 3).\n"
+                f"compile improvement (stagnation threshold: {STAGNATION_ABORT_THRESHOLD}).\n"
                 "Your previous output(s) produced the SAME compiler errors. "
                 "Do NOT output the same code again. Try a completely different "
                 "approach — different API calls, different structure, different headers.\n\n"
@@ -1265,6 +1367,26 @@ class ModelRouter:
             prompt += (
                 f"\nAUTO-FIXED ITEMS (already applied — do NOT redo):\n{changelog_text}\n\n"
             )
+        # ── P1 two-layer SIGSEGV fix: Layer 1 is immutable ──
+        # The base kernel below already passed hipcc. The only defect is at runtime.
+        # Rewriting it trades a crashing binary for one that does not build at all.
+        if frozen_base_code:
+            base_for_prompt = (frozen_base_code if self_contained
+                               else frozen_base_code[:4000])
+            prompt += (
+                "\n[IMPORTANT] The base kernel below COMPILES CLEANLY and crashes only "
+                "at runtime. It is a frozen baseline (Layer 1).\n"
+                "Apply TARGETED fixes on top of it (Layer 2). Do NOT rewrite, "
+                "restructure, or re-port the base kernel — change only the specific "
+                "lines responsible for the runtime fault (typically __shfl width/mask "
+                "semantics on wavefront64, shared memory sized blockDim/32 instead of "
+                "blockDim/64, or out-of-bounds indexing).\n"
+                "If your output does not compile, it will be DISCARDED and this base "
+                "kernel returned instead — a compiling kernel that crashes beats a "
+                "kernel that does not build.\n"
+                f"BASE KERNEL (Layer 1, compiles):\n```hip\n{base_for_prompt}```\n\n"
+            )
+
         prompt += (
             "Respond with JSON: {\"ported_code\": str, \"confidence\": 0-100, "
             "\"changes\": [str], \"explanation\": str}."
@@ -1458,7 +1580,8 @@ class ModelRouter:
               max_iterations: int = 10,
               on_phase=None,
               verifier=None,
-              kernel_name: str = "test_kernel") -> Dict:
+              kernel_name: str = "test_kernel",
+              max_seconds: Optional[float] = None) -> Dict:
         """Route kernel through the loop engineering pipeline.
 
         Loop: DeepSeek (plan) → Kimi (code) → [hipcc compile FIRST] → GLM (evaluate only if compile passes) → feedback → Kimi refines
@@ -1480,6 +1603,8 @@ class ModelRouter:
             on_phase: Optional callback(phase: str, detail: str) for live progress.
             verifier: Optional VerificationAgent for in-loop hipcc compile checks.
             kernel_name: Name of kernel (for verifier build dir isolation).
+            max_seconds: Hard wall-clock budget. Defaults to MAX_PIPELINE_SECONDS.
+                Pass 0 (or a negative value) to disable the budget entirely.
 
         Returns:
             {"ported_code": ..., "confidence": ..., "changes": [...],
@@ -1493,7 +1618,14 @@ class ModelRouter:
                     "orchestrator_passed": False, "iterations_used": 0,
                     "compile_errors": [], "compile_passed": False,
                     "best_attempt_code": "", "best_attempt_iteration": 0,
-                    "best_attempt_confidence": 0.0}
+                    "best_attempt_confidence": 0.0,
+                    "prompt_version": PROMPT_VERSION, "timed_out": False}
+
+        # P0: start the wall-clock budget before the first LLM call. _call_model
+        # reads self._deadline and clamps every request timeout to what is left.
+        budget = MAX_PIPELINE_SECONDS if max_seconds is None else max_seconds
+        deadline = Deadline(budget)
+        self._deadline = deadline
 
         result = {"ported_code": "", "confidence": 0,
                   "changes": [], "model_used": "", "cost": 0,
@@ -1501,7 +1633,11 @@ class ModelRouter:
                   "compile_errors": [], "compile_passed": False,
                   "compile_error_history": [],
                   "best_attempt_code": "", "best_attempt_iteration": 0,
-                  "best_attempt_confidence": 0.0}
+                  "best_attempt_confidence": 0.0,
+                  "prompt_version": PROMPT_VERSION, "timed_out": False}
+        if not deadline.unlimited:
+            result["changes"].append(
+                f"[budget] Wall-clock limit {budget:.0f}s (prompt {PROMPT_VERSION})")
 
         # S3: best attempt tracking — code from the iteration that compiled the
         # furthest (highest iteration where compile passed). Used for caching on
@@ -1657,7 +1793,18 @@ class ModelRouter:
             result["changes"].append("[kimi27] Generated ported kernel")
             result["model_used"] = "kimi27"
         else:
-            result["changes"].append("[kimi27] Code generation FAILED")
+            # P0: distinguish "the model failed" from "we ran out of clock". The
+            # budget can expire during this very first Kimi call, in which case
+            # _call_model returns a failed AgentResult and this branch would
+            # otherwise report a model failure and hide the real cause.
+            if deadline.exhausted():
+                result["timed_out"] = True
+                result["abort_reason"] = "pipeline_timeout"
+                result["changes"].append(
+                    f"[budget] Wall-clock limit {budget:.0f}s reached during initial "
+                    f"code generation — no kernel was produced")
+            else:
+                result["changes"].append("[kimi27] Code generation FAILED")
             # Can't proceed without initial code
             result["cost"] = round(self.total_cost, 4)
             return result
@@ -1684,8 +1831,28 @@ class ModelRouter:
         replan_count = 0  # Bug 7: how many stagnation re-plans we've already used
         runtime_crash_count = 0  # RUN-FIRST: consecutive compile-pass-but-crash iterations
         kimi_plateau_count = 0  # C1: count consecutive iterations with same error set after Kimi refine
+        # P1 (two-layer SIGSEGV): last code that hipcc accepted. Once set, a refine
+        # that breaks compilation is discarded and this is restored (Layer 1).
+        frozen_base_code = ""
+        frozen_base_iteration = 0
         for iteration in range(1, max_iterations + 1):
             if not result["ported_code"]:
+                break
+
+            # ── P0: wall-clock budget check at the iteration boundary ──
+            # Checked here (not mid-call) because an iteration is the unit of work
+            # we can abandon cleanly: best_attempt_code already holds the furthest
+            # compiling version, so stopping now returns real value instead of Ctrl+C.
+            if deadline.exhausted():
+                result["timed_out"] = True
+                result["abort_reason"] = "pipeline_timeout"
+                result["iterations_used"] = iteration - 1
+                result["changes"].append(
+                    f"[budget] Wall-clock limit {budget:.0f}s reached after "
+                    f"{deadline.elapsed():.0f}s — stopping at iteration {iteration - 1} "
+                    f"and returning the best compiling attempt "
+                    f"(iter {best_attempt_iteration or 0})")
+                print(f"║  │  ⏱ TIMEOUT: {budget:.0f}s budget spent — returning best attempt{'':<10}║")
                 break
 
             # ── Step 1: hipcc compile check FIRST ──────────────────────────
@@ -1693,6 +1860,10 @@ class ModelRouter:
             # If compile fails, compile errors ARE the feedback. Skip GLM entirely.
             compile_failed_this_iter = False
             run_crashed_this_iter = False  # RUN-FIRST: set by the in-loop run check below
+            # P0: a stagnant iteration used to fire TWO DeepSeek re-plans — the
+            # escalation below and the GLM-informed re-plan after it — costing ~160s
+            # for two strategies where only the second one is ever used.
+            replanned_this_iter = False
             if verifier and hasattr(verifier, 'quick_compile_check'):
                 if on_phase: on_phase("compile", "hipcc", f"compile-first check (attempt {iteration}/{max_iterations})")
                 cc = verifier.quick_compile_check(result["ported_code"], kernel_name=kernel_name)
@@ -1716,6 +1887,11 @@ class ModelRouter:
                         best_attempt_iteration = iteration
                         result["changes"].append(
                             f"[best-attempt] Saved iter {iteration} code as best attempt")
+
+                    # P1 (two-layer): this code compiles. Freeze it as Layer 1 so a
+                    # later refine that breaks the build can be rolled back to here.
+                    frozen_base_code = result["ported_code"]
+                    frozen_base_iteration = iteration
 
                     # ── RUN-FIRST: compile-pass is not convergence — run the binary ──
                     # The compile check just linked a real executable into the loop
@@ -1769,6 +1945,27 @@ class ModelRouter:
                 else:
                     compile_failed_this_iter = True
                     compile_errs = cc.get("errors", [])
+
+                    # ── P1 (two-layer SIGSEGV): reject a regressing Layer 2 ──
+                    # We had code that compiled (Layer 1), asked Kimi to fix a runtime
+                    # crash, and got back code that no longer builds. That is exactly
+                    # the 2026-07-09 regression: iteration 4 (1 error) → iteration 5
+                    # (5 errors) because the crash "fix" rewrote the whole kernel.
+                    # A non-compiling kernel is strictly worse than a compiling one
+                    # that crashes, so discard Layer 2 and stop — the caller gets
+                    # Layer 1 back via the recovery block after the loop.
+                    if frozen_base_code and result["ported_code"] != frozen_base_code:
+                        result["changes"].append(
+                            f"[two-layer] Refine at iter {iteration} broke a build that "
+                            f"compiled at iter {frozen_base_iteration} "
+                            f"({len(compile_errs)} errors) — discarding it and keeping "
+                            f"the frozen base kernel")
+                        print(f"║  │  🧊 LAYER-2 REJECTED: refine broke the build — reverting{'':<8}║")
+                        result["ported_code"] = frozen_base_code
+                        result["abort_reason"] = "layer2_rejected"
+                        result["iterations_used"] = iteration
+                        break
+
                     # TRIZ #24 (hidden resource): the exact source lines at each
                     # error location, extracted deterministically from the file
                     # hipcc actually compiled. Without this, every agent reasons
@@ -1974,6 +2171,7 @@ class ModelRouter:
                             system_prompt=SYSTEM_PROMPTS.get("deepseek", ""),
                         )
                         replan_count += 1
+                        replanned_this_iter = True
                         if re_plan.success:
                             deepseek_plan_output = re_plan.output
                             result["changes"].append(
@@ -1991,20 +2189,26 @@ class ModelRouter:
 
                     # ── Bug 5, trigger 2 / Bug 7: hard stagnation abort ──
                     # After multiple re-plans failed to converge, more iterations won't help.
-                    if stagnation_count >= 3 and replan_count >= max(max_iterations // 2, 1):
+                    # P0: was `stagnation_count >= 3 and replan_count >= max_iterations // 2`
+                    # (i.e. 5 re-plans at the default max_iterations=10), which took ~6
+                    # iterations to reach — the run was Ctrl+C'd long before it could fire.
+                    if (stagnation_count >= STAGNATION_ABORT_THRESHOLD
+                            and replan_count >= MAX_REPLANS):
                         result["changes"].append(
                             f"[hipcc] Hard stagnation: {stagnation_count} iterations with no "
-                            f"improvement AFTER a fresh DeepSeek re-plan already failed to help. "
-                            f"Aborting — a second re-plan is unlikely to succeed where the first "
-                            f"one didn't.")
+                            f"improvement after {replan_count} DeepSeek re-plans already failed "
+                            f"to help. Aborting — another re-plan is unlikely to succeed where "
+                            f"those didn't.")
                         print(f"║  │  🛑 ABORT: fresh strategy also stagnated — giving up{'':<20}║")
                         result["iterations_used"] = iteration
                         result["abort_reason"] = "hard_stagnation"
                         break
 
-                    # TRIZ #15: After 3 stagnant iterations, escalate to DeepSeek re-plan —
-                    # but only once (see hard-stagnation abort above for what happens next).
-                    if stagnation_count >= 3 and replan_count == 0 and iteration < max_iterations:
+                    # TRIZ #15: After the first stagnant iterations, escalate to a DeepSeek
+                    # re-plan — but only once (see hard-stagnation abort above for what
+                    # happens next).
+                    if (stagnation_count >= STAGNATION_ABORT_THRESHOLD
+                            and replan_count == 0 and iteration < max_iterations):
                         result["changes"].append(
                             f"[hipcc] Stagnation detected ({stagnation_count} iterations no improvement) "
                             f"— escalating to DeepSeek re-plan")
@@ -2020,6 +2224,7 @@ class ModelRouter:
                             system_prompt=SYSTEM_PROMPTS.get("deepseek", ""),
                         )
                         replan_count += 1
+                        replanned_this_iter = True
                         if re_plan.success:
                             deepseek_plan_output = re_plan.output
                             result["changes"].append(
@@ -2119,7 +2324,7 @@ class ModelRouter:
                             error_context=cc.get("error_context"))
                         glm_err = self._call_model(
                             "glm", glm_err_prompt,
-                            system_prompt="You are a HIP/ROCm compile error analyst. Respond ONLY with JSON.",
+                            system_prompt=SYSTEM_PROMPTS.get("glm_error_analyst", ""),
                             prefill='{"fixes":'  # TRIZ #9: force JSON
                         )
                         if glm_err.success:
@@ -2218,10 +2423,17 @@ class ModelRouter:
             # gave DeepSeek raw compile errors only — visual order was broken and
             # the re-plan prompt was uninformed.
             #
-            # Triggers: compile failed AND we have ~half the iteration budget left
-            # for re-plans AND no hard-stagnation abort already happened.
+            # Triggers: compile failed AND we have re-plan budget left AND no
+            # re-plan already ran this iteration AND no hard-stagnation abort.
+            #
+            # P0: this used to fire on EVERY failing iteration (~80s of DeepSeek each,
+            # up to max_iterations//2 = 5 times), and on a stagnant iteration it fired
+            # a *second* time right after the escalation above — two plans, one used.
+            # Capping at MAX_REPLANS and skipping when replanned_this_iter is what
+            # takes a stagnating run from ~3min/iteration to roughly one Kimi call.
             if (compile_failed_this_iter
-                    and replan_count < max(max_iterations // 2, 1)
+                    and not replanned_this_iter
+                    and replan_count < MAX_REPLANS
                     and iteration < max_iterations
                     and compile_errs
                     and result.get("abort_reason") != "hard_stagnation"):
@@ -2236,7 +2448,7 @@ class ModelRouter:
                         logger.debug("Failed to dump glm_analysis: %s", e)
                 replan_prompt = (
                     f"You produced a CUDA→HIP plan earlier that yielded code still failing to compile.\n"
-                    f"This is re-plan attempt {replan_count + 1}/{max(max_iterations // 2, 1)}.\n"
+                    f"This is re-plan attempt {replan_count + 1}/{MAX_REPLANS}.\n"
                     f"{glm_summary}\n"
                     f"RECURRING COMPILE ERRORS:\n{chr(10).join(compile_errs[:8])}\n\n"
                     f"LAST HIP CODE:\n```hip\n{result.get('ported_code', '')[:3000]}\n```\n\n"
@@ -2246,10 +2458,10 @@ class ModelRouter:
                 )
                 result["changes"].append(
                     f"[orch] GLM→DeepSeek informed re-plan "
-                    f"({replan_count + 1}/{max(max_iterations // 2, 1)}, iter {iteration})"
+                    f"({replan_count + 1}/{MAX_REPLANS}, iter {iteration})"
                 )
                 print(f"║  │  🔄 GLM→DeepSeek: informed re-plan "
-                      f"({replan_count + 1}/{max(max_iterations // 2, 1)}){'':<14}║")
+                      f"({replan_count + 1}/{MAX_REPLANS}){'':<14}║")
                 if on_phase: on_phase("replan", "DeepSeek-v4-pro",
                     f"informed re-plan after GLM (iter {iteration})")
                 re_plan = self._call_model(
@@ -2470,6 +2682,10 @@ class ModelRouter:
                     checklist_override=evolved.checklist,
                     stagnation_count=stagnation_count,
                     regex_changelog=result.get("regex_changelog"),
+                    # P1: only constrain Kimi to patch-on-top when the failure is a
+                    # RUNTIME crash on code that compiles. On a compile failure there
+                    # is no good baseline to freeze, and a rewrite is what we want.
+                    frozen_base_code=(frozen_base_code if run_crashed_this_iter else ""),
                 )
                 refine = self._call_model(
                     "kimi27", refine_prompt,
@@ -2586,6 +2802,20 @@ class ModelRouter:
             ported_code=result["ported_code"],
             changes_count=len(result["changes"]),
         )
+        # P0/P1: if we stopped early (budget exhausted, or a refine broke a build
+        # that previously worked), the last ported_code is the broken one. Hand back
+        # the furthest-compiling version instead — that is what "return the best
+        # compiling code so far" means, and it is what the demo needs to show.
+        if (result.get("abort_reason") in ("pipeline_timeout", "layer2_rejected")
+                and best_attempt_code
+                and result["ported_code"] != best_attempt_code):
+            result["ported_code"] = best_attempt_code
+            result["compile_passed"] = True
+            result["compile_errors"] = []
+            result["changes"].append(
+                f"[recover] Returned best compiling code (iter {best_attempt_iteration}) "
+                f"instead of the last, non-compiling attempt")
+
         # S3: populate best-attempt result fields for caching.
         # If no attempt ever compiled, fall back to the last ported_code (even if
         # it didn't compile) — something is better than nothing for cold-start.
@@ -2615,6 +2845,15 @@ class ModelRouter:
         local_first = model_info.get("local_first", False)
         model_timeout = model_info.get("timeout", 90)
         t0 = time.perf_counter()
+
+        # P0: never start a request that cannot finish inside the pipeline budget.
+        # Without this a single kimi27 call (180s timeout, retried at 2x = 360s)
+        # outlives the whole 180s budget on its own.
+        deadline = getattr(self, "_deadline", None) or Deadline(0)
+        if deadline.exhausted():
+            self.call_log.append({"model": model_key, "error": "pipeline budget exhausted"})
+            return AgentResult(model_key, False, "", 0.0, 0,
+                               round((time.perf_counter() - t0) * 1000, 1))
 
         # Try in order: local-first for Gemma, Fireworks-first for others
         endpoints = []
@@ -2648,7 +2887,11 @@ class ModelRouter:
                         data=data_bytes,
                         headers={"Content-Type": "application/json"}
                     )
-                    with urllib.request.urlopen(req, timeout=30) as resp:
+                    local_timeout = deadline.clamp_timeout(30)
+                    if local_timeout < MIN_LLM_TIMEOUT_SECONDS:
+                        raise PipelineTimeoutError(
+                            f"{deadline.remaining():.1f}s left — too little for a local call")
+                    with urllib.request.urlopen(req, timeout=local_timeout) as resp:
                         raw = resp.read()
                         try:
                             data = json.loads(raw)
@@ -2678,7 +2921,10 @@ class ModelRouter:
                     if schema:
                         payload["response_format"] = schema
                     data_bytes = json.dumps(payload).encode()
-                    # TRIZ #11: Retry once with 2x timeout on timeout failure
+                    # TRIZ #11: Retry once with 2x timeout on timeout failure.
+                    # P0: both the first attempt and the 2x retry are clamped to the
+                    # pipeline's remaining budget, so the retry can no longer turn a
+                    # 180s call into a 540s one that outlives the whole run.
                     for attempt in range(2):
                         try:
                             req = urllib.request.Request(
@@ -2689,11 +2935,18 @@ class ModelRouter:
                                     "Content-Type": "application/json"
                                 }
                             )
-                            with urllib.request.urlopen(req, timeout=model_timeout * (attempt + 1)) as resp:
+                            attempt_timeout = deadline.clamp_timeout(model_timeout * (attempt + 1))
+                            if attempt_timeout < MIN_LLM_TIMEOUT_SECONDS:
+                                raise PipelineTimeoutError(
+                                    f"{deadline.remaining():.1f}s left — too little for a "
+                                    f"{model_key} call")
+                            with urllib.request.urlopen(req, timeout=attempt_timeout) as resp:
                                 raw = resp.read()
                             break  # success — exit retry loop
                         except urllib.error.URLError as e:
-                            if "timed out" in str(e).lower() and attempt == 0:
+                            # Don't burn the remaining budget on a retry that cannot fit.
+                            if ("timed out" in str(e).lower() and attempt == 0
+                                    and not deadline.exhausted()):
                                 # Retry with 2x timeout
                                 continue
                             raise  # Re-raise for outer handler
@@ -2725,6 +2978,13 @@ class ModelRouter:
                     self.call_log.append({"model": model_key, "tokens": tokens, "cost": cost})
                     return AgentResult(model_key, True, content, self._rubric_score_response(content),
                                        tokens, round((time.perf_counter()-t0)*1000, 1))
+            except PipelineTimeoutError as e:
+                # Budget is gone. Falling through to the next endpoint would just
+                # issue another doomed request — stop and let route() return the
+                # best compiling attempt it already has.
+                self.call_log.append({"model": model_key, "error": str(e)[:200]})
+                return AgentResult(model_key, False, "", 0.0, 0,
+                                   round((time.perf_counter() - t0) * 1000, 1))
             except Exception as e:
                 source = "local-vllm" if endpoint == "local" else "fireworks"
                 err_msg = str(e)[:200]
@@ -2744,7 +3004,9 @@ class ModelRouter:
                                 "Content-Type": "application/json"
                             }
                         )
-                        with urllib.request.urlopen(req, timeout=model_timeout) as resp:
+                        with urllib.request.urlopen(
+                                req, timeout=max(deadline.clamp_timeout(model_timeout),
+                                                 MIN_LLM_TIMEOUT_SECONDS)) as resp:
                             raw = resp.read()
                             data = json.loads(raw)
                             content = data["choices"][0]["message"]["content"]
