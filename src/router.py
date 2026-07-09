@@ -917,6 +917,48 @@ class ModelRouter:
         )
         return prompt
 
+    def _build_deepseek_replan_prompt(self, kernel_source: str,
+                                      patterns: List[Dict],
+                                      failed_code: str,
+                                      compile_errors: List[str],
+                                      previous_plan: str) -> str:
+        """Build a stagnation-recovery re-plan prompt (Bug 7).
+
+        The original stagnation escalation re-sent the exact same prompt as
+        the initial plan (no compile errors, no failed code, no indication
+        the first plan didn't work), so DeepSeek — at temperature 0.3, but
+        starting from byte-identical input — produced a substantially
+        identical plan. This prompt instead shows DeepSeek what it tried and
+        why it failed, and explicitly asks for a DIFFERENT strategy.
+        """
+        err_text = "\n".join(compile_errors[:8]) if compile_errors else "(no specific errors captured)"
+        prompt = (
+            "Your previous porting plan for this CUDA kernel produced code that "
+            "still fails to compile after multiple refinement attempts. The same "
+            "or similar errors keep recurring — the current strategy is not working.\n\n"
+            f"YOUR PREVIOUS PLAN:\n{previous_plan[:2000]}\n\n"
+            f"CODE PRODUCED FROM THAT PLAN (most recent attempt):\n"
+            f"```hip\n{failed_code[:2000]}\n```\n\n"
+            f"COMPILER ERRORS THAT KEEP RECURRING:\n{err_text}\n\n"
+            "Produce a DIFFERENT porting strategy — do not repeat the previous "
+            "approach. Consider: a different algorithm structure for the "
+            "warp/wavefront logic, different HIP APIs than previously chosen, "
+            "or a simpler approach that avoids the construct that keeps failing.\n\n"
+        )
+
+        pattern_summary = _format_patterns_summary(patterns)
+        if pattern_summary:
+            prompt += pattern_summary + "\n"
+
+        prompt += (
+            f"ORIGINAL CUDA KERNEL:\n```cuda\n{kernel_source[:5000]}\n```\n\n"
+            "Write a detailed porting plan as a numbered checklist, explicitly "
+            "different from the previous plan above. For each item: what to "
+            "change, where, and why. Be specific — a coder agent will follow "
+            "your plan exactly."
+        )
+        return prompt
+
     def _build_kimi_code_prompt(self, kernel_source: str,
                                 patterns: List[Dict],
                                 deepseek_plan: str = "") -> str:
@@ -1152,6 +1194,11 @@ class ModelRouter:
             "- checkCudaErrors() → remove or define wrapper\n"
             "- __shfl_*_sync mask: 0x1f (32-bit) → 0x3f (64-bit wavefront)\n"
             "- threadIdx.x threadIdx.y etc stay the same in HIP\n\n"
+            "IMPORTANT: Only explain errors whose exact text (function name, variable,\n"
+            "line content) you can actually find in the CURRENT CODE shown above. If an\n"
+            "error references something that does NOT appear in that code block, do not\n"
+            "invent a plausible-sounding root cause for it — set that fix's root_cause to\n"
+            "\"NOT FOUND IN PROVIDED CODE\" and exact_fix to \"unknown\" instead of guessing.\n\n"
             'Respond with JSON: {"fixes": [{"error": str, "root_cause": str, '
             '"exact_fix": str, "priority": int}], "summary": str, '
             '"missing_includes": [str], "wrong_apis": [{"cuda": str, "hip": str}]}.'
@@ -1201,7 +1248,8 @@ class ModelRouter:
         result = {"ported_code": "", "confidence": 0,
                   "changes": [], "model_used": "", "cost": 0,
                   "orchestrator_passed": False, "iterations_used": 0,
-                  "compile_errors": [], "compile_passed": False}
+                  "compile_errors": [], "compile_passed": False,
+                  "compile_error_history": []}
 
         # A2A protocol: unique run ID for structured message full_ref keys
         # I3: Use UUID for reproducibility tracking and create run directory
@@ -1254,6 +1302,12 @@ class ModelRouter:
                             "output": code.output[:5000]}, indent=2), encoding="utf-8")
         except OSError:
             pass
+        # TRIZ #23/#22/#3: baseline for the loop's error-delta and new-error tracking.
+        # Seeded from the pre-loop compile check below (if it fails) so iteration 1's
+        # delta is measured against real prior state instead of a phantom zero.
+        prev_error_count = 0
+        prev_errors_set = set()
+        prev_errors_norm = set()  # TRIZ #3: normalized baseline for semantic diffing
         if code.success:
             coder_success = True
             extracted = self._extract_code(code.output)
@@ -1272,8 +1326,15 @@ class ModelRouter:
                     compile_passed = True
                 else:
                     compile_errs = cc.get("errors", [])
-                    result["compile_errors"].extend(compile_errs)
+                    # Bug 4: assign (not extend) — compile_errors always reflects the
+                    # LATEST check's state, not an ever-growing accumulation of every
+                    # error seen across every iteration. Full history is kept separately
+                    # in compile_error_history for reporting.
+                    result["compile_errors"] = list(compile_errs)
+                    result["compile_error_history"].append({"iteration": 0, "errors": list(compile_errs)})
                     prev_error_count = len(compile_errs)  # TRIZ #23: baseline for prompt evolution
+                    prev_errors_set = set(e.strip() for e in compile_errs if e.strip())  # TRIZ #22: baseline
+                    prev_errors_norm = set(self._normalize_error(e) for e in compile_errs if e.strip())  # TRIZ #3: baseline
                     err_summary = "; ".join(compile_errs[:3]) if compile_errs else cc["compile_output"][:300]
                     result["changes"].append(f"[hipcc] In-loop compile FAILED: {err_summary[:120]}")
                     # Feed compile errors to GLM evaluator as additional feedback
@@ -1322,12 +1383,16 @@ class ModelRouter:
         #   If compile passes → THEN run GLM for semantic check (shfl correctness, perf).
         # This eliminates conflicting signals and saves the GLM call when compile fails.
         opt = PromptOptimizer()
-        prev_error_count = 0  # TRIZ #23: track error delta across iterations
-        prev_errors_set  = set()  # TRIZ #22: track which errors we've already shown (raw)
-        prev_errors_norm = set()  # TRIZ #3/#22: normalized set for semantic diffing
+        # prev_error_count / prev_errors_set / prev_errors_norm are intentionally NOT
+        # reset here — they were seeded above from the pre-loop compile check (or
+        # remain at their 0/empty defaults if that check passed outright). Resetting
+        # them to 0/empty at this point used to make iteration 1's error delta a
+        # phantom "-N" against a fake zero baseline, which fired the stagnation
+        # detector on iteration 1 even when the port was genuinely improving.
         stagnation_count = 0  # TRIZ #15: count iterations with no improvement
         error_history = []  # TRIZ #17: cap error context to last 2 iterations
         norm_error_history = []  # A5: track normalized error frozensets for cycle detection
+        replan_count = 0  # Bug 7: how many stagnation re-plans we've already used
         for iteration in range(1, max_iterations + 1):
             if not result["ported_code"]:
                 break
@@ -1356,7 +1421,31 @@ class ModelRouter:
                 else:
                     compile_failed_this_iter = True
                     compile_errs = cc.get("errors", [])
-                    result["compile_errors"].extend(compile_errs)
+                    # Bug 5: computed deterministically from line numbers in verifier.py
+                    # (_classify_error_origin), not guessed by an LLM — an error whose line
+                    # falls outside the ported kernel's spliced range in the harness is one
+                    # Kimi cannot fix, because it's not in code Kimi ever wrote or saw.
+                    all_harness_origin = cc.get("all_harness_origin", False)
+                    # Bug 4: assign, don't accumulate — see note at the pre-loop check above.
+                    result["compile_errors"] = list(compile_errs)
+                    result["compile_error_history"].append({"iteration": iteration, "errors": list(compile_errs)})
+
+                    # ── Bug 5, trigger 1: harness-origin errors are unfixable by Kimi ──
+                    # No refinement iteration can fix a line that isn't in the code Kimi
+                    # wrote — that's the root finding of the nvidia_shfl_scan failure
+                    # (docs/fix-plan-harness-and-diagnostics.md). Abort immediately rather
+                    # than burning the remaining iteration budget on guaranteed repeats.
+                    if all_harness_origin and compile_errs:
+                        result["changes"].append(
+                            f"[hipcc] Iter {iteration}: all {len(compile_errs)} error(s) originate "
+                            f"in harness/driver code, not the ported kernel — Kimi cannot fix "
+                            f"these. Aborting early instead of repeating {max_iterations - iteration} "
+                            f"more guaranteed-identical iterations.")
+                        print(f"║  │  🛑 ABORT: errors are in the test harness, not the ported "
+                              f"kernel — see spec coverage{'':<8}║")
+                        result["iterations_used"] = iteration
+                        result["abort_reason"] = "harness_origin"
+                        break
 
                     # TRIZ #3/#22/#28: Semantic error diffing — normalize before
                     # comparing so the same error at a different line number is
@@ -1372,17 +1461,19 @@ class ModelRouter:
                     # TRIZ #23: Track convergence — error count delta
                     current_err_count = len(compile_errs)
                     error_delta = prev_error_count - current_err_count
-                    error_history.append(current_err_count)
                     result["changes"].append(
                         f"[hipcc] Iter {iteration}: {current_err_count} errors "
                         f"(delta: {error_delta:+d}, new: {len(new_errors_norm)}, "
                         f"resolved: {len(resolved_errors)})")
 
-                    # LIVE VISIBILITY: Print error details during loop, not after
+                    # LIVE VISIBILITY: Print error details during loop, not after.
+                    # verifier._compile() already strips the temp build-dir path prefix
+                    # from these lines, so [:58] now shows "file:line:col: error: msg"
+                    # instead of the path alone (the original bug here truncated at the
+                    # exact character the path ended and the message began).
                     top_errs = compile_errs[:2] if compile_errs else ["(no error lines parsed)"]
                     for err_line in top_errs:
-                        # Truncate and clean for terminal display
-                        clean = err_line.strip()[:60]
+                        clean = err_line.strip()[:58]
                         if clean:
                             print(f"║  │  ⚠ {clean:<58}║")
                     trend = f"{'↓' if error_delta > 0 else '↑' if error_delta < 0 else '→'} {current_err_count} errs (Δ{error_delta:+d}, new:{len(new_errors_norm)})"
@@ -1410,23 +1501,48 @@ class ModelRouter:
                         print(f"║  │  🔁 CYCLE: same errors recurred — stagnation escalated{'':<27}║")
                     norm_error_history.append(current_norm_frozen)
 
-                    # TRIZ #15: After 3 stagnant iterations, escalate to DeepSeek re-plan
-                    if stagnation_count >= 3 and iteration < max_iterations:
+                    # ── Bug 5, trigger 2 / Bug 7: hard stagnation abort ──
+                    # If we already spent our one re-plan attempt on a fresh strategy and
+                    # errors are STILL not decreasing, more iterations won't help.
+                    if stagnation_count >= 3 and replan_count >= 1:
+                        result["changes"].append(
+                            f"[hipcc] Hard stagnation: {stagnation_count} iterations with no "
+                            f"improvement AFTER a fresh DeepSeek re-plan already failed to help. "
+                            f"Aborting — a second re-plan is unlikely to succeed where the first "
+                            f"one didn't.")
+                        print(f"║  │  🛑 ABORT: fresh strategy also stagnated — giving up{'':<20}║")
+                        result["iterations_used"] = iteration
+                        result["abort_reason"] = "hard_stagnation"
+                        break
+
+                    # TRIZ #15: After 3 stagnant iterations, escalate to DeepSeek re-plan —
+                    # but only once (see hard-stagnation abort above for what happens next).
+                    if stagnation_count >= 3 and replan_count == 0 and iteration < max_iterations:
                         result["changes"].append(
                             f"[hipcc] Stagnation detected ({stagnation_count} iterations no improvement) "
                             f"— escalating to DeepSeek re-plan")
                         print(f"║  │  🔄 STAGNATION: {stagnation_count} iters no improvement — re-planning{'':<24}║")
                         if on_phase: on_phase("plan", "DeepSeek-v4-pro",
                             f"re-planning due to stagnation (iter {iteration})")
+                        replan_prompt = self._build_deepseek_replan_prompt(
+                            kernel_source, patterns, result["ported_code"],
+                            compile_errs, deepseek_plan_output,
+                        )
                         re_plan = self._call_model(
-                            "deepseek", ds_prompt,
+                            "deepseek", replan_prompt,
                             system_prompt=SYSTEM_PROMPTS.get("deepseek", ""),
                         )
+                        replan_count += 1
                         if re_plan.success:
                             deepseek_plan_output = re_plan.output
                             result["changes"].append(
-                                f"[deepseek] Re-plan generated (stagnation recovery)")
-                            stagnation_count = 0  # Reset after re-plan
+                                f"[deepseek] Re-plan generated (stagnation recovery, "
+                                f"fresh strategy vs. previous plan)")
+                            # Bug 7: deliberately NOT resetting stagnation_count to 0 here.
+                            # The old behavior erased the evidence the loop was stuck,
+                            # letting it re-plan indefinitely. Leaving the counter running
+                            # means the hard-stagnation abort above can actually fire once
+                            # this fresh strategy also fails to show improvement.
                         # Keep the same compile errors for Kimi, but with fresh plan
 
                     err_summary = "; ".join(compile_errs[:3]) if compile_errs else cc["compile_output"][:300]
@@ -1491,7 +1607,16 @@ class ModelRouter:
                     # when Kimi needs semantic guidance MOST. Raw hipcc errors like
                     # "undefined reference to hipMalloc" don't tell Kimi WHY — it needs
                     # "you forgot #include <hip/hip_runtime.h>". GLM bridges this gap.
-                    if compile_errs and iteration < max_iterations:
+                    #
+                    # Guarded by `not all_harness_origin`: if every error's line number
+                    # falls outside the ported kernel's range in the harness, the errors
+                    # are not in code Kimi wrote — asking GLM to explain them produces a
+                    # confident, plausible, WRONG root cause (it cannot say "this isn't in
+                    # the code you gave me" because it was never asked to consider that).
+                    # See docs/fix-plan-harness-and-diagnostics.md, "Regression introduced
+                    # by a0d2bc5". Bug 5 aborts the loop entirely in this case (below);
+                    # skipping the analyst call here avoids paying for it either way.
+                    if compile_errs and iteration < max_iterations and not all_harness_origin:
                         if on_phase: on_phase("analyze", "GLM-5.2",
                             f"analyzing compile errors for Kimi (iter {iteration})")
                         print(f"║  │  🔍 GLM analyzing {len(compile_errs)} compile errors for Kimi{'':<30}║")

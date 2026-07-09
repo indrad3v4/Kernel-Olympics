@@ -88,31 +88,36 @@ def test_generate_harness_spec_driven():
     """_generate_harness should use spec when available."""
     agent = VerificationAgent()
     source = "__global__ void warp_reduce_kernel(const float* input, float* output, int n) {}"
-    harness = agent._generate_harness("warp_reduce", "", source)
+    harness, kernel_start, kernel_end = agent._generate_harness("warp_reduce", "", source)
     # Spec-driven: should have dim3(4,1,1), dim3(64,1,1) instead of hardcoded <<<4, 64>>>
     assert "dim3(4,1,1)" in harness
     assert "dim3(64,1,1)" in harness
     assert "warp_reduce_kernel" in harness
     assert "hipMalloc" in harness
     assert "hipMemcpy" in harness
+    # The reported kernel line range must actually contain the spliced source
+    spliced_lines = harness.splitlines()[kernel_start - 1:kernel_end]
+    assert "\n".join(spliced_lines) == source
 
 
 def test_generate_harness_legacy_fallback():
     """_generate_harness should fall back to legacy harness when no spec."""
     agent = VerificationAgent()
     source = "__global__ void my_kernel() {}"
-    harness = agent._generate_harness("unknown_kernel", "", source)
+    harness, kernel_start, kernel_end = agent._generate_harness("unknown_kernel", "", source)
     # Legacy: hardcoded <<<4, 64>>>
     assert "<<<4, 64>>>" in harness
     assert "hip/hip_runtime.h" in harness
     assert "my_kernel" in harness
+    spliced_lines = harness.splitlines()[kernel_start - 1:kernel_end]
+    assert "\n".join(spliced_lines) == source
 
 
 def test_harness_histogram_dynamic_shared():
     """Histogram harness should include dynamic shared memory."""
     agent = VerificationAgent()
     source = "__global__ void histogram_kernel(const float* input, int* histogram, int n, int num_bins) {}"
-    harness = agent._generate_harness("histogram", "", source)
+    harness, _start, _end = agent._generate_harness("histogram", "", source)
     # dim3(1,1,1), dim3(256,1,1), dynamic shared mem 1024
     assert "dim3(1,1,1)" in harness
     assert "dim3(256,1,1)" in harness
@@ -123,10 +128,67 @@ def test_harness_transpose_2d_block():
     """Transpose harness should use 2D block (32,32)."""
     agent = VerificationAgent()
     source = "__global__ void transpose_kernel(const float* input, float* output, int width, int height) {}"
-    harness = agent._generate_harness("transpose", "", source)
+    harness, _start, _end = agent._generate_harness("transpose", "", source)
     assert "dim3(3,3,1)" in harness
     assert "dim3(32,32,1)" in harness
     assert "linear_ramp" not in harness or True  # not a string check we need
+
+
+# ── Bug 2: self-contained programs must not be wrapped in a second harness ──
+
+
+def test_generate_harness_skips_wrapping_when_source_has_main():
+    """A ported source that already defines int main() must be returned as-is.
+
+    Regression test for the nvidia_shfl_scan.cu failure: wrapping a complete
+    NVIDIA sample program (which brings its own main()) in the generic
+    harness produced two main() definitions -> 'redefinition of main', and
+    every downstream compile error was then unattributable to the ported
+    code (see docs/fix-plan-harness-and-diagnostics.md, Bug 2).
+    """
+    agent = VerificationAgent()
+    source = (
+        "__global__ void shfl_scan_test(int *data, int width, int *partial_sums) {}\n"
+        "int main() {\n"
+        "    shfl_scan_test<<<1,1>>>(nullptr, 32, nullptr);\n"
+        "    return 0;\n"
+        "}\n"
+    )
+    harness, kernel_start, kernel_end = agent._generate_harness("nvidia_shfl_scan", "", source)
+    assert harness == source
+    assert harness.count("int main(") == 1
+    assert kernel_start == 1
+    assert kernel_end == len(source.splitlines())
+
+
+def test_generate_harness_main_detection_ignores_indentation_and_comments():
+    """int main( should be detected regardless of leading whitespace."""
+    agent = VerificationAgent()
+    source = "    int main(void) {\n        return 0;\n    }\n"
+    harness, kernel_start, kernel_end = agent._generate_harness("some_kernel", "", source)
+    assert harness == source
+
+
+def test_classify_error_origin_ported_code():
+    agent = VerificationAgent()
+    origin = agent._classify_error_origin(
+        "test_kernel.cpp:8:5: error: use of undeclared identifier 'foo'", 6, 20
+    )
+    assert origin == "ported_code"
+
+
+def test_classify_error_origin_harness():
+    agent = VerificationAgent()
+    origin = agent._classify_error_origin(
+        "test_kernel.cpp:67:5: error: redefinition of 'main'", 6, 20
+    )
+    assert origin == "harness"
+
+
+def test_classify_error_origin_unknown_when_unparseable():
+    agent = VerificationAgent()
+    origin = agent._classify_error_origin("some unrelated log line", 6, 20)
+    assert origin == "unknown"
 
 
 def test_verify_spec_tracking():

@@ -108,7 +108,7 @@ class VerificationAgent:
         src_file = self.build_dir / f"{kernel_name}.hip.cpp"
         src_file.write_text(warmup_src, encoding="utf-8")
 
-        compile_ok, compile_out = self._compile(src_file, self.build_dir, kernel_name)
+        compile_ok, compile_out, _log_path = self._compile(src_file, self.build_dir, kernel_name)
 
         if compile_ok:
             self._run(self.build_dir, kernel_name)
@@ -163,7 +163,7 @@ class VerificationAgent:
     # ── Spec-driven harness generation ──────────────────────────────
 
     def _generate_harness(self, kernel_name: str, test_input: str,
-                          ported_kernel_source: str) -> str:
+                          ported_kernel_source: str) -> tuple:
         """
         Generate a test harness driven by the kernel's JSON spec.
 
@@ -171,7 +171,23 @@ class VerificationAgent:
         correct launch configuration, parameter list, input setup, and
         output readback.  Otherwise falls back to the legacy heuristic
         (auto-detect kernel function, generic 256‑element harness).
+
+        Self-contained programs (source already defining ``int main(``) are
+        returned as-is — wrapping a second driver/``main`` around a complete
+        program is what caused the harness to redefine ``main`` and shadow
+        the program's own logic (e.g. ``nvidia_shfl_scan.cu``, a full NVIDIA
+        sample, not a bare kernel snippet).
+
+        Returns (harness_text, kernel_line_start, kernel_line_end): the
+        1-indexed, inclusive line range within *harness_text* that
+        corresponds to *ported_kernel_source*. Callers use this to tell
+        whether a hipcc error originates in the ported code or in
+        harness-authored driver code — see :meth:`_classify_error_origin`.
         """
+        import re
+        if re.search(r'^\s*int\s+main\s*\(', ported_kernel_source, re.MULTILINE):
+            return ported_kernel_source, 1, len(ported_kernel_source.splitlines())
+
         # Try loading the spec
         spec = self.load_spec(kernel_name)
 
@@ -179,12 +195,44 @@ class VerificationAgent:
             return self._harness_from_spec(spec, ported_kernel_source)
 
         # Fallback: legacy heuristic
-        import re
         match = re.search(r'__global__\s+void\s+(\w+)\s*\(', ported_kernel_source)
         actual_kernel = match.group(1) if match else f"{kernel_name}_kernel"
         return self._legacy_harness(actual_kernel, ported_kernel_source)
 
-    def _harness_from_spec(self, spec: dict, ported_kernel_source: str) -> str:
+    def _warn_if_legacy_harness(self, kernel_name: str, ported_kernel_source: str) -> None:
+        """Print a loud warning when compilation will use the guessed generic harness.
+
+        Mirrors the exact branch condition in :meth:`_generate_harness`: the
+        legacy harness fires only when the source is not self-contained
+        (no ``int main(``) and no JSON spec exists for *kernel_name*. Silent
+        use of this guessed harness is what made a signature mismatch look
+        like a mystery ``hipMalloc`` compile error instead of an obvious
+        "no spec" warning.
+        """
+        import re
+        if re.search(r'^\s*int\s+main\s*\(', ported_kernel_source, re.MULTILINE):
+            return
+        if self.load_spec(kernel_name) is not None:
+            return
+        print(f"║ ⚠️ No spec for '{kernel_name}' — using generic 256-element harness "
+              f"(assumes a (float*, float*, int) signature launched <<<4,64>>>). "
+              f"Signature may not match; add src/verification/specs/{kernel_name}.json.")
+
+    def _classify_error_origin(self, error_line: str, kernel_start: int, kernel_end: int) -> str:
+        """Classify a hipcc diagnostic as pointing into the ported kernel or the harness.
+
+        Errors in harness-authored lines (the driver's own main/mallocs/launch
+        call) are not fixable by refining the ported kernel — no amount of
+        LLM feedback can fix a line the model never wrote or saw.
+        """
+        import re
+        m = re.search(r':(\d+):\d+:\s*(?:fatal )?error:', error_line)
+        if not m:
+            return "unknown"
+        line_no = int(m.group(1))
+        return "ported_code" if kernel_start <= line_no <= kernel_end else "harness"
+
+    def _harness_from_spec(self, spec: dict, ported_kernel_source: str) -> tuple:
         """Build a C++ harness from a kernel spec dictionary."""
         fn = spec.get("kernel_function", "kernel")
         params = spec.get("params", [])
@@ -305,13 +353,18 @@ class VerificationAgent:
         kernel_call_args = ", ".join(kernel_args)
 
         # Assemble full harness
-        lines = [
+        preamble = [
             '#include <iostream>',
             '#include <iomanip>',
             '#include <vector>',
             '#include <hip/hip_runtime.h>',
             '#include <cmath>',
             '',
+        ]
+        kernel_start = len(preamble) + 1  # 1-indexed line where ported_kernel_source begins
+        kernel_end = kernel_start + len(ported_kernel_source.splitlines()) - 1
+        lines = [
+            *preamble,
             ported_kernel_source,
             '',
             'int main() {',
@@ -346,43 +399,55 @@ class VerificationAgent:
         lines.append('    return 0;')
         lines.append('}')
 
-        return '\n'.join(lines)
+        return '\n'.join(lines), kernel_start, kernel_end
 
-    def _legacy_harness(self, actual_kernel: str, ported_kernel_source: str) -> str:
-        """Legacy fallback harness (hardcoded 256-element generic harness)."""
-        return f"""
-#include <iostream>
-#include <vector>
-#include <hip/hip_runtime.h>
-#include <cmath>
+    def _legacy_harness(self, actual_kernel: str, ported_kernel_source: str) -> tuple:
+        """Legacy fallback harness (hardcoded 256-element generic harness).
 
-{ported_kernel_source}
-
-int main() {{
-    const int N = 256;
-    std::vector<float> input(N, 1.0f);
-    std::vector<float> output(N, 0.0f);
-
-    float *d_input, *d_output;
-    hipMalloc(&d_input, N * sizeof(float));
-    hipMalloc(&d_output, N * sizeof(float));
-
-    hipMemcpy(d_input, input.data(), N * sizeof(float), hipMemcpyHostToDevice);
-
-    {actual_kernel}<<<4, 64>>>(d_input, d_output, N);
-    hipDeviceSynchronize();
-
-    hipMemcpy(output.data(), d_output, 4 * sizeof(float), hipMemcpyDeviceToHost);
-
-    for (int i = 0; i < 4; i++) {{
-        std::cout << output[i] << std::endl;
-    }}
-
-    hipFree(d_input);
-    hipFree(d_output);
-    return 0;
-}}
-"""
+        This is a *guess* about the kernel's signature (assumes
+        ``(float* in, float* out, int n)``-shaped params, launched as
+        ``<<<4, 64>>>``) used only when no JSON spec exists for the kernel.
+        It will misfire on kernels with a different signature — see the
+        warning this emits in :meth:`_generate_harness` callers.
+        """
+        preamble = [
+            "#include <iostream>",
+            "#include <vector>",
+            "#include <hip/hip_runtime.h>",
+            "#include <cmath>",
+            "",
+        ]
+        kernel_start = len(preamble) + 1  # 1-indexed line where ported_kernel_source begins
+        kernel_end = kernel_start + len(ported_kernel_source.splitlines()) - 1
+        driver = [
+            "",
+            "int main() {",
+            "    const int N = 256;",
+            "    std::vector<float> input(N, 1.0f);",
+            "    std::vector<float> output(N, 0.0f);",
+            "",
+            "    float *d_input, *d_output;",
+            "    hipMalloc(&d_input, N * sizeof(float));",
+            "    hipMalloc(&d_output, N * sizeof(float));",
+            "",
+            "    hipMemcpy(d_input, input.data(), N * sizeof(float), hipMemcpyHostToDevice);",
+            "",
+            f"    {actual_kernel}<<<4, 64>>>(d_input, d_output, N);",
+            "    hipDeviceSynchronize();",
+            "",
+            "    hipMemcpy(output.data(), d_output, 4 * sizeof(float), hipMemcpyDeviceToHost);",
+            "",
+            "    for (int i = 0; i < 4; i++) {",
+            "        std::cout << output[i] << std::endl;",
+            "    }",
+            "",
+            "    hipFree(d_input);",
+            "    hipFree(d_output);",
+            "    return 0;",
+            "}",
+        ]
+        harness = "\n".join([*preamble, ported_kernel_source, *driver])
+        return harness, kernel_start, kernel_end
 
     # ── Verify method (using persistent build directory) ────────────
 
@@ -401,18 +466,20 @@ int main() {{
         src_file.write_text(hip_source, encoding="utf-8")
 
         if on_progress: on_progress(15, "generating harness")
-        harness = self._generate_harness(kernel_name, "", hip_source)
+        harness, kernel_start, kernel_end = self._generate_harness(kernel_name, "", hip_source)
         harness_file = kernel_build_dir / f"test_{kernel_name}.cpp"
         harness_file.write_text(harness, encoding="utf-8")
+        self._warn_if_legacy_harness(kernel_name, hip_source)
 
         if on_progress: on_progress(30, "starting hipcc")
-        compile_ok, compile_out = self._compile(harness_file, kernel_build_dir, kernel_name)
+        compile_ok, compile_out, compile_log_path = self._compile(harness_file, kernel_build_dir, kernel_name)
 
         if on_progress: on_progress(100, "done" if compile_ok else "compile failed")
 
         # Extract error lines for concise LLM feedback
         # TRIZ #22: Throwing away — filter template noise, keep only actionable errors
         errors = []
+        origins = []  # parallel to primary error lines only (not caret context lines)
         lines = compile_out.splitlines()
         for i, line in enumerate(lines):
             stripped = line.strip()
@@ -426,6 +493,7 @@ int main() {{
                 continue
             # Keep the error line + 1 context line after (often shows the code)
             errors.append(stripped[:200])
+            origins.append(self._classify_error_origin(stripped, kernel_start, kernel_end))
             # Include the next line if it shows the code caret (^~~~)
             if i + 1 < len(lines) and lines[i + 1].strip().startswith("|"):
                 errors.append(lines[i + 1].strip()[:200])
@@ -438,10 +506,19 @@ int main() {{
                     if len(errors) >= 3:
                         break
 
+        # Bug 5: if every classifiable error points outside the ported kernel's
+        # line range, no amount of Kimi refinement can fix it — it's the
+        # harness (or spec-driven driver code) that's broken, not the port.
+        known_origins = [o for o in origins if o != "unknown"]
+        all_harness_origin = bool(known_origins) and all(o == "harness" for o in known_origins)
+
         return {
             "compile_success": compile_ok,
             "compile_output": compile_out[:2000] if compile_out else "",
             "errors": errors[:8],  # concise — LLM doesn't need 10+ error lines
+            "error_origins": origins[:8],
+            "all_harness_origin": all_harness_origin,
+            "compile_log_path": compile_log_path,
             "kernel_name": kernel_name,
         }
 
@@ -493,18 +570,20 @@ int main() {{
 
         # Step 2: Generate harness (10→20%)
         if on_progress: on_progress(15, "generating test harness")
-        harness = self._generate_harness(kernel_name, test_input, hip_source)
+        harness, _kernel_start, _kernel_end = self._generate_harness(kernel_name, test_input, hip_source)
         harness_file = kernel_build_dir / f"test_{kernel_name}.cpp"
         harness_file.write_text(harness, encoding="utf-8")
+        self._warn_if_legacy_harness(kernel_name, hip_source)
 
         # Step 3: Compile with hipcc (20→70%)
         if on_progress: on_progress(25, "starting hipcc compilation")
-        compile_ok, compile_out = self._compile(
+        compile_ok, compile_out, compile_log_path = self._compile(
             harness_file, kernel_build_dir, kernel_name, on_progress=on_progress
         )
         if on_progress: on_progress(70, "compilation complete" if compile_ok else "compilation failed")
         result["compile_success"] = compile_ok
         result["compile_output"] = compile_out[:1000] if compile_out else ""
+        result["compile_log_path"] = compile_log_path
 
         if not compile_ok:
             manual_dir = Path.cwd() / "ported_kernels"
@@ -515,10 +594,12 @@ int main() {{
                 shutil.copy2(harness_file, manual_path)
                 compile_out += f"\n\n⚠️ Ported kernel saved to: {manual_path}\n"
                 compile_out += f"   Compile manually: hipcc -o /tmp/{kernel_name} {manual_path} -std=c++17 -O2\n"
-                compile_out += f"   Run: /tmp/{kernel_name}"
+                compile_out += f"   Run: /tmp/{kernel_name}\n"
+                compile_out += f"   Full compile log: {compile_log_path}"
             except Exception as e:
                 print(f"║ ⚠️ Failed to save ported kernel to {manual_path}: {e}")
                 pass
+            result["compile_output"] = compile_out[:1000] if compile_out else ""
             if on_progress: on_progress(100, "failed — saved for manual hipcc")
             result["passed"] = False
             return result
@@ -561,12 +642,46 @@ int main() {{
 
     # ── Compile / Run / Diff helpers (unchanged from original) ──────
 
+    def _write_compile_log(self, build_dir: Path, kernel_name: str, output: str) -> str:
+        """Write the FULL, untruncated compiler output to disk.
+
+        Terminal/report display always truncates for readability — this file
+        is the one place the complete diagnostic text survives, so it can be
+        `cat`-ed when the truncated summary isn't enough to debug a failure.
+        """
+        log_path = build_dir / f"{kernel_name}.compile.log"
+        try:
+            log_path.write_text(output, encoding="utf-8")
+        except OSError as e:
+            print(f"║ ⚠️ Failed to write compile log to {log_path}: {e}")
+        return str(log_path)
+
+    def _shorten_error_line(self, line: str, build_dir: Path) -> str:
+        """Strip the temp build-dir prefix from a hipcc diagnostic line.
+
+        hipcc reports paths as ``<build_dir>/<file>:<line>:<col>: error: ...``.
+        The build_dir portion is a long, high-entropy temp path (e.g.
+        ``/tmp/verifier_build_0x_00_mm/loop_nvidia_shfl_scan/``) that eats the
+        entire character budget of any truncated display, pushing the actual
+        ``error: <message>`` text off the end. Stripping it here — once, at
+        the source — means every caller that later does ``line[:N]`` for
+        terminal width shows the message instead of the path.
+        """
+        for prefix in (str(build_dir) + os.sep, str(build_dir).replace(os.sep, "/") + "/"):
+            if line.startswith(prefix):
+                return line[len(prefix):]
+        return line
+
     def _compile(self, harness_file: Path, build_dir: Path, kernel_name: str,
                  on_progress=None) -> tuple:
         """Compile HIP kernel with hipcc.
 
         on_progress: optional callback(percent: int, stage: str) — called
         at key compilation milestones so the UI can show a 0-100% bar.
+
+        Returns (compile_ok, compile_output, compile_log_path). compile_output
+        has build-dir path prefixes stripped for readability; compile_log_path
+        points to the full, untruncated, unstripped output on disk.
         """
         output_bin = build_dir / kernel_name
 
@@ -586,7 +701,12 @@ int main() {{
                     cwd=str(build_dir)
                 )
                 if on_progress: on_progress(65, "hipcc finished")
-                return result.returncode == 0, result.stdout + result.stderr
+                raw_output = result.stdout + result.stderr
+                log_path = self._write_compile_log(build_dir, kernel_name, raw_output)
+                shortened = "\n".join(
+                    self._shorten_error_line(line, build_dir) for line in raw_output.splitlines()
+                )
+                return result.returncode == 0, shortened, log_path
             except (subprocess.TimeoutExpired, FileNotFoundError) as e:
                 manual_dir = Path.cwd() / "ported_kernels"
                 manual_dir.mkdir(parents=True, exist_ok=True)
@@ -597,11 +717,13 @@ int main() {{
                 except Exception as e:
                     print(f"║ ⚠️ Failed to copy kernel to {manual_path} during compile fallback: {e}")
                     pass
-                return False, (
+                msg = (
                     f"hipcc compilation failed. Ported kernel saved to {manual_path}.\n"
                     f"To compile manually: hipcc -o /tmp/{kernel_name} {manual_path} -std=c++17 -O2\n"
                     f"Then run: /tmp/{kernel_name}"
                 )
+                log_path = self._write_compile_log(build_dir, kernel_name, msg)
+                return False, msg, log_path
         else:
             manual_dir = Path.cwd() / "ported_kernels"
             manual_dir.mkdir(parents=True, exist_ok=True)
@@ -617,7 +739,8 @@ int main() {{
                 f"To compile manually: hipcc -o /tmp/{kernel_name} {manual_path} -std=c++17 -O2\n"
                 f"Then run: /tmp/{kernel_name}"
             )
-            return False, msg
+            log_path = self._write_compile_log(build_dir, kernel_name, msg)
+            return False, msg, log_path
 
     def _run(self, build_dir: Path, kernel_name: str) -> tuple:
         """Run the compiled HIP kernel."""
