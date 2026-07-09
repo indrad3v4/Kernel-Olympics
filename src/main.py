@@ -60,6 +60,43 @@ def bold(s): return _c(s, 1)
 def dim(s): return _c(s, 2)
 
 
+def gate_confidence(port_confidence, passed: bool):
+    """T0.2: confidence is a claim about a VERIFIED port.
+
+    The authoritative verifier's ``passed`` (compiled + ran + diffed) is the
+    only gate — deliberately stricter than the orchestrator's in-loop
+    compile_ok / orch_passed. So a kernel that compiled in-loop but did not
+    verify (crashed, diffed, or the orchestrator bailed) reports 0, not the
+    porter's optimistic self-score.
+    """
+    return port_confidence if passed else 0
+
+
+def compute_run_verdict(verification_results: list) -> tuple:
+    """T0.3: a single honest verdict for a run → (verdict_str, exit_fail).
+
+    "no GPU" is NOT a failure of the port — it means we could not test it —
+    so it is kept distinct from a real FAILED (compiled+crashed / diffed /
+    failed to compile with a GPU present). exit_fail is True only when a real
+    port was verified and failed.
+    """
+    def _no_gpu(v):
+        return (not v.get("hipcc_available", True)) or \
+               ("hipcc not found" in v.get("compile_output", ""))
+
+    attempted = len(verification_results)
+    passed = sum(1 for v in verification_results if v.get("passed"))
+    if attempted == 0:
+        return "NO PORTS NEEDED", False
+    if all(_no_gpu(v) for v in verification_results):
+        return "UNVERIFIED (no GPU)", False
+    if passed == 0:
+        return "FAILED", True
+    if passed == attempted:
+        return "PASSED", False
+    return f"PARTIAL ({passed}/{attempted} verified)", False
+
+
 def verification_failure_label(ver_result: dict) -> str:
     """Pick the failure label for a verify() result that did not pass.
 
@@ -413,11 +450,11 @@ class KernelOlympics:
                 sys.stdout.write("\r" + " " * 80 + "\r")  # clear progress bar
                 sys.stdout.flush()
 
-                # T0.2: confidence is a claim about a VERIFIED port. If verification
-                # did not pass — didn't compile, crashed, or output diffed — the
-                # porter's optimistic score is fiction. A real number only survives a
-                # real pass; otherwise it is 0. No more "47%" on code that never ran.
-                ver_result["confidence"] = port_result.get("confidence", 0) if ver_result.get("passed") else 0
+                # T0.2: confidence only survives a real verification pass (see
+                # gate_confidence). Gated on the authoritative verifier — so
+                # compile-in-loop-but-not-verified also lands at 0.
+                ver_result["confidence"] = gate_confidence(
+                    port_result.get("confidence", 0), ver_result.get("passed"))
                 # Attach in-loop compile errors to verification result
                 if port_result.get("compile_errors"):
                     ver_result["in_loop_compile_errors"] = port_result["compile_errors"]
@@ -487,10 +524,12 @@ class KernelOlympics:
                     # GPU unavailable — the port was never compiled or run, so it is
                     # UNVERIFIED. T0.4: store it quarantined (verified=False) so it is
                     # never served on a hit; a later real verification can promote it.
+                    # Review: confidence 0.0, not 0.70 — nothing compiled or ran, so a
+                    # non-zero score here would be as much a fiction as the old 47%.
                     self.memory.store(
                         pattern_snippet=source[:500],
                         verified_fix=port_result.get("ported_code", "")[:500],
-                        confidence=0.70,
+                        confidence=0.0,
                         verification_run_id="template_unverified",
                         llm_time_s=port_result.get("llm_time_s", 0.0),
                         findings=cr.get("findings", []),
@@ -594,25 +633,8 @@ class KernelOlympics:
         )
         report["pipeline_state"] = pipeline_state
 
-        # T0.3: a single honest verdict for the whole run. "no GPU" is NOT a
-        # failure of the port — it means we couldn't test it — so it's kept
-        # distinct from a real FAILED (compiled+crashed / diffed / failed to
-        # compile with a GPU present).
-        def _no_gpu(v):
-            return (not v.get("hipcc_available", True)) or \
-                   ("hipcc not found" in v.get("compile_output", ""))
-        attempted = len(verification_results)
-        passed = sum(1 for v in verification_results if v.get("passed"))
-        if attempted == 0:
-            verdict, exit_fail = "NO PORTS NEEDED", False
-        elif all(_no_gpu(v) for v in verification_results):
-            verdict, exit_fail = "UNVERIFIED (no GPU)", False
-        elif passed == 0:
-            verdict, exit_fail = "FAILED", True
-        elif passed == attempted:
-            verdict, exit_fail = "PASSED", False
-        else:
-            verdict, exit_fail = f"PARTIAL ({passed}/{attempted} verified)", False
+        # T0.3: a single honest verdict for the whole run (see compute_run_verdict).
+        verdict, exit_fail = compute_run_verdict(verification_results)
         report["result"] = verdict
         pipeline_state["result"] = verdict
         pipeline_state["exit_fail"] = exit_fail
