@@ -37,6 +37,9 @@ class CacheEntry:
     llm_time_s: float = 0.0   # measured LLM time this fix originally cost
     times_retrieved: int = 0
     failure_count: int = 0    # verifications of this signature that failed
+    verified: bool = True     # T0.4: served on a hit ONLY if the fix actually
+                              # passed verification. Unverified "resume" attempts
+                              # are kept (verified=False) but never served.
     metadata: Dict = field(default_factory=dict)
 
     def to_public(self, retrieval_ms: Optional[float] = None) -> Dict:
@@ -49,6 +52,7 @@ class CacheEntry:
             "llm_time_s": self.llm_time_s,
             "times_retrieved": self.times_retrieved,
             "failure_count": self.failure_count,
+            "verified": self.verified,
             "match_type": "exact_signature",
             "metadata": dict(self.metadata),
         }
@@ -92,7 +96,8 @@ class PatternMemory:
     def store(self, pattern_snippet: str = "", verified_fix: str = "",
               confidence: float = 0.0, verification_run_id: str = "",
               llm_time_s: float = 0.0, *, findings=None,
-              signature=None, metadata: Optional[Dict] = None) -> Optional[str]:
+              signature=None, metadata: Optional[Dict] = None,
+              verified: bool = True) -> Optional[str]:
         """Cache a verified fix under its pattern signature.
 
         The signature is taken from (in priority order) ``signature``, then
@@ -119,14 +124,22 @@ class PatternMemory:
 
         existing = self._cache.get(key)
         if existing is not None:
-            # Same migration problem seen before — keep the strongest fix.
-            if confidence >= existing.confidence:
+            # T0.4: a verified fix is authoritative. Never let an unverified
+            # "resume" attempt overwrite or downgrade a fix that actually passed.
+            if existing.verified and not verified:
+                return existing.sig_id
+            # Promote an unverified entry the moment a verified fix arrives, even
+            # if its confidence is lower; otherwise keep the strongest fix.
+            promote = verified and not existing.verified
+            if promote or confidence >= existing.confidence:
                 existing.verified_fix = verified_fix
                 existing.confidence = confidence
+                existing.verified = verified or existing.verified
                 existing.llm_time_s = round(float(llm_time_s), 3)
                 existing.metadata.update(meta)
             else:
                 existing.confidence = max(existing.confidence, confidence)
+                existing.verified = existing.verified or verified
             self._persist(existing)
             return existing.sig_id
 
@@ -138,6 +151,7 @@ class PatternMemory:
             verified_fix=verified_fix,
             confidence=confidence,
             llm_time_s=round(float(llm_time_s), 3),
+            verified=verified,
             metadata=meta,
         )
         self._cache[key] = entry
@@ -171,6 +185,7 @@ class PatternMemory:
                 verified_fix="",
                 confidence=0.0,
                 failure_count=1,
+                verified=False,
                 metadata={"last_error": error_message[:200]} if error_message else {},
             )
             self._cache[key] = entry
@@ -193,7 +208,10 @@ class PatternMemory:
             return None
 
         entry = self._cache.get(sig.serialize())
-        if entry is None or not entry.verified_fix:
+        # T0.4: only a *verified* fix is served. An unverified resume attempt
+        # (verified=False) or a negative-only placeholder is a cache miss — this
+        # is what stops broken code coming back as a fast, confident "hit".
+        if entry is None or not entry.verified_fix or not entry.verified:
             self._misses += 1
             return None
 
@@ -302,12 +320,21 @@ class PatternMemory:
                 llm_time_s      REAL DEFAULT 0,
                 times_retrieved INTEGER DEFAULT 0,
                 failure_count   INTEGER DEFAULT 0,
+                verified        INTEGER DEFAULT 1,
                 metadata        TEXT,
                 created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
             """
         )
+        # T0.4: migrate DBs created before the `verified` column existed. Old rows
+        # default to verified=1 (they were stored as served-on-hit fixes).
+        try:
+            self._conn.execute(
+                f"ALTER TABLE {self._TABLE} ADD COLUMN verified INTEGER DEFAULT 1"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already present
         self._conn.commit()
 
     def _load_cache(self) -> None:
@@ -315,14 +342,14 @@ class PatternMemory:
         try:
             rows = self._conn.execute(
                 f"SELECT signature, sig_id, verified_fix, confidence, llm_time_s, "
-                f"times_retrieved, failure_count, metadata FROM {self._TABLE}"
+                f"times_retrieved, failure_count, verified, metadata FROM {self._TABLE}"
             ).fetchall()
         except sqlite3.Error:
             return
 
         for row in rows:
             try:
-                signature, sig_id, fix, confidence, llm_t, times, failures, meta_json = row
+                signature, sig_id, fix, confidence, llm_t, times, failures, verified, meta_json = row
                 if not signature:
                     continue
                 metadata = json.loads(meta_json) if meta_json else {}
@@ -336,6 +363,7 @@ class PatternMemory:
                     llm_time_s=float(llm_t or 0),
                     times_retrieved=int(times or 0),
                     failure_count=int(failures or 0),
+                    verified=bool(verified if verified is not None else 1),
                     metadata=metadata,
                 )
             except (ValueError, TypeError, json.JSONDecodeError):
@@ -352,8 +380,8 @@ class PatternMemory:
                 f"""
                 INSERT INTO {self._TABLE}
                     (signature, sig_id, verified_fix, confidence, llm_time_s,
-                     times_retrieved, failure_count, metadata, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                     times_retrieved, failure_count, verified, metadata, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                 ON CONFLICT(signature) DO UPDATE SET
                     sig_id          = excluded.sig_id,
                     verified_fix    = excluded.verified_fix,
@@ -361,13 +389,14 @@ class PatternMemory:
                     llm_time_s      = excluded.llm_time_s,
                     times_retrieved = excluded.times_retrieved,
                     failure_count   = excluded.failure_count,
+                    verified        = excluded.verified,
                     metadata        = excluded.metadata,
                     updated_at      = CURRENT_TIMESTAMP
                 """,
                 (
                     entry.signature, entry.sig_id, entry.verified_fix,
                     entry.confidence, entry.llm_time_s, entry.times_retrieved,
-                    entry.failure_count, json.dumps(entry.metadata),
+                    entry.failure_count, int(entry.verified), json.dumps(entry.metadata),
                 ),
             )
             self._conn.commit()

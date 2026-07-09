@@ -469,25 +469,30 @@ class KernelOlympics:
                     print(f"  ⚠️ Failed to save: {e}")
 
                 if ver_result.get("passed"):
+                    # T0.4: only this branch — an actual verification pass — writes
+                    # a verified fix that retrieve() will serve on a cache hit.
                     self.memory.store(
                         pattern_snippet=source[:500],
                         verified_fix=port_result.get("ported_code", "")[:500],
                         confidence=port_result.get("confidence", 80) / 100.0,
                         verification_run_id=ver_result.get("compile_output", "")[:20],
                         llm_time_s=port_result.get("llm_time_s", 0.0),
-                        findings=cr.get("findings", [])
+                        findings=cr.get("findings", []),
+                        verified=True,
                     )
                     self.disp.status("Verifying", f"{Path(cr['file']).name} {green('VERIFIED')}", ok=True)
                 elif not ver_result.get("compile_success") and "hipcc not found" in ver_result.get("compile_output", ""):
-                    # GPU unavailable — store as unverified template fix for the
-                    # "second kernel is faster" demo. Uses lower confidence.
+                    # GPU unavailable — the port was never compiled or run, so it is
+                    # UNVERIFIED. T0.4: store it quarantined (verified=False) so it is
+                    # never served on a hit; a later real verification can promote it.
                     self.memory.store(
                         pattern_snippet=source[:500],
                         verified_fix=port_result.get("ported_code", "")[:500],
-                        confidence=0.70,  # lower confidence — unverified
+                        confidence=0.70,
                         verification_run_id="template_unverified",
                         llm_time_s=port_result.get("llm_time_s", 0.0),
-                        findings=cr.get("findings", [])
+                        findings=cr.get("findings", []),
+                        verified=False,
                     )
                     self.disp.status("Verifying", f"{Path(cr['file']).name} {yellow('stored (unverified — no GPU)')}", ok=False)
                 else:
@@ -538,18 +543,21 @@ class KernelOlympics:
                     best_iter = port_result.get("best_attempt_iteration", 0)
                     if best_code:
                         best_confidence = port_result.get("best_attempt_confidence", 0.15)
+                        # T0.4: quarantined (verified=False) — kept so a re-run can
+                        # resume from the closest attempt, but NEVER served on a hit.
                         self.memory.store(
                             pattern_snippet=source[:500],
                             verified_fix=best_code[:500],
                             confidence=best_confidence,
                             verification_run_id=f"best_attempt_iter_{best_iter}",
                             llm_time_s=port_result.get("llm_time_s", 0.0),
-                            findings=cr.get("findings", [])
+                            findings=cr.get("findings", []),
+                            verified=False,
                         )
-                        print(f"║  {'📦 Cached best attempt (iter ' + str(best_iter) + ') @ ' + str(best_confidence*100) + '% confidence':<64}║")
+                        print(f"║  {'📦 Quarantined best attempt (iter ' + str(best_iter) + ') — resume only, not served':<64}║")
                     else:
-                        # No best-attempt code either — still cache the ported_code
-                        # with a token confidence so re-runs have a starting point.
+                        # No best-attempt code either — quarantine the ported_code so a
+                        # re-run has a starting point. Still verified=False (unserved).
                         fallback_code = port_result.get("ported_code", "")
                         if fallback_code:
                             self.memory.store(
@@ -558,9 +566,10 @@ class KernelOlympics:
                                 confidence=0.10,
                                 verification_run_id="best_attempt_fallback",
                                 llm_time_s=port_result.get("llm_time_s", 0.0),
-                                findings=cr.get("findings", [])
+                                findings=cr.get("findings", []),
+                                verified=False,
                             )
-                            print(f"║  {'📦 Cached fallback code @ 10% confidence (no compile success)':<64}║")
+                            print(f"║  {'📦 Quarantined fallback code — resume only, not served on hits':<64}║")
             else:
                 self.disp.file_done(Path(cr['file']).name, f"{cr.get('risk_level')} — no porting needed", ok=True)
 
