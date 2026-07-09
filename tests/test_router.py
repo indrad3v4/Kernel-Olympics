@@ -4,6 +4,7 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 import pytest
 from router import ModelRouter, AgentResult
@@ -292,3 +293,129 @@ class TestConvergenceLoop:
         )
         # DeepSeek should have been called at least twice (initial + re-plan)
         assert ds_call_count[0] >= 2, f"DeepSeek called {ds_call_count[0]} times, expected >=2"
+
+
+# ── Bug 1: self-contained programs must not be truncated ──────────────────────
+
+SELF_CONTAINED_SOURCE = """
+#include <cuda_runtime.h>
+__global__ void shfl_scan_test(int *data, int width, int *partial_sums = NULL) {
+    int tid = threadIdx.x;
+}
+
+""" + ("// padding line to push the real entry point past a 6000-character window\n" * 250) + """
+int main(int argc, char *argv[]) {
+    shfl_scan_test<<<4, 64>>>(nullptr, 0, nullptr);
+    return 0;
+}
+"""
+
+
+class TestSelfContainedPromptTruncation:
+    """Bug 1: Kimi must see a self-contained program's own main(), even when
+    the source is long enough that the old fixed character slices would have
+    cut it off (see docs/fix-plan-self-contained-programs.md)."""
+
+    def test_source_is_long_enough_to_have_broken_the_old_truncation(self):
+        # Sanity check on the fixture itself — if this fails, the fixture no
+        # longer exercises the bug and the tests below would pass vacuously.
+        assert len(SELF_CONTAINED_SOURCE) > 6000
+        assert SELF_CONTAINED_SOURCE[:6000].find("int main") == -1
+
+    def test_is_self_contained_detects_main(self, router):
+        assert router._is_self_contained(SELF_CONTAINED_SOURCE) is True
+        assert router._is_self_contained(CUDA_KERNEL_EXAMPLE) is False
+
+    def test_kimi_code_prompt_contains_full_main(self, router):
+        prompt = router._build_kimi_code_prompt(SELF_CONTAINED_SOURCE, patterns=[])
+        assert "int main(int argc, char *argv[])" in prompt
+        assert "CRITICAL" in prompt and "main()" in prompt
+
+    def test_kimi_refine_prompt_does_not_truncate_previous_code(self, router):
+        previous_code = SELF_CONTAINED_SOURCE  # pretend Kimi echoed it back
+        prompt = router._build_kimi_refine_prompt(
+            kernel_source=SELF_CONTAINED_SOURCE,
+            previous_code=previous_code,
+            feedback="fix the warp shuffle mask",
+            patterns=[],
+        )
+        assert "int main(int argc, char *argv[])" in prompt
+
+    def test_deepseek_plan_prompt_does_not_truncate_self_contained_source(self, router):
+        prompt = router._build_deepseek_plan_prompt(SELF_CONTAINED_SOURCE, patterns=[])
+        assert "int main(int argc, char *argv[])" in prompt
+
+    def test_bare_kernel_still_truncates_at_budget(self, router):
+        long_bare_kernel = CUDA_KERNEL_EXAMPLE + ("// pad\n" * 3000)
+        assert len(long_bare_kernel) > 6000
+        prompt = router._build_kimi_code_prompt(long_bare_kernel, patterns=[])
+        assert len(prompt) < len(long_bare_kernel) + 2000  # truncated, not echoed whole
+
+
+# ── Bug 3: missing local .cuh headers must not be silently ignored ────────────
+
+class TestUnresolvedLocalHeaders:
+
+    def test_detects_missing_cuh(self, router):
+        source = '#include "shfl_integral_image.cuh"\n__global__ void k(int* a) {}\n'
+        missing = router._unresolved_local_headers(source)
+        assert "shfl_integral_image.cuh" in missing
+
+    def test_no_false_positive_for_present_header(self, router, tmp_path):
+        # A header that genuinely exists anywhere under sample_kernels/
+        # (rglob, not just the same directory) must not be flagged.
+        sample_dir = Path(__file__).resolve().parent.parent / "sample_kernels"
+        probe = sample_dir / "_test_tmp_header_for_unit_test.cuh"
+        probe.write_text("// unit-test probe header\n", encoding="utf-8")
+        try:
+            source = '#include "_test_tmp_header_for_unit_test.cuh"\n'
+            missing = router._unresolved_local_headers(source)
+            assert "_test_tmp_header_for_unit_test.cuh" not in missing
+        finally:
+            probe.unlink()
+
+    def test_kimi_code_prompt_warns_about_missing_header(self, router):
+        source = (
+            '#include "shfl_integral_image.cuh"\n'
+            '__global__ void shfl_scan_test(int *data) {}\n'
+        )
+        prompt = router._build_kimi_code_prompt(source, patterns=[])
+        assert "shfl_integral_image.cuh" in prompt
+        assert "DROPPED" in prompt
+
+
+# ── Bug 2: NVIDIA helper_cuda/helper_functions compat shims ───────────────────
+
+class TestFixPortedCodeHelperShims:
+
+    def test_adds_shim_when_helper_symbols_present(self, router):
+        code = (
+            "#include <hip/hip_runtime.h>\n"
+            "int main() {\n"
+            "    int dev = findCudaDevice(0, nullptr);\n"
+            "    StopWatchInterface *hTimer = NULL;\n"
+            "    sdkCreateTimer(&hTimer);\n"
+            "    sdkStartTimer(&hTimer);\n"
+            "    sdkStopTimer(&hTimer);\n"
+            "    float et = sdkGetTimerValue(&hTimer);\n"
+            "    return 0;\n"
+            "}\n"
+        )
+        fixed = router._fix_ported_code(code)
+        assert "struct StopWatchInterface" in fixed
+        assert "static inline int findCudaDevice" in fixed
+        assert "static inline void sdkCreateTimer" in fixed
+
+    def test_no_shim_when_helper_symbols_absent(self, router):
+        code = "#include <hip/hip_runtime.h>\nint main() { return 0; }\n"
+        fixed = router._fix_ported_code(code)
+        assert "StopWatchInterface" not in fixed
+
+    def test_shim_not_duplicated_on_second_pass(self, router):
+        code = (
+            "#include <hip/hip_runtime.h>\n"
+            "int main() { findCudaDevice(0, nullptr); return 0; }\n"
+        )
+        once = router._fix_ported_code(code)
+        twice = router._fix_ported_code(once)
+        assert twice.count("struct StopWatchInterface") == 1

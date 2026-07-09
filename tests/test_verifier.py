@@ -191,6 +191,49 @@ def test_classify_error_origin_unknown_when_unparseable():
     assert origin == "unknown"
 
 
+def test_classify_error_origin_link_undefined_main_lld():
+    """Bug 6: ld.lld's undefined-symbol diagnostic has no file:line:col, so it
+    used to fall through to 'unknown' — invisible to any caller trying to
+    give targeted guidance ("you dropped main() — restore it")."""
+    agent = VerificationAgent()
+    origin = agent._classify_error_origin("ld.lld: error: undefined symbol: main", 6, 20)
+    assert origin == "link"
+
+
+def test_classify_error_origin_link_undefined_reference_gnu_ld():
+    """GNU ld phrases the same failure as 'undefined reference to `main'."""
+    agent = VerificationAgent()
+    origin = agent._classify_error_origin(
+        "test_kernel.cpp:(.text+0x10): undefined reference to `main'", 6, 20
+    )
+    assert origin == "link"
+
+
+def test_classify_error_origin_harness_not_misclassified_as_link():
+    """A harness-origin 'redefinition of main' must stay 'harness', not 'link'
+    — only an UNDEFINED main symbol is a link-stage failure."""
+    agent = VerificationAgent()
+    origin = agent._classify_error_origin(
+        "test_kernel.cpp:67:5: error: redefinition of 'main'", 6, 20
+    )
+    assert origin == "harness"
+
+
+def test_run_returns_exit_code():
+    """Bug 0: _run() must surface the real exit code, not just a pass/fail
+    bool, so callers can tell 'crashed' from 'ran and returned nonzero for a
+    known reason' (e.g. the NVIDIA sample's EXIT_WAIVED=2)."""
+    import tempfile
+    from pathlib import Path
+    agent = VerificationAgent()
+    with tempfile.TemporaryDirectory() as tmp:
+        build_dir = Path(tmp)
+        run_ok, output, benchmark, exit_code = agent._run(build_dir, "nonexistent_binary")
+        assert run_ok is False
+        assert exit_code is None  # binary never launched — distinct from a real nonzero exit
+        assert "not found" in output.lower() or "compile step" in output.lower()
+
+
 def test_verify_spec_tracking():
     """verify() should record spec_used in result when spec exists."""
     agent = VerificationAgent()

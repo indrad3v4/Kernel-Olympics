@@ -58,6 +58,27 @@ def cyan(s): return _c(s, 96)
 def bold(s): return _c(s, 1)
 def dim(s): return _c(s, 2)
 
+
+def verification_failure_label(ver_result: dict) -> str:
+    """Pick the failure label for a verify() result that did not pass.
+
+    Bug 0: compile_success / run_success / output_match are three DIFFERENT
+    failure points, and verify() (verifier.py) returns early on a run
+    failure — before any diff ever executes. The old code derived the label
+    from compile_success alone, so a crashed binary and a genuine diff
+    failure printed identically as "Output mismatch", and the label implied
+    a comparison had happened when it hadn't. Call only when
+    ver_result["passed"] is falsy and it isn't the no-GPU case.
+    """
+    if not ver_result.get("compile_success"):
+        return "Not compiled — saved for manual hipcc"
+    if not ver_result.get("run_success"):
+        exit_code = ver_result.get("run_exit_code")
+        if exit_code is not None:
+            return f"Compiled, but crashed at runtime (exit {exit_code})"
+        return "Compiled, but failed to run"
+    return "Output mismatch"
+
 SPINNER = "|/-\\"
 
 class Display:
@@ -427,7 +448,7 @@ class KernelOlympics:
                     )
                     self.disp.status("Verifying", f"{Path(cr['file']).name} {yellow('stored (unverified — no GPU)')}", ok=False)
                 else:
-                    reason = "Not compiled — saved for manual hipcc" if not ver_result.get("compile_success") else "Output mismatch"
+                    reason = verification_failure_label(ver_result)
                     self.disp.status("Verifying", f"{Path(cr['file']).name} {yellow(reason)}", ok=False)
                     # Show compile errors or hipcc status.
                     # verifier._compile() already strips the temp build-dir prefix from
@@ -445,11 +466,20 @@ class KernelOlympics:
                             print(f"║  ℹ️ Full compile log: {dim(log_path):<44}║")
                     if not ver_result.get("hipcc_available", True):
                         print(f"║  ⚠️  {'hipcc not found — export PATH=/opt/rocm-7.2.1/bin:$PATH':<64}║")
-                    # TRIZ #23: Do NOT cache compile-failed code — it poisons future runs.
-                    # Old behavior stored broken code at confidence=0.50, which caused
-                    # cache hits to replay the same compile failure without LLM calls.
-                    # Now: only cache when compilation succeeds (verified code only).
-                    print(f"║  {'ℹ️ Cache skipped — compile failed, not caching broken fix':<64}║")
+                    # Bug 0: the binary's own stdout/stderr is the actual explanation
+                    # for a runtime failure and was captured but never printed —
+                    # the same class of blindness Bug 1 (in the harness fix plan)
+                    # found in the compile path.
+                    if ver_result.get("compile_success") and not ver_result.get("run_success"):
+                        run_output = ver_result.get("run_output", "")
+                        if run_output:
+                            for line in run_output.strip().splitlines()[:5]:
+                                print(f"║  ⚠️  {red(line[:65]):<64}║")
+                    # TRIZ #23: Do NOT cache a verification failure — it poisons future
+                    # runs. Old behavior only guarded against compile failures; a
+                    # runtime crash or output mismatch is just as broken and must not
+                    # be cached as a "verified" fix either.
+                    print(f"║  {'ℹ️ Cache skipped — verification failed, not caching unverified fix':<64}║")
             else:
                 self.disp.file_done(Path(cr['file']).name, f"{cr.get('risk_level')} — no porting needed", ok=True)
 
