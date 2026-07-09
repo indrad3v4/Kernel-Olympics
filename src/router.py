@@ -350,6 +350,54 @@ class AgentResult:
     elapsed_ms: float = 0.0
 
 
+@dataclass
+class A2AMessage:
+    """Structured inter-agent message — replaces blob truncation.
+
+    TRIZ #3 (Local quality): Each agent receives a structured, prioritized
+    message instead of a truncated text blob.  The summary ALWAYS fits;
+    priority details are added in order so truncation hits low-priority
+    items only.  full_ref keeps the complete content addressable without
+    re-sending it.
+
+    TRIZ #28 (Mechanical substitution): Replaces ad-hoc string slicing
+    (plan[:2000], feedback[:800], compile_errs[:3]) with a budget-aware
+    renderer that preserves the most important information.
+    """
+    summary: str              # 1-2 sentences, ALWAYS fits
+    priority_details: list    # most important first, truncation hits low-priority only
+    full_ref: str             # pattern memory key or run_id, not re-sent
+    changelog: list           # what was modified (regex fixes, etc.)
+
+    def to_prompt(self, max_chars: int = 4000) -> str:
+        """Render to prompt text within budget. Summary always included.
+        Priority details added in order until budget hit."""
+        parts = [self.summary]
+        budget = max_chars - len(self.summary) - 200  # reserve for formatting
+        for d in self.priority_details:
+            rendered = self._render_detail(d)
+            if len("\n".join(parts)) + len(rendered) > max_chars:
+                parts.append(f"... ({len(self.priority_details) - len(parts) + 1} more details omitted)")
+                break
+            parts.append(rendered)
+        if self.changelog:
+            parts.append("Applied fixes: " + "; ".join(self.changelog[:5]))
+        return "\n".join(parts)
+
+    @staticmethod
+    def _render_detail(d: dict) -> str:
+        if d.get("type") == "api_mapping":
+            return f"  API: {d['cuda']} → {d['hip']}"
+        elif d.get("type") == "header":
+            return f"  HEADER: {d['cuda']} → {d['hip']}"
+        elif d.get("type") == "error_fix":
+            return f"  FIX [{d.get('priority','?')}]: {d['error']} → {d['fix']}"
+        elif d.get("type") == "risk":
+            return f"  RISK: {d['description']}"
+        else:
+            return f"  {d.get('text', str(d))}"
+
+
 class ModelRouter:
     """Routes CUDA porting tasks to the best model for each pattern.
 
@@ -366,6 +414,7 @@ class ModelRouter:
         self.base_url = "https://api.fireworks.ai/inference/v1"
         self.total_cost = 0.0
         self.call_log: List[Dict] = []
+        self.run_id: str = ""  # set by route() for A2AMessage full_ref keys
 
     @staticmethod
     def _extract_code(text: str) -> str:
@@ -476,77 +525,95 @@ class ModelRouter:
         return text.strip()
 
     @staticmethod
-    def _fix_ported_code(code: str) -> str:
+    def _fix_ported_code(code: str, return_changelog: bool = False):
         """Fix AMD-specific issues in ported code.
 
         Post-processing safety net applied after every Kimi code generation
         and refinement pass. Catches common issues the LLM may miss.
+
+        Args:
+            code: The raw ported code string.
+            return_changelog: If True, returns (fixed_code, changelog) where
+                changelog is a list of human-readable strings describing each
+                regex substitution that was actually applied. If False (default),
+                returns just the fixed code string — preserving backward
+                compatibility with existing callers that don't need the
+                changelog.
         """
+        changelog: List[str] = []
+
+        def _tracked_sub(pattern, replacement, text, description):
+            """Run re.sub, but record in changelog if any substitution occurred."""
+            new_text, count = re.subn(pattern, replacement, text)
+            if count > 0 and description:
+                changelog.append(f"{description} (×{count})")
+            return new_text
+
         # ── Comprehensive CUDA header replacement ──────────────────
         # Core CUDA runtime → HIP
-        code = re.sub(r'#include\s*[<"]cuda_runtime\.h[>"]', '#include <hip/hip_runtime.h>', code)
-        code = re.sub(r'#include\s*[<"]cuda_runtime_api\.h[>"]', '#include <hip/hip_runtime.h>', code)
+        code = _tracked_sub(r'#include\s*[<"]cuda_runtime\.h[>"]', '#include <hip/hip_runtime.h>', code, 'cuda_runtime.h→hip/hip_runtime.h')
+        code = _tracked_sub(r'#include\s*[<"]cuda_runtime_api\.h[>"]', '#include <hip/hip_runtime.h>', code, 'cuda_runtime_api.h→hip/hip_runtime.h')
         # CUDA math → HIP (hip already includes math)
-        code = re.sub(r'#include\s*[<"]cuda_math\.h[>"]\n?', '', code)
+        code = _tracked_sub(r'#include\s*[<"]cuda_math\.h[>"]\n?', '', code, 'cuda_math.h removed')
         # NVIDIA helper headers — NOT in ROCm, remove
-        code = re.sub(r'#include\s*[<"]helper_cuda\.h[>"]\n?', '', code)
-        code = re.sub(r'#include\s*[<"]helper_functions\.h[>"]\n?', '', code)
-        code = re.sub(r'#include\s*[<"]helper_string\.h[>"]\n?', '', code)
-        code = re.sub(r'#include\s*[<"]helper_timer\.h[>"]\n?', '', code)
-        code = re.sub(r'#include\s*[<"]helper_image\.h[>"]\n?', '', code)
-        code = re.sub(r'#include\s*[<"]helper_gl\.h[>"]\n?', '', code)
+        code = _tracked_sub(r'#include\s*[<"]helper_cuda\.h[>"]\n?', '', code, 'helper_cuda.h removed')
+        code = _tracked_sub(r'#include\s*[<"]helper_functions\.h[>"]\n?', '', code, 'helper_functions.h removed')
+        code = _tracked_sub(r'#include\s*[<"]helper_string\.h[>"]\n?', '', code, 'helper_string.h removed')
+        code = _tracked_sub(r'#include\s*[<"]helper_timer\.h[>"]\n?', '', code, 'helper_timer.h removed')
+        code = _tracked_sub(r'#include\s*[<"]helper_image\.h[>"]\n?', '', code, 'helper_image.h removed')
+        code = _tracked_sub(r'#include\s*[<"]helper_gl\.h[>"]\n?', '', code, 'helper_gl.h removed')
         # CUDA device launch — not needed in HIP
-        code = re.sub(r'#include\s*[<"]device_launch_parameters\.h[>"]\n?', '', code)
+        code = _tracked_sub(r'#include\s*[<"]device_launch_parameters\.h[>"]\n?', '', code, 'device_launch_parameters.h removed')
         # CUDA random, FFT, BLAS, sparse, solver — need HIP equivalents
-        code = re.sub(r'#include\s*[<"]curand\.h[>"]', '#include <hiprand/hiprand.h>', code)
-        code = re.sub(r'#include\s*[<"]curand_kernel\.h[>"]', '#include <hiprand/hiprand_kernel.h>', code)
-        code = re.sub(r'#include\s*[<"]cufft\.h[>"]', '#include <hipfft/hipfft.h>', code)
-        code = re.sub(r'#include\s*[<"]cublas_v2\.h[>"]', '#include <hipblas/hipblas.h>', code)
-        code = re.sub(r'#include\s*[<"]cusparse\.h[>"]', '#include <hipsparse/hipsparse.h>', code)
-        code = re.sub(r'#include\s*[<"]cusolver_common\.h[>"]', '#include <hipsolver/hipsolver.h>', code)
+        code = _tracked_sub(r'#include\s*[<"]curand\.h[>"]', '#include <hiprand/hiprand.h>', code, 'curand.h→hiprand/hiprand.h')
+        code = _tracked_sub(r'#include\s*[<"]curand_kernel\.h[>"]', '#include <hiprand/hiprand_kernel.h>', code, 'curand_kernel.h→hiprand/hiprand_kernel.h')
+        code = _tracked_sub(r'#include\s*[<"]cufft\.h[>"]', '#include <hipfft/hipfft.h>', code, 'cufft.h→hipfft/hipfft.h')
+        code = _tracked_sub(r'#include\s*[<"]cublas_v2\.h[>"]', '#include <hipblas/hipblas.h>', code, 'cublas_v2.h→hipblas/hipblas.h')
+        code = _tracked_sub(r'#include\s*[<"]cusparse\.h[>"]', '#include <hipsparse/hipsparse.h>', code, 'cusparse.h→hipsparse/hipsparse.h')
+        code = _tracked_sub(r'#include\s*[<"]cusolver_common\.h[>"]', '#include <hipsolver/hipsolver.h>', code, 'cusolver_common.h→hipsolver/hipsolver.h')
         # NVRTC → no HIP equivalent, remove
-        code = re.sub(r'#include\s*[<"]nvrtc\.h[>"]\n?', '', code)
+        code = _tracked_sub(r'#include\s*[<"]nvrtc\.h[>"]\n?', '', code, 'nvrtc.h removed')
         # Remove project-specific .cuh headers — not available in HIP port
-        code = re.sub(r'#include\s*"[^"]*\.cuh"\n?', '', code)
-        code = re.sub(r"#include\s*<[^>]*\.cuh>\n?", '', code)
+        code = _tracked_sub(r'#include\s*"[^"]*\.cuh"\n?', '', code, 'local .cuh headers removed')
+        code = _tracked_sub(r"#include\s*<[^>]*\.cuh>\n?", '', code, 'system .cuh headers removed')
         # Remove any remaining CUDA-specific includes
-        code = re.sub(r'#include\s*[<"][^>"]*cuda[^>"]*[>"]\n?', '', code, flags=re.IGNORECASE)
+        code = _tracked_sub(r'#include\s*[<"][^>"]*cuda[^>"]*[>"]\n?', '', code, 'remaining CUDA includes removed', )
 
         # ── API renames: cuda* → hip* ──────────────────────────────
-        code = re.sub(r'\bcudaMalloc\b', 'hipMalloc', code)
-        code = re.sub(r'\bcudaFree\b', 'hipFree', code)
-        code = re.sub(r'\bcudaMemcpy\b', 'hipMemcpy', code)
-        code = re.sub(r'\bcudaMemcpyAsync\b', 'hipMemcpyAsync', code)
-        code = re.sub(r'\bcudaMemset\b', 'hipMemset', code)
-        code = re.sub(r'\bcudaDeviceSynchronize\b', 'hipDeviceSynchronize', code)
-        code = re.sub(r'\bcudaGetLastError\b', 'hipGetLastError', code)
-        code = re.sub(r'\bcudaError_t\b', 'hipError_t', code)
-        code = re.sub(r'\bcudaSuccess\b', 'hipSuccess', code)
-        code = re.sub(r'\bcudaGetDeviceCount\b', 'hipGetDeviceCount', code)
-        code = re.sub(r'\bcudaSetDevice\b', 'hipSetDevice', code)
-        code = re.sub(r'\bcudaGetDeviceProperties\b', 'hipGetDeviceProperties', code)
-        code = re.sub(r'\bcudaDeviceProp\b', 'hipDeviceProp_t', code)
-        code = re.sub(r'\bcudaStreamCreate\b', 'hipStreamCreate', code)
-        code = re.sub(r'\bcudaStreamSynchronize\b', 'hipStreamSynchronize', code)
-        code = re.sub(r'\bcudaEventCreate\b', 'hipEventCreate', code)
-        code = re.sub(r'\bcudaEventRecord\b', 'hipEventRecord', code)
-        code = re.sub(r'\bcudaEventSynchronize\b', 'hipEventSynchronize', code)
-        code = re.sub(r'\bcudaEventElapsedTime\b', 'hipEventElapsedTime', code)
+        code = _tracked_sub(r'\bcudaMalloc\b', 'hipMalloc', code, 'cudaMalloc→hipMalloc')
+        code = _tracked_sub(r'\bcudaFree\b', 'hipFree', code, 'cudaFree→hipFree')
+        code = _tracked_sub(r'\bcudaMemcpy\b', 'hipMemcpy', code, 'cudaMemcpy→hipMemcpy')
+        code = _tracked_sub(r'\bcudaMemcpyAsync\b', 'hipMemcpyAsync', code, 'cudaMemcpyAsync→hipMemcpyAsync')
+        code = _tracked_sub(r'\bcudaMemset\b', 'hipMemset', code, 'cudaMemset→hipMemset')
+        code = _tracked_sub(r'\bcudaDeviceSynchronize\b', 'hipDeviceSynchronize', code, 'cudaDeviceSynchronize→hipDeviceSynchronize')
+        code = _tracked_sub(r'\bcudaGetLastError\b', 'hipGetLastError', code, 'cudaGetLastError→hipGetLastError')
+        code = _tracked_sub(r'\bcudaError_t\b', 'hipError_t', code, 'cudaError_t→hipError_t')
+        code = _tracked_sub(r'\bcudaSuccess\b', 'hipSuccess', code, 'cudaSuccess→hipSuccess')
+        code = _tracked_sub(r'\bcudaGetDeviceCount\b', 'hipGetDeviceCount', code, 'cudaGetDeviceCount→hipGetDeviceCount')
+        code = _tracked_sub(r'\bcudaSetDevice\b', 'hipSetDevice', code, 'cudaSetDevice→hipSetDevice')
+        code = _tracked_sub(r'\bcudaGetDeviceProperties\b', 'hipGetDeviceProperties', code, 'cudaGetDeviceProperties→hipGetDeviceProperties')
+        code = _tracked_sub(r'\bcudaDeviceProp\b', 'hipDeviceProp_t', code, 'cudaDeviceProp→hipDeviceProp_t')
+        code = _tracked_sub(r'\bcudaStreamCreate\b', 'hipStreamCreate', code, 'cudaStreamCreate→hipStreamCreate')
+        code = _tracked_sub(r'\bcudaStreamSynchronize\b', 'hipStreamSynchronize', code, 'cudaStreamSynchronize→hipStreamSynchronize')
+        code = _tracked_sub(r'\bcudaEventCreate\b', 'hipEventCreate', code, 'cudaEventCreate→hipEventCreate')
+        code = _tracked_sub(r'\bcudaEventRecord\b', 'hipEventRecord', code, 'cudaEventRecord→hipEventRecord')
+        code = _tracked_sub(r'\bcudaEventSynchronize\b', 'hipEventSynchronize', code, 'cudaEventSynchronize→hipEventSynchronize')
+        code = _tracked_sub(r'\bcudaEventElapsedTime\b', 'hipEventElapsedTime', code, 'cudaEventElapsedTime→hipEventElapsedTime')
         # cudaMemcpyKind
-        code = re.sub(r'\bcudaMemcpyHostToDevice\b', 'hipMemcpyHostToDevice', code)
-        code = re.sub(r'\bcudaMemcpyDeviceToHost\b', 'hipMemcpyDeviceToHost', code)
-        code = re.sub(r'\bcudaMemcpyDeviceToDevice\b', 'hipMemcpyDeviceToDevice', code)
+        code = _tracked_sub(r'\bcudaMemcpyHostToDevice\b', 'hipMemcpyHostToDevice', code, 'cudaMemcpyHostToDevice→hipMemcpyHostToDevice')
+        code = _tracked_sub(r'\bcudaMemcpyDeviceToHost\b', 'hipMemcpyDeviceToHost', code, 'cudaMemcpyDeviceToHost→hipMemcpyDeviceToHost')
+        code = _tracked_sub(r'\bcudaMemcpyDeviceToDevice\b', 'hipMemcpyDeviceToDevice', code, 'cudaMemcpyDeviceToDevice→hipMemcpyDeviceToDevice')
         # Pinned memory
-        code = re.sub(r'\bcudaMallocHost\b', 'hipHostMalloc', code)
-        code = re.sub(r'\bcudaFreeHost\b', 'hipHostFree', code)
+        code = _tracked_sub(r'\bcudaMallocHost\b', 'hipHostMalloc', code, 'cudaMallocHost→hipHostMalloc')
+        code = _tracked_sub(r'\bcudaFreeHost\b', 'hipHostFree', code, 'cudaFreeHost→hipHostFree')
         # Events
-        code = re.sub(r'\bcudaEvent_t\b', 'hipEvent_t', code)
+        code = _tracked_sub(r'\bcudaEvent_t\b', 'hipEvent_t', code, 'cudaEvent_t→hipEvent_t')
         # Device queries
-        code = re.sub(r'\bcudaGetDevice\b', 'hipDeviceGet', code)
+        code = _tracked_sub(r'\bcudaGetDevice\b', 'hipDeviceGet', code, 'cudaGetDevice→hipDeviceGet')
         # checkCudaErrors macro — stub it out (no HIP equivalent)
-        code = re.sub(r'\bcheckCudaErrors\s*\(', '(void)(', code)
+        code = _tracked_sub(r'\bcheckCudaErrors\s*\(', '(void)(', code, 'checkCudaErrors→(void)(')
         # cuda_device variable name
-        code = re.sub(r'\bcuda_device\b', 'hip_device', code)
+        code = _tracked_sub(r'\bcuda_device\b', 'hip_device', code, 'cuda_device→hip_device')
 
         # ── WAVEFRONT_SIZE define ───────────────────────────────────
         # ROCm wavefront is 64 on gfx9 (MI300/MI250). CUDA warp is 32.
@@ -558,39 +625,42 @@ class ModelRouter:
                 code = code[:insert_pos] + '#define WAVEFRONT_SIZE 64\n' + code[insert_pos:]
             else:
                 code = '#define WAVEFRONT_SIZE 64\n' + code
+            changelog.append('#define WAVEFRONT_SIZE 64 added')
 
         # ── Shuffle intrinsics: fix masks for wavefront64 ──────────
         # __shfl_xor_sync mask: 0x1f (5-bit, warp32) → 0x3f (6-bit, wavefront64)
-        code = re.sub(
+        code = _tracked_sub(
             r'(__shfl_xor_sync\s*\()0x1f(,)',
             r'\g<1>0x3f\g<2>',
-            code
+            code, '__shfl_xor_sync mask 0x1f→0x3f'
         )
         # __shfl_up_sync / __shfl_down_sync mask: 0x1f → 0x3f
-        code = re.sub(
+        code = _tracked_sub(
             r'(__shfl_up_sync\s*\()0x1f(,)',
             r'\g<1>0x3f\g<2>',
-            code
+            code, '__shfl_up_sync mask 0x1f→0x3f'
         )
-        code = re.sub(
+        code = _tracked_sub(
             r'(__shfl_down_sync\s*\()0x1f(,)',
             r'\g<1>0x3f\g<2>',
-            code
+            code, '__shfl_down_sync mask 0x1f→0x3f'
         )
         # Full-width masks: 0xffffffff → 64-bit
-        code = re.sub(
+        code = _tracked_sub(
             r'(__shfl_\w+_sync\s*\()0x[fF]{8}(,)',
             r'\g<1>0xffffffffffffffffULL\g<2>',
-            code
+            code, '__shfl mask 0xffffffff→0xffffffffffffffffULL'
         )
         # Replace __syncwarp() with __syncthreads() for wavefront64 safety
-        code = re.sub(r'\b__syncwarp\s*\(\s*\)', '__syncthreads()', code)
+        code = _tracked_sub(r'\b__syncwarp\s*\(\s*\)', '__syncthreads()', code, '__syncwarp()→__syncthreads()')
 
         # ── Warp size constant: 32 → 64 ────────────────────────────
         # Only replace standalone 32 in warp-size contexts, NOT array sizes
-        code = re.sub(r'\bwarpSize\b', '64', code)
-        code = re.sub(r'\bWARP_SIZE\b(?!\s*64)', 'WAVEFRONT_SIZE', code)
+        code = _tracked_sub(r'\bwarpSize\b', '64', code, 'warpSize→64')
+        code = _tracked_sub(r'\bWARP_SIZE\b(?!\s*64)', 'WAVEFRONT_SIZE', code, 'WARP_SIZE→WAVEFRONT_SIZE')
 
+        if return_changelog:
+            return code, changelog
         return code
 
     @staticmethod
@@ -654,6 +724,157 @@ class ModelRouter:
             score += 0.15
         return min(score, 1.0)
 
+    # ── A2A structured message builders ──────────────────────────
+
+    def _build_deepseek_plan_message(self, plan_text: str,
+                                     kernel_source: str = "") -> A2AMessage:
+        """Parse DeepSeek's plan text into a structured A2AMessage.
+
+        Extracts API mappings, header changes, and constants from the plan
+        prose so that downstream agents (Kimi, GLM) receive prioritized
+        details instead of a truncated blob.
+        """
+        # Summary: first 300 chars or first 2 sentences
+        sentences = re.split(r'(?<=[.!?])\s+', plan_text.strip())
+        if len(sentences) >= 2 and len(sentences[0]) + len(sentences[1]) <= 300:
+            summary = f"DeepSeek Plan: {sentences[0]} {sentences[1]}"
+        else:
+            summary = f"DeepSeek Plan: {plan_text[:300]}"
+
+        priority_details = []
+
+        # Extract API mappings: patterns like "cudaMalloc → hipMalloc" or
+        # "replace cudaMalloc with hipMalloc"
+        for m in re.finditer(r'(\w*[Cc]uda\w*)\s*(?:→|->|→ )\s*(\w*[Hh]ip\w*)', plan_text):
+            priority_details.append({
+                "type": "api_mapping",
+                "cuda": m.group(1),
+                "hip": m.group(2),
+            })
+        # Also catch "replace X with Y" style
+        for m in re.finditer(r'replace\s+(\w+)\s+with\s+(\w+)', plan_text, re.IGNORECASE):
+            priority_details.append({
+                "type": "api_mapping",
+                "cuda": m.group(1),
+                "hip": m.group(2),
+            })
+
+        # Extract header changes: "#include <cuda_runtime.h> → #include <hip/hip_runtime.h>"
+        for m in re.finditer(r'#include\s+[<"]([^>"]+\.h)[>"]\s*(?:→|->)\s*#include\s+[<"]([^>"]+\.h)[>"]', plan_text):
+            priority_details.append({
+                "type": "header",
+                "cuda": m.group(1),
+                "hip": m.group(2),
+            })
+        # Also catch "cuda_runtime.h → hip/hip_runtime.h" without #include prefix
+        for m in re.finditer(r'(cuda_runtime\.h|helper_cuda\.h|helper_functions\.h|device_launch_parameters\.h)\s*(?:→|->)\s*(hip/[\w/]+\.h)', plan_text):
+            priority_details.append({
+                "type": "header",
+                "cuda": m.group(1),
+                "hip": m.group(2),
+            })
+
+        # Extract constants / sizing changes: "warpSize 32 → 64", "0x1f → 0x3f"
+        for m in re.finditer(r'(warpSize|WAVEFRONT_SIZE|0x1f|0xffffffff)\s*(?:→|->)\s*(\w+)', plan_text):
+            priority_details.append({
+                "type": "risk",
+                "description": f"Constant change: {m.group(1)} → {m.group(2)}",
+            })
+
+        full_ref = f"plan:{self.run_id}" if self.run_id else "deepseek_plan"
+
+        return A2AMessage(
+            summary=summary,
+            priority_details=priority_details,
+            full_ref=full_ref,
+            changelog=[],
+        )
+
+    def _build_error_feedback_message(self, compile_errs: list,
+                                      glm_analysis: dict = None,
+                                      iteration: int = 0) -> A2AMessage:
+        """Structure compile errors + GLM analysis into an A2AMessage.
+
+        ALL errors are included as priority_details (not just first 3).
+        If GLM analysis exists, its fixes are used and prioritized by
+        severity (error > warning).
+        """
+        # Summary: count + first error type
+        first_err = compile_errs[0] if compile_errs else "(no errors)"
+        err_type = "error"
+        if "warning" in first_err.lower():
+            err_type = "warning"
+        summary = f"{len(compile_errs)} compile {err_type}s. First: {first_err[:120]}"
+
+        priority_details = []
+
+        if glm_analysis:
+            # Use GLM's structured fixes, sorted by priority
+            fixes = glm_analysis.get("fixes", [])
+            fixes = sorted(fixes, key=lambda x: x.get("priority", 99))
+            for f in fixes:
+                priority_details.append({
+                    "type": "error_fix",
+                    "error": f.get("error", "?")[:200],
+                    "fix": f.get("exact_fix", f.get("root_cause", "?"))[:200],
+                    "priority": f.get("priority", 99),
+                })
+            # Also include missing includes and wrong APIs
+            for inc in glm_analysis.get("missing_includes", []):
+                priority_details.append({
+                    "type": "error_fix",
+                    "error": f"Missing include: {inc}",
+                    "fix": f"Add #include {inc}",
+                    "priority": 1,
+                })
+            for api in glm_analysis.get("wrong_apis", []):
+                priority_details.append({
+                    "type": "api_mapping",
+                    "cuda": api.get("cuda", "?"),
+                    "hip": api.get("hip", "?"),
+                })
+        else:
+            # No GLM analysis — structure raw errors, prioritize errors > warnings
+            for i, err in enumerate(compile_errs):
+                is_warning = "warning" in err.lower()
+                priority_details.append({
+                    "type": "error_fix",
+                    "error": err[:200],
+                    "fix": "see compiler output",
+                    "priority": 99 if is_warning else 10 + i,
+                })
+
+        full_ref = f"errors:{self.run_id}:iter{iteration}" if self.run_id else f"errors:iter{iteration}"
+
+        return A2AMessage(
+            summary=summary,
+            priority_details=priority_details,
+            full_ref=full_ref,
+            changelog=[],
+        )
+
+    def _build_glm_feedback_message(self, glm_result: dict) -> A2AMessage:
+        """Structure GLM evaluation feedback into an A2AMessage."""
+        summary = glm_result.get("verdict", "") or glm_result.get("feedback", "")[:300]
+
+        priority_details = []
+        for i, issue in enumerate(glm_result.get("issues", [])):
+            priority_details.append({
+                "type": "error_fix",
+                "error": issue,
+                "fix": "see feedback",
+                "priority": i + 1,
+            })
+
+        full_ref = f"glm:{self.run_id}" if self.run_id else "glm_feedback"
+
+        return A2AMessage(
+            summary=summary,
+            priority_details=priority_details,
+            full_ref=full_ref,
+            changelog=[],
+        )
+
     # ── Phase prompt builders ────────────────────────────────────
 
     def _build_deepseek_plan_prompt(self, kernel_source: str,
@@ -709,7 +930,11 @@ class ModelRouter:
         )
 
         if deepseek_plan:
-            prompt += f"DeepSeek Planner's plan (follow this):\n{deepseek_plan[:2000]}\n\n"
+            try:
+                plan_msg = self._build_deepseek_plan_message(deepseek_plan, kernel_source)
+                prompt += f"DeepSeek Planner's plan (follow this):\n{plan_msg.to_prompt(max_chars=4000)}\n\n"
+            except Exception:
+                prompt += f"DeepSeek Planner's plan (follow this):\n{deepseek_plan[:2000]}\n\n"
 
         pattern_summary = _format_patterns_summary(patterns)
         if pattern_summary:
@@ -760,16 +985,31 @@ class ModelRouter:
         )
 
         if deepseek_plan:
-            prompt += f"DeepSeek Planner's plan (reference):\n{deepseek_plan[:1500]}\n\n"
+            try:
+                plan_msg = self._build_deepseek_plan_message(deepseek_plan)
+                prompt += f"DeepSeek Planner's plan (reference):\n{plan_msg.to_prompt(max_chars=3000)}\n\n"
+            except Exception:
+                prompt += f"DeepSeek Planner's plan (reference):\n{deepseek_plan[:1500]}\n\n"
 
         pattern_summary = _format_patterns_summary(patterns)
         if pattern_summary:
             prompt += pattern_summary + "\n"
 
+        if feedback:
+            try:
+                fb_msg = A2AMessage(
+                    summary=f"Evaluator feedback (fix ALL): {feedback[:300]}",
+                    priority_details=[{"type": "error_fix", "error": feedback[:600], "fix": "see feedback above", "priority": 1}],
+                    full_ref=f"feedback:{self.run_id}" if self.run_id else "feedback",
+                    changelog=[],
+                )
+                prompt += f"Evaluator feedback (fix ALL):\n{fb_msg.to_prompt(max_chars=3000)}\n\n"
+            except Exception:
+                prompt += f"Evaluator feedback (fix ALL):\n{feedback}\n\n"
+
         prompt += (
-            f"Original CUDA:\n```cuda\n{kernel_source[:4000]}\n```\n\n"
-            f"Your previous output:\n```hip\n{previous_code[:4000]}\n```\n\n"
-            f"Evaluator feedback (fix ALL):\n{feedback}\n\n"
+            f"Original CUDA:\n```cuda\n{kernel_source[:4000]}```\n\n"
+            f"Your previous output:\n```hip\n{previous_code[:4000]}```\n\n"
             "Respond with JSON: {\"ported_code\": str, \"confidence\": 0-100, "
             "\"changes\": [str], \"explanation\": str}."
         )
@@ -801,10 +1041,23 @@ class ModelRouter:
         )
 
         if deepseek_plan:
-            prompt += f"Planner's plan (reference):\n{deepseek_plan[:800]}\n\n"
+            try:
+                plan_msg = self._build_deepseek_plan_message(deepseek_plan)
+                prompt += f"Planner's plan (reference):\n{plan_msg.to_prompt(max_chars=2000)}\n\n"
+            except Exception:
+                prompt += f"Planner's plan (reference):\n{deepseek_plan[:800]}\n\n"
 
         if feedback:
-            prompt += f"Previous issues (verify fixed):\n{feedback[:800]}\n\n"
+            try:
+                fb_msg = A2AMessage(
+                    summary=f"Previous issues (verify fixed): {feedback[:300]}",
+                    priority_details=[{"type": "error_fix", "error": feedback[:600], "fix": "verify fixed", "priority": 1}],
+                    full_ref=f"feedback:{self.run_id}" if self.run_id else "feedback",
+                    changelog=[],
+                )
+                prompt += f"Previous issues (verify fixed):\n{fb_msg.to_prompt(max_chars=2000)}\n\n"
+            except Exception:
+                prompt += f"Previous issues (verify fixed):\n{feedback[:800]}\n\n"
 
         pattern_summary = _format_patterns_summary(patterns)
         if pattern_summary:
@@ -921,6 +1174,9 @@ class ModelRouter:
                   "orchestrator_passed": False, "iterations_used": 0,
                   "compile_errors": [], "compile_passed": False}
 
+        # A2A protocol: unique run ID for structured message full_ref keys
+        self.run_id = f"{kernel_name}_{int(time.time())}"
+
         # Track pipeline phase outcomes for rubric scoring
         planner_success = False
         coder_success = False
@@ -967,13 +1223,18 @@ class ModelRouter:
                     prev_error_count = len(compile_errs)  # TRIZ #23: baseline for prompt evolution
                     err_summary = "; ".join(compile_errs[:3]) if compile_errs else cc["compile_output"][:300]
                     result["changes"].append(f"[hipcc] In-loop compile FAILED: {err_summary[:120]}")
+                    # Feed compile errors to GLM evaluator as additional feedback
+                    # A2A protocol: structure ALL errors, not just first 3
+                    all_errs = compile_errs if compile_errs else [cc["compile_output"][:300]]
                     # Check if the code was truncated
                     is_truncated = "TRUNCATED" in extracted
                     if is_truncated:
                         result["changes"].append("[kimi27] Output was TRUNCATED — requesting shorter response")
-                    # Feed compile errors to GLM evaluator as additional feedback
-                    # TRIZ #22: Throwing away — only first 3 errors, filtered by verifier
-                    compile_err_lines = compile_errs[:3] if compile_errs else [cc["compile_output"][:300]]
+                    try:
+                        err_msg = self._build_error_feedback_message(all_errs, iteration=0)
+                        structured_errs = err_msg.to_prompt(max_chars=4000)
+                    except Exception:
+                        structured_errs = "\n".join(compile_errs[:3]) if compile_errs else cc["compile_output"][:300]
                     if is_truncated:
                         evaluator_feedback = (
                             "CRITICAL: Your previous response was TRUNCATED (hit token limit). "
@@ -981,12 +1242,12 @@ class ModelRouter:
                             "No JSON wrapper, no explanation, no comments. "
                             "Just the raw C++ code with all CUDA→HIP replacements applied.\n\n"
                             f"REAL COMPILER ERRORS (hipcc) — fix these FIRST:\n"
-                            + "\n".join(compile_err_lines)
+                            + structured_errs
                         )
                     else:
                         evaluator_feedback = (
                             f"REAL COMPILER ERRORS (hipcc) — fix these FIRST:\n"
-                            + "\n".join(compile_err_lines)
+                            + structured_errs
                             + "\n\nAlso address any static analysis issues below."
                         )
 
@@ -1094,17 +1355,17 @@ class ModelRouter:
                         f"[hipcc] Compile-first check {iteration}: FAILED: {err_summary[:120]}")
 
                     # TRIZ #22/#28: Feed only NEW (semantically) errors to Kimi.
+                    # A2A protocol: structure ALL errors via A2AMessage, not just first 3-5.
                     # Use normalized diff for the decision; raw errors for display.
+                    all_errs_for_kimi = compile_errs if compile_errs else [cc["compile_output"][:300]]
                     if new_errors_norm:
                         # Genuinely new error type/message — show raw form
-                        compile_err_lines = list(new_errors)[:5] if new_errors else compile_errs[:5]
                         feedback_intro = (
                             f"REAL COMPILER ERRORS (hipcc) — NEW errors since last iteration (iteration {iteration}):\n"
                         )
                     elif new_errors and not new_errors_norm:
                         # Raw diff shows "new" but normalized diff shows 0 → same
                         # error at a different line number.  Tell Kimi explicitly.
-                        compile_err_lines = compile_errs[:3] if compile_errs else [cc["compile_output"][:300]]
                         feedback_intro = (
                             f"REAL COMPILER ERRORS (hipcc) — SAME error persists (possibly at different line) (iteration {iteration}).\n"
                             f"The error type and message are identical to last iteration; only the line number shifted.\n"
@@ -1112,15 +1373,26 @@ class ModelRouter:
                         )
                     else:
                         # All errors are the same as before — send them all but flag stagnation
-                        compile_err_lines = compile_errs[:3] if compile_errs else [cc["compile_output"][:300]]
                         feedback_intro = (
                             f"REAL COMPILER ERRORS (hipcc) — SAME errors persisting (iteration {iteration}).\n"
                             f"You MUST try a DIFFERENT approach. Previous fix did not work.\n"
                         )
 
+                    # A2A: Build structured message from ALL errors
+                    try:
+                        err_msg = self._build_error_feedback_message(
+                            all_errs_for_kimi, iteration=iteration)
+                        structured_errs = err_msg.to_prompt(max_chars=4000)
+                    except Exception:
+                        # Fallback: old truncation approach
+                        if new_errors_norm:
+                            structured_errs = "\n".join(list(new_errors)[:5] if new_errors else compile_errs[:5])
+                        else:
+                            structured_errs = "\n".join(compile_errs[:3] if compile_errs else [cc["compile_output"][:300]])
+
                     evaluator_feedback = (
                         feedback_intro
-                        + "\n".join(compile_err_lines)
+                        + structured_errs
                         + "\n\nFocus on:\n"
                         "- Missing HIP API calls (cuda* not converted to hip*)\n"
                         "- Undefined functions/macros (checkCudaErrors, etc.)\n"
