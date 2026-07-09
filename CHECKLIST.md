@@ -38,6 +38,14 @@ Companion to [`ROAST.md`](ROAST.md). Items 1–5 are **implemented in this chang
 - **TRIZ:** #23 feedback — moved from "22-minute GPU run" to "unit test".
 - **10B impact:** infrastructure — protects the journey, not one kernel.
 
+### ✅ 5b. RUN-FIRST — the loop's convergence criterion is now "it runs", not "it compiles" (addendum)
+- **Change:** `verifier.py` gains `quick_run_check()` (runs the binary the in-loop compile check already linked; ~1s) + `_signal_name()` (exit −11 → `SIGSEGV`). `router.py`: after every passing compile, the binary is run; a crash blocks BOTH loop exits (convergence break and the "keeping working code" break), merges the signal + GLM's semantic findings into the refine feedback, and aborts with `runtime_stagnation` after 3 consecutive crashes. `main.py`: signal-named crash labels, compile diagnostics only shown for compile failures, "(no output captured — crashed before stdout flush)" note. Shim emits `(void)hipSetDevice(0)` so our injected code is warning-clean.
+- **Route:** hipcc→binary→Kimi/GLM — a new, highest-authority oracle edge that existed physically (the binary was on disk every iteration) but had no wire.
+- **TRIZ:** #13 do-it-in-reverse (run before semantic eval decides), #23 feedback, #24 hidden resource.
+- **Evidence:** the post-fix 296s run compiled on iter 1, GLM flagged `__shfl_up_sync uses width as the width parameter`, the loop discarded the finding at the "keeping" break, and verify() found `exit -11` with no feedback path. The discard policy cited "proven: refinement always regresses" — proof from the era when the fixer corrupted every refinement.
+- **Convergence:** the exact class of wavefront64 bug this system exists for (shfl width/mask, shared-mem sized 32 vs 64) *compiles clean and fails at runtime* — this is the first change that lets the loop see it.
+- **10B impact:** 1000X+ — runnability is the definition of the main function (Гл.Ф), not an afterthought.
+
 ## Specified, not implemented (next pass)
 
 ### ☐ 6. Fixer output must be self-validating (the real Tier-1)
