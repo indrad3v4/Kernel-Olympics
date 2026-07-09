@@ -16,7 +16,7 @@ I'm a **contributor**, not the owner. All changes go through PRs. Do not push to
 
 These are the only tasks that matter right now. Do them in priority order. P0 first, always.
 
-### P0 — The tool lies about its own results
+### P0 — The tool lies about its own results   [IMPLEMENTED on branch p0-pipeline-integrity]
 
 ```
 T0.1  COMPILED label is contradicted two lines later
@@ -56,47 +56,31 @@ T0.5  Pattern count celebrates garbage
 ### P1 — The 14-minute, $0.11 bonfire
 
 ```
-T1.1  Stagnation is detected but not obeyed
-      By iteration 3 the loop already knows: 6 errs, Δ+0, new:0, CYCLE, KIMI PLATEAU
-      router.py:1850–1868 escalates a counter instead of bailing
-      It kept paying Kimi ~150s/lap for iterations 3 and 4
-      Fix: first exact-error-set repeat after one retry = abort
-      Identical 6 errors are proof the model is stuck
-
 T1.2  No time or cost budget
       router.py:1458 sets max_iterations=10
       At ~150s/iter that is a ~25-minute worst case, uncapped
       Fix: add --max-seconds and --max-cost
       Lower default iterations and enforce early-exit
-
-T1.3  SHIM INJECTION is theater
-      extern int → SHIM FAILED instantly
-      A band-aid that never works in the router.py shim path
-      Fix: either make it real or delete it
 ```
 
-### P1 — Verifier vs. porter civil war
-
-```
-T1.4  Harness generator wraps a main() around a file that already has one
-      nvidia_shfl_scan.cu is a complete NVIDIA sample
-      The harness redefines main and produces downstream nonsense
-      verifier.py:196 already has a self_contained guard — it did not fire
-      Either the spec was not marked self_contained,
-      or Kimi stripped the int main during porting
-      Fix: detect self-contained from the original source reliably
-      Skip harness wrapping for self-contained inputs
-      This one bug generated most of the wasted iterations
-```
+Pruned 2026-07-09 — verified already fixed on main @ f3affa4:
+- T1.1 (stagnation) now aborts via runtime_stagnation / harness_origin /
+  kimi_plateau paths (router.py ~1763/1815/1926), not just a counter.
+- T1.3 (shim) now has a real SHIM FIX success path + clean abort, not
+  instant-fail theater (router.py ~1903–1934).
+- T1.4 (self-contained) guard at verifier.py:196 fires for self_contained
+  specs, so the verify path no longer wraps a second main().
 
 ### P2 — It fumbles its own hello
 
 ```
-T2.1  Double banner + silently-dropped --silent flag
+T2.1  Double banner + silently-dropped --silent flag  [STILL LIVE 2026-07-09]
       main.py:172 constructs Display(silent=silent)
       main.py:186 immediately overwrites it with Display()
       Result: banner prints twice and --silent does nothing
       Fix: construct Display once and pass silent through
+      (Reviewer thought this landed in PR #8/#9 — it did NOT; origin/main
+       @ f3affa4 still double-constructs Display. Verified against code.)
 
 T2.2  Box borders overflow
       Long lines and emoji-heavy status text blow past the ║ right border
