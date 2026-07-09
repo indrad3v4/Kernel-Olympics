@@ -468,6 +468,48 @@ class VerificationAgent:
 
     # ── Verify method (using persistent build directory) ────────────
 
+    @staticmethod
+    def _signal_name(exit_code) -> str:
+        """Translate a negative POSIX exit code to its signal name.
+
+        subprocess reports 'killed by signal N' as returncode -N. Showing a
+        raw 'exit -11' makes the operator (and the LLM feedback loop) do
+        signal arithmetic; 'SIGSEGV' is the actionable spelling.
+        """
+        if exit_code is None or exit_code >= 0:
+            return ""
+        import signal as _signal
+        try:
+            return _signal.Signals(-exit_code).name
+        except (ValueError, AttributeError):
+            return f"signal {-exit_code}"
+
+    def quick_run_check(self, kernel_name: str) -> Dict:
+        """Run the binary produced by the last quick_compile_check for *kernel_name*.
+
+        The in-loop compile check already links a real executable into
+        build_dir/loop_<kernel>/ — running it costs ~1s and is the cheapest,
+        highest-authority oracle in the pipeline. Until 2026-07-09 nobody
+        called it: the loop declared victory on compile-pass, and a SIGSEGV
+        was discovered once, in verify(), after the loop had exited — with
+        no feedback path back to the models.
+
+        Returns run_success / run_output / run_exit_code / signal /
+        benchmark_us. A missing binary (compile never passed, or no hipcc)
+        reports run_success=False with exit_code None — callers should only
+        invoke this after a passing compile check.
+        """
+        kernel_build_dir = self.build_dir / f"loop_{kernel_name}"
+        safe_kernel_name = re.sub(r'[^a-zA-Z0-9_-]', '', kernel_name)
+        run_ok, run_output, benchmark, exit_code = self._run(kernel_build_dir, safe_kernel_name)
+        return {
+            "run_success": run_ok,
+            "run_output": run_output[:1000] if run_output else "",
+            "run_exit_code": exit_code,
+            "signal": self._signal_name(exit_code),
+            "benchmark_us": benchmark,
+        }
+
     def quick_compile_check(self, hip_source: str, kernel_name: str = "test_kernel",
                             on_progress=None) -> Dict:
         """Fast in-loop compilation check — no run, no diff.
