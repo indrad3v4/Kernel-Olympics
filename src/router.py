@@ -797,6 +797,9 @@ class ModelRouter:
         # This eliminates conflicting signals and saves the GLM call when compile fails.
         opt = PromptOptimizer()
         prev_error_count = 0  # TRIZ #23: track error delta across iterations
+        prev_errors_set = set()  # TRIZ #22: track which errors we've already shown
+        stagnation_count = 0  # TRIZ #15: count iterations with no improvement
+        error_history = []  # TRIZ #17: cap error context to last 2 iterations
         for iteration in range(1, max_iterations + 1):
             if not result["ported_code"]:
                 break
@@ -817,19 +820,74 @@ class ModelRouter:
                     compile_failed_this_iter = True
                     compile_errs = cc.get("errors", [])
                     result["compile_errors"].extend(compile_errs)
+
+                    # TRIZ #22: Only feed NEW errors to Kimi (diff vs previous iteration)
+                    current_errors_set = set(e.strip() for e in compile_errs if e.strip())
+                    new_errors = current_errors_set - prev_errors_set
+                    resolved_errors = prev_errors_set - current_errors_set
+                    prev_errors_set = current_errors_set
+
+                    # TRIZ #23: Track convergence — error count delta
+                    current_err_count = len(compile_errs)
+                    error_delta = prev_error_count - current_err_count
+                    error_history.append(current_err_count)
+                    result["changes"].append(
+                        f"[hipcc] Iter {iteration}: {current_err_count} errors "
+                        f"(delta: {error_delta:+d}, new: {len(new_errors)}, "
+                        f"resolved: {len(resolved_errors)})")
+
+                    # TRIZ #15: Detect stagnation — 3 iterations with no improvement
+                    if error_delta <= 0:
+                        stagnation_count += 1
+                    else:
+                        stagnation_count = 0
+
+                    # TRIZ #15: After 3 stagnant iterations, escalate to DeepSeek re-plan
+                    if stagnation_count >= 3 and iteration < max_iterations:
+                        result["changes"].append(
+                            f"[hipcc] Stagnation detected ({stagnation_count} iterations no improvement) "
+                            f"— escalating to DeepSeek re-plan")
+                        if on_phase: on_phase("plan", "DeepSeek-v4-pro",
+                            f"re-planning due to stagnation (iter {iteration})")
+                        re_plan = self._call_model(
+                            "deepseek", ds_prompt,
+                            system_prompt=SYSTEM_PROMPTS.get("deepseek", ""),
+                        )
+                        if re_plan.success:
+                            deepseek_plan_output = re_plan.output
+                            result["changes"].append(
+                                f"[deepseek] Re-plan generated (stagnation recovery)")
+                            stagnation_count = 0  # Reset after re-plan
+                        # Keep the same compile errors for Kimi, but with fresh plan
+
                     err_summary = "; ".join(compile_errs[:3]) if compile_errs else cc["compile_output"][:300]
                     result["changes"].append(
                         f"[hipcc] Compile-first check {iteration}: FAILED: {err_summary[:120]}")
-                    # Compile errors ARE the feedback — no need for GLM static analysis
-                    compile_err_lines = compile_errs[:3] if compile_errs else [cc["compile_output"][:300]]
+
+                    # TRIZ #22: Feed only NEW errors to Kimi (throw away repeated ones)
+                    if new_errors:
+                        compile_err_lines = list(new_errors)[:5]
+                        feedback_intro = (
+                            f"REAL COMPILER ERRORS (hipcc) — NEW errors since last iteration (iteration {iteration}):\n"
+                        )
+                    else:
+                        # All errors are the same as before — send them all but flag stagnation
+                        compile_err_lines = compile_errs[:3] if compile_errs else [cc["compile_output"][:300]]
+                        feedback_intro = (
+                            f"REAL COMPILER ERRORS (hipcc) — SAME errors persisting (iteration {iteration}).\n"
+                            f"You MUST try a DIFFERENT approach. Previous fix did not work.\n"
+                        )
+
                     evaluator_feedback = (
-                        f"REAL COMPILER ERRORS (hipcc) — fix these FIRST (iteration {iteration}):\n"
+                        feedback_intro
                         + "\n".join(compile_err_lines)
                         + "\n\nFocus on:\n"
                         "- Missing HIP API calls (cuda* not converted to hip*)\n"
                         "- Undefined functions/macros (checkCudaErrors, etc.)\n"
                         "- Type mismatches (hipError_t vs cudaError_t)\n"
                         "- Missing or wrong #include directives\n"
+                        + (f"- ⚠️ Stagnation: {stagnation_count} iterations without improvement — try a DIFFERENT approach\n"
+                           if stagnation_count > 0 else "")
                     )
                     # TRIZ #23: Record iteration for prompt evolution
                     opt.record_iteration(
