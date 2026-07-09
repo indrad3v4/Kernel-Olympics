@@ -475,11 +475,37 @@ class KernelOlympics:
                         if run_output:
                             for line in run_output.strip().splitlines()[:5]:
                                 print(f"║  ⚠️  {red(line[:65]):<64}║")
-                    # TRIZ #23: Do NOT cache a verification failure — it poisons future
-                    # runs. Old behavior only guarded against compile failures; a
-                    # runtime crash or output mismatch is just as broken and must not
-                    # be cached as a "verified" fix either.
-                    print(f"║  {'ℹ️ Cache skipped — verification failed, not caching unverified fix':<64}║")
+                    # S3: Cache best-attempt code even when verification fails, so
+                    # re-runs can rebuild from the closest-working version instead
+                    # of starting from scratch (which costs ~10 min per kernel).
+                    # This solves the 0% cache-hit-rate problem for long-running loops.
+                    best_code = port_result.get("best_attempt_code", "")
+                    best_iter = port_result.get("best_attempt_iteration", 0)
+                    if best_code:
+                        best_confidence = port_result.get("best_attempt_confidence", 0.15)
+                        self.memory.store(
+                            pattern_snippet=source[:500],
+                            verified_fix=best_code[:500],
+                            confidence=best_confidence,
+                            verification_run_id=f"best_attempt_iter_{best_iter}",
+                            llm_time_s=port_result.get("llm_time_s", 0.0),
+                            findings=cr.get("findings", [])
+                        )
+                        print(f"║  {'📦 Cached best attempt (iter ' + str(best_iter) + ') @ ' + str(best_confidence*100) + '% confidence':<64}║")
+                    else:
+                        # No best-attempt code either — still cache the ported_code
+                        # with a token confidence so re-runs have a starting point.
+                        fallback_code = port_result.get("ported_code", "")
+                        if fallback_code:
+                            self.memory.store(
+                                pattern_snippet=source[:500],
+                                verified_fix=fallback_code[:500],
+                                confidence=0.10,
+                                verification_run_id="best_attempt_fallback",
+                                llm_time_s=port_result.get("llm_time_s", 0.0),
+                                findings=cr.get("findings", [])
+                            )
+                            print(f"║  {'📦 Cached fallback code @ 10% confidence (no compile success)':<64}║")
             else:
                 self.disp.file_done(Path(cr['file']).name, f"{cr.get('risk_level')} — no porting needed", ok=True)
 

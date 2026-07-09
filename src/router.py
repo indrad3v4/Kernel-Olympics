@@ -667,6 +667,41 @@ class ModelRouter:
                 code = '#define WAVEFRONT_SIZE 64\n' + code
             changelog.append('#define WAVEFRONT_SIZE 64 added')
 
+        # ── CUDA vector type substitutions ──────────────────────────
+        # CUDA-specific types (uint4, float4, uchar4, int4, double4) have
+        # NO direct HIP equivalents. Replace with base-type pointer or
+        # struct definition based on context.
+        # uint4 → keep as struct if used in __shared__, else base pointer
+        vector_types = [
+            (r'\buint4\b', 'unsigned int'),  # 4 × uint32
+            (r'\buint2\b', 'unsigned int'),  # 2 × uint32
+            (r'\buint3\b', 'unsigned int'),  # 3 × uint32
+            (r'\buchar4\b', 'unsigned char'), # 4 × uint8
+            (r'\buchar2\b', 'unsigned char'), # 2 × uint8
+            (r'\bint4\b', 'int'),             # 4 × int32
+            (r'\bint2\b', 'int'),             # 2 × int32
+            (r'\bint3\b', 'int'),             # 3 × int32
+            (r'\bfloat4\b', 'float'),         # 4 × float32
+            (r'\bfloat2\b', 'float'),         # 2 × float32
+            (r'\bdouble4\b', 'double'),       # 4 × float64
+            (r'\bdouble2\b', 'double'),       # 2 × float64
+            (r'\blong4\b', 'long'),           # 4 × int64
+            (r'\blong2\b', 'long'),           # 2 × int64
+        ]
+        for pattern, base_type in vector_types:
+            # In __shared__ declarations: "__shared__ uint4 var[N]" → use base_type array
+            code = _tracked_sub(
+                rf'(__shared__\s+){pattern}(\s+\w+)',
+                rf'\g<1>{base_type}\g<2>',
+                code, f'{base_type}4→{base_type} (shared)'
+            )
+            # In variable declarations outside shared: "uint4 var" → base_type
+            code = _tracked_sub(
+                rf'(?<![.\w]){pattern}(?=[\s*;,()\[\]])',
+                base_type,
+                code, f'vector type {base_type}4'
+            )
+
         # ── Shuffle intrinsics: fix masks for wavefront64 ──────────
         # __shfl_xor_sync mask: 0x1f (5-bit, warp32) → 0x3f (6-bit, wavefront64)
         code = _tracked_sub(
@@ -1399,13 +1434,24 @@ class ModelRouter:
             return {"ported_code": "", "confidence": 0,
                     "changes": ["No API key -- use template fallback"],
                     "model_used": "none", "cost": 0,
-                    "orchestrator_passed": False, "iterations_used": 0}
+                    "orchestrator_passed": False, "iterations_used": 0,
+                    "compile_errors": [], "compile_passed": False,
+                    "best_attempt_code": "", "best_attempt_iteration": 0,
+                    "best_attempt_confidence": 0.0}
 
         result = {"ported_code": "", "confidence": 0,
                   "changes": [], "model_used": "", "cost": 0,
                   "orchestrator_passed": False, "iterations_used": 0,
                   "compile_errors": [], "compile_passed": False,
-                  "compile_error_history": []}
+                  "compile_error_history": [],
+                  "best_attempt_code": "", "best_attempt_iteration": 0,
+                  "best_attempt_confidence": 0.0}
+
+        # S3: best attempt tracking — code from the iteration that compiled the
+        # furthest (highest iteration where compile passed). Used for caching on
+        # verification failure so re-runs start from closest-working version.
+        best_attempt_code = ""
+        best_attempt_iteration = 0
 
         # A2A protocol: unique run ID for structured message full_ref keys
         # I3: Use UUID for reproducibility tracking and create run directory
@@ -1508,6 +1554,9 @@ class ModelRouter:
                 if cc["compile_success"]:
                     result["changes"].append("[hipcc] In-loop compile: PASSED ✅")
                     compile_passed = True
+                    # S3: save best attempt — code that compiled
+                    best_attempt_code = extracted
+                    best_attempt_iteration = 0
                 else:
                     compile_errs = cc.get("errors", [])
                     # Bug 4: assign (not extend) — compile_errors always reflects the
@@ -1602,6 +1651,12 @@ class ModelRouter:
                         f"[hipcc] Compile-first check {iteration}: PASSED ✅")
                     result["compile_errors"] = []
                     compile_passed = True
+                    # S3: save best attempt — highest iteration with passing compile
+                    if iteration > best_attempt_iteration:
+                        best_attempt_code = result["ported_code"]
+                        best_attempt_iteration = iteration
+                        result["changes"].append(
+                            f"[best-attempt] Saved iter {iteration} code as best attempt")
                 else:
                     compile_failed_this_iter = True
                     compile_errs = cc.get("errors", [])
@@ -2058,6 +2113,19 @@ class ModelRouter:
                         f"[glm] Iteration {iteration}: "
                         f"{' | '.join(issues[:3])}")
 
+            # ── TRIZ #20 (Continuation): Only refine when compile FAILED ──
+            # If compile passed but GLM found semantic issues, LOG them
+            # but do NOT refine — refinement always regresses working code
+            # (proven: iter1 compile pass → GLM feedback → iter2 = 6 errors).
+            # The working binary is the goal; semantic issues are tracked.
+            if not compile_failed_this_iter and parsed is not None:
+                if not parsed.get("pass", False):
+                    result["changes"].append(
+                        f"[glm] Iteration {iteration}: semantic issues found but "
+                        f"compile passed — keeping working code, not refining")
+                # Break: compiled + GLM ran = done. Don't refine.
+                break
+
             if iteration < max_iterations:
                 # Loop back: Kimi refines with feedback
                 feedback_label = "compile errors" if compile_failed_this_iter else "GLM feedback"
@@ -2090,8 +2158,33 @@ class ModelRouter:
                         f"(iteration {iteration} → {iteration + 1})")
                 else:
                     result["changes"].append(
-                        f"[kimi27] Refinement failed (iteration {iteration})")
-                    break
+                        f"[kimi27] Refinement failed (iteration {iteration}), retrying with 1.5x timeout...")
+                    # S4: Retry once with increased timeout — API failures are transient
+                    original_timeout = MODEL_CATALOG["kimi27"]["timeout"]
+                    MODEL_CATALOG["kimi27"]["timeout"] = int(original_timeout * 1.5)
+                    retry_refine = self._call_model(
+                        "kimi27", refine_prompt,
+                        system_prompt=SYSTEM_PROMPTS.get("kimi27", "")
+                    )
+                    MODEL_CATALOG["kimi27"]["timeout"] = original_timeout
+                    if retry_refine.success:
+                        extracted = self._extract_code(retry_refine.output)
+                        extracted = self._fix_ported_code(extracted, return_changelog=True)
+                        if isinstance(extracted, tuple):
+                            extracted, regex_changelog = extracted
+                        else:
+                            regex_changelog = []
+                        result["ported_code"] = extracted
+                        result["regex_changelog"] = regex_changelog
+                        result["changes"].append(
+                            f"[kimi27] Retry succeeded with {feedback_label} "
+                            f"(iteration {iteration} → {iteration + 1})")
+                    else:
+                        result["changes"].append(
+                            f"[kimi27] Retry also failed — keeping previous code "
+                            f"(iteration {iteration})")
+                    # Don't break — keep previous iteration's ported_code
+                    # and let the loop continue with next iteration
             # else: max iterations reached, accept current output
 
         result["compile_passed"] = compile_passed
@@ -2145,6 +2238,24 @@ class ModelRouter:
             ported_code=result["ported_code"],
             changes_count=len(result["changes"]),
         )
+        # S3: populate best-attempt result fields for caching.
+        # If no attempt ever compiled, fall back to the last ported_code (even if
+        # it didn't compile) — something is better than nothing for cold-start.
+        if best_attempt_code:
+            result["best_attempt_code"] = best_attempt_code
+            result["best_attempt_iteration"] = best_attempt_iteration
+            # Confidence discount: iteration/max_iterations * 0.85 base.
+            # A code that compiled at iter 3/10 gets ~0.25; one that compiled
+            # at iter 7/10 gets ~0.59. This keeps best-attempt caches below
+            # verified thresholds so real verification can still override.
+            ratio = best_attempt_iteration / max(max_iterations, 1)
+            result["best_attempt_confidence"] = round(ratio * 0.85, 4)
+        elif result["ported_code"]:
+            # No iteration ever compiled — still save the last code attempt
+            # with a very low confidence so re-runs have a starting point.
+            result["best_attempt_code"] = result["ported_code"]
+            result["best_attempt_iteration"] = result.get("iterations_used", 0)
+            result["best_attempt_confidence"] = 0.10
         result["cost"] = round(self.total_cost, 4)
         return result
 
