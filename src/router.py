@@ -664,6 +664,44 @@ class ModelRouter:
         )
         return prompt
 
+    def _build_glm_error_analysis_prompt(self, ported_code: str,
+                                         compile_errors: List[str],
+                                         iteration: int,
+                                         patterns: List[Dict]) -> str:
+        """Build GLM prompt for compile-error analysis (TRIZ #28).
+
+        When hipcc fails, GLM analyzes the compile errors + code and tells
+        Kimi WHAT to fix structurally — not just "error: undefined hipMalloc"
+        but "you forgot #include <hip/hip_runtime.h>, that's why hipMalloc is undefined."
+
+        This is the lightweight error-analyst mode, not full semantic evaluation.
+        """
+        err_text = "\n".join(compile_errors[:10])
+
+        prompt = (
+            f"You are a HIP/ROCm compile error analyst. Kimi generated code that fails to compile.\n"
+            f"Analyze the compiler errors and tell Kimi EXACTLY what to fix.\n\n"
+            f"COMPILER ERRORS (hipcc, iteration {iteration}):\n"
+            f"{err_text}\n\n"
+            f"CURRENT CODE (first 3000 chars):\n"
+            f"```hip\n{ported_code[:3000]}\n```\n\n"
+            "Analyze each error and provide:\n"
+            "1. Root cause for each error (not just the error message)\n"
+            "2. The EXACT fix needed (specific API name, include, or type)\n"
+            "3. Priority order (fix headers first, then types, then logic)\n\n"
+            "Common CUDA→HIP issues:\n"
+            "- cuda_runtime.h → hip/hip_runtime.h (causes ALL cuda* functions to be undefined)\n"
+            "- cudaMalloc → hipMalloc, cudaMemcpy → hipMemcpy, cudaFree → hipFree\n"
+            "- cudaError_t → hipError_t, cudaSuccess → hipSuccess\n"
+            "- checkCudaErrors() → remove or define wrapper\n"
+            "- __shfl_*_sync mask: 0x1f (32-bit) → 0x3f (64-bit wavefront)\n"
+            "- threadIdx.x threadIdx.y etc stay the same in HIP\n\n"
+            'Respond with JSON: {"fixes": [{"error": str, "root_cause": str, '
+            '"exact_fix": str, "priority": int}], "summary": str, '
+            '"missing_includes": [str], "wrong_apis": [{"cuda": str, "hip": str}]}.'
+        )
+        return prompt
+
     # ── Main routing logic ──────────────────────────────────────
 
     def route(self, kernel_source: str, patterns: List[Dict],
@@ -906,12 +944,92 @@ class ModelRouter:
                     )
                     prev_error_count = len(compile_errs)
 
+                    # ── TRIZ #28: GLM Error Analyst — translate compile errors for Kimi ──
+                    # Root contradiction: GLM was skipped on compile failure, but that's
+                    # when Kimi needs semantic guidance MOST. Raw hipcc errors like
+                    # "undefined reference to hipMalloc" don't tell Kimi WHY — it needs
+                    # "you forgot #include <hip/hip_runtime.h>". GLM bridges this gap.
+                    if compile_errs and iteration < max_iterations:
+                        if on_phase: on_phase("analyze", "GLM-5.2",
+                            f"analyzing compile errors for Kimi (iter {iteration})")
+                        print(f"║  │  🔍 GLM analyzing {len(compile_errs)} compile errors for Kimi{'':<30}║")
+                        glm_err_prompt = self._build_glm_error_analysis_prompt(
+                            result["ported_code"], compile_errs, iteration, patterns)
+                        glm_err = self._call_model(
+                            "glm", glm_err_prompt,
+                            system_prompt="You are a HIP/ROCm compile error analyst. Respond ONLY with JSON.",
+                            prefill='{"fixes":'  # TRIZ #9: force JSON
+                        )
+                        if glm_err.success:
+                            # Parse GLM error analysis
+                            raw_glm = glm_err.output.strip()
+                            json_start = raw_glm.find("{")
+                            if json_start >= 0:
+                                raw_glm_json = raw_glm[json_start:]
+                            else:
+                                raw_glm_json = raw_glm
+                            glm_analysis = None
+                            try:
+                                glm_analysis = json.loads(raw_glm_json)
+                            except:
+                                # Try extracting just the fixes array
+                                m = re.search(r'\{.*"fixes".*\}', raw_glm, re.DOTALL)
+                                if m:
+                                    try: glm_analysis = json.loads(m.group(0))
+                                    except: pass
+
+                            if glm_analysis and glm_analysis.get("fixes"):
+                                # Build structured feedback for Kimi
+                                fixes = sorted(glm_analysis["fixes"],
+                                    key=lambda x: x.get("priority", 99))
+                                fix_lines = []
+                                for f in fixes[:7]:
+                                    fix_lines.append(
+                                        f"  • {f.get('error', '?')[:80]}\n"
+                                        f"    Root cause: {f.get('root_cause', '?')[:120]}\n"
+                                        f"    Fix: {f.get('exact_fix', '?')[:150]}"
+                                    )
+                                missing_inc = glm_analysis.get("missing_includes", [])
+                                wrong_apis = glm_analysis.get("wrong_apis", [])
+
+                                evaluator_feedback = (
+                                    f"GLM ERROR ANALYSIS (iteration {iteration}):\n"
+                                    f"GLM analyzed {len(compile_errs)} compiler errors and identified {len(fixes)} root causes.\n\n"
+                                    f"PRIORITY FIXES:\n" + "\n".join(fix_lines) + "\n"
+                                )
+                                if missing_inc:
+                                    evaluator_feedback += (
+                                        f"\nMISSING INCLUDES (add these):\n"
+                                        + "\n".join(f"  #include {inc}" for inc in missing_inc) + "\n"
+                                    )
+                                if wrong_apis:
+                                    evaluator_feedback += (
+                                        f"\nWRONG APIs (replace CUDA → HIP):\n"
+                                        + "\n".join(f"  {a.get('cuda','?')} → {a.get('hip','?')}" for a in wrong_apis) + "\n"
+                                    )
+                                if glm_analysis.get("summary"):
+                                    evaluator_feedback += f"\nSUMMARY: {glm_analysis['summary'][:200]}\n"
+
+                                result["changes"].append(
+                                    f"[glm] Error analysis: {len(fixes)} fixes identified "
+                                    f"(missing_includes={len(missing_inc)}, wrong_apis={len(wrong_apis)})")
+                                print(f"║  │  💡 GLM: {len(fixes)} fixes, {len(missing_inc)} includes, {len(wrong_apis)} APIs{'':<26}║")
+                            else:
+                                result["changes"].append(
+                                    f"[glm] Error analysis parse failed — using raw compile errors")
+                                print(f"║  │  ⚠ GLM analysis parse failed — falling back to raw errors{'':<16}║")
+                        else:
+                            result["changes"].append(
+                                f"[glm] Error analyst call failed — using raw compile errors")
+                            print(f"║  │  ⚠ GLM analyst call failed — falling back to raw errors{'':<18}║")
+
             result["iterations_used"] = iteration
 
             # ── Step 2: If compile passed → run GLM for semantic evaluation ──
             # TRIZ #28: GLM is now ONLY used when code actually compiles —
             #   it checks semantic correctness (shfl masks, perf), not compile errors.
             # If compile failed (or no verifier), skip GLM — go straight to Kimi refine.
+            # NOTE: GLM error-analyst mode was already called above when compile failed.
             parsed = None  # will stay None if GLM is skipped
             if not compile_failed_this_iter:
                 eval_prompt = self._build_glm_evaluate_prompt(
