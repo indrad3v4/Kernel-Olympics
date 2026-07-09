@@ -1,0 +1,20 @@
+{
+  "versions": [
+    {
+      "version": "v1.0.0",
+      "date": "2026-07-09",
+      "author": "fable",
+      "changes": [
+        "Initial versioned system prompts for DeepSeek (planner), Kimi (coder), GLM (evaluator)",
+        "Moved the GLM error-analyst role from an inline call-site string into SYSTEM_PROMPTS",
+        "Added the two-layer SIGSEGV constraint to the Kimi refine prompt (frozen Layer 1 base)",
+        "Refine prompt now reports the real stagnation threshold instead of a hardcoded 3"
+      ],
+      "files_changed": [
+        "src/router.py"
+      ],
+      "run_results": {}
+    }
+  ],
+  "current": "v1.0.0"
+}
