@@ -329,20 +329,9 @@ def _format_patterns_summary(patterns: List[Dict]) -> str:
     return "\n".join(lines)
 
 
-# Pattern → best model routing table
-ROUTING_TABLE = {
-    # Complex warp patterns → GLM (planner analyzes the structure)
-    "shfl_down_sync": "glm",
-    "shfl_xor_sync": "glm",
-    "syncwarp": "glm",
-    # Structural patterns → Kimi K2.7 (coder generates HIP code)
-    "warp_size_constant": "kimi27",
-    "shared_mem_warp_count": "kimi27",
-    "lane_id_mask": "kimi27",
-    "tile_size_warp": "kimi27",
-    # Verification → Gemma 4 locally, fallback DeepSeek
-    "default": "gemma4",
-}
+# NOTE: ROUTING_TABLE was removed — it was dead code. route() always runs
+# the full DeepSeek→Kimi→GLM pipeline regardless of detected patterns.
+# If per-pattern model selection is needed in the future, add it to route().
 
 
 @dataclass
@@ -1196,7 +1185,12 @@ class ModelRouter:
                   "compile_errors": [], "compile_passed": False}
 
         # A2A protocol: unique run ID for structured message full_ref keys
-        self.run_id = f"{kernel_name}_{int(time.time())}"
+        # I3: Use UUID for reproducibility tracking and create run directory
+        run_id = str(uuid.uuid4())[:8]
+        self.run_id = f"{kernel_name}_{run_id}"
+        run_dir = Path(f"runs/{self.run_id}")
+        run_dir.mkdir(parents=True, exist_ok=True)
+        result["run_id"] = self.run_id
 
         # Track pipeline phase outcomes for rubric scoring
         planner_success = False
@@ -1212,6 +1206,15 @@ class ModelRouter:
         ds_prompt = self._build_deepseek_plan_prompt(kernel_source, patterns)
         plan = self._call_model("deepseek", ds_prompt,
                                 system_prompt=SYSTEM_PROMPTS.get("deepseek", ""))
+        # I3: Log model I/O for reproducibility
+        try:
+            (run_dir / "phase1_plan_input.json").write_text(
+                json.dumps({"prompt": ds_prompt[:5000]}, indent=2), encoding="utf-8")
+            (run_dir / "phase1_plan_output.json").write_text(
+                json.dumps({"model": "deepseek", "success": plan.success,
+                            "output": plan.output[:5000]}, indent=2), encoding="utf-8")
+        except OSError:
+            pass
         if plan.success:
             planner_success = True
             deepseek_plan_output = plan.output
@@ -1225,6 +1228,13 @@ class ModelRouter:
                                                    deepseek_plan=deepseek_plan_output)
         code = self._call_model("kimi27", kimi_prompt,
                                 system_prompt=SYSTEM_PROMPTS.get("kimi27", ""))
+        # I3: Log Kimi code generation
+        try:
+            (run_dir / "phase2_kimi_output.json").write_text(
+                json.dumps({"model": "kimi27", "success": code.success,
+                            "output": code.output[:5000]}, indent=2), encoding="utf-8")
+        except OSError:
+            pass
         if code.success:
             coder_success = True
             extracted = self._extract_code(code.output)
@@ -1298,6 +1308,7 @@ class ModelRouter:
         prev_errors_norm = set()  # TRIZ #3/#22: normalized set for semantic diffing
         stagnation_count = 0  # TRIZ #15: count iterations with no improvement
         error_history = []  # TRIZ #17: cap error context to last 2 iterations
+        norm_error_history = []  # A5: track normalized error frozensets for cycle detection
         for iteration in range(1, max_iterations + 1):
             if not result["ported_code"]:
                 break
@@ -1309,6 +1320,15 @@ class ModelRouter:
             if verifier and hasattr(verifier, 'quick_compile_check'):
                 if on_phase: on_phase("compile", "hipcc", f"compile-first check (attempt {iteration}/{max_iterations})")
                 cc = verifier.quick_compile_check(result["ported_code"], kernel_name=kernel_name)
+                # I3: Log iteration compile result for reproducibility
+                try:
+                    (run_dir / f"iteration_{iteration}_compile.json").write_text(
+                        json.dumps({"iteration": iteration,
+                                    "compile_success": cc["compile_success"],
+                                    "errors": cc.get("errors", [])[:8]},
+                                   indent=2), encoding="utf-8")
+                except OSError:
+                    pass
                 if cc["compile_success"]:
                     result["changes"].append(
                         f"[hipcc] Compile-first check {iteration}: PASSED ✅")
@@ -1354,6 +1374,22 @@ class ModelRouter:
                         stagnation_count += 1
                     else:
                         stagnation_count = 0
+
+                    # A5: Cycle detection — if the same normalized error set
+                    # recurs within the last 4 iterations, the loop is
+                    # oscillating (e.g., 5→3→5→3) without making real
+                    # progress. Double-count cycles to trigger stagnation
+                    # recovery faster.
+                    current_norm_frozen = frozenset(
+                        self._normalize_error(e) for e in compile_errs if e.strip()
+                    )
+                    if current_norm_frozen in norm_error_history[-4:]:
+                        stagnation_count += 2  # cycle detected — escalate faster
+                        result["changes"].append(
+                            f"[hipcc] Cycle detected: same error set recurred "
+                            f"(stagnation_count={stagnation_count})")
+                        print(f"║  │  🔁 CYCLE: same errors recurred — stagnation escalated{'':<27}║")
+                    norm_error_history.append(current_norm_frozen)
 
                     # TRIZ #15: After 3 stagnant iterations, escalate to DeepSeek re-plan
                     if stagnation_count >= 3 and iteration < max_iterations:

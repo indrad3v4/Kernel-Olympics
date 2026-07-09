@@ -53,6 +53,24 @@ class VerificationAgent:
             self.build_dir.mkdir(parents=True, exist_ok=True)
         else:
             self.build_dir = Path(tempfile.mkdtemp(prefix="verifier_build_"))
+            # Register cleanup for temp dirs created by mkdtemp
+            atexit.register(self.cleanup)
+
+    def cleanup(self):
+        """Remove the temporary build directory if it was auto-created."""
+        if self.build_dir and self.build_dir.exists():
+            # Only clean up if not using a user-specified VERIFIER_BUILD_DIR
+            if not os.environ.get("VERIFIER_BUILD_DIR"):
+                try:
+                    shutil.rmtree(self.build_dir)
+                except OSError as e:
+                    logging.debug("Failed to clean up build dir %s: %s", self.build_dir, e)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.cleanup()
 
     # ── hipcc warmup ────────────────────────────────────────────────
 
