@@ -229,9 +229,16 @@ MODEL_CATALOG = {
         "strength": "code generation, struct-aware HIP porting",
         "cost_per_1k": 0.00095,
         "local_first": False,
-        "max_tokens": 8192,      # coder needs room for full kernel + JSON wrapper
+        # Bug 1: 8192 was too tight once self-contained programs are sent in
+        # full (see _is_self_contained) — a ~15k-char / ~4300-token source
+        # plus its own main() must round-trip through the response, wrapped
+        # in {"ported_code": ...} JSON with escaping overhead on top.
+        # UNVERIFIED: confirm Fireworks accepts 16384 for kimi-k2p7-code
+        # before relying on it — _call_model degrades gracefully to a failed
+        # AgentResult if the API rejects the value, so this is safe to try.
+        "max_tokens": 16384,     # coder needs room for full kernel + JSON wrapper
         "temperature": 0.1,      # code generation needs precision
-        "timeout": 180,          # TRIZ #1: coder with 8192 tokens needs the most time
+        "timeout": 180,          # TRIZ #1: coder with 8192+ tokens needs the most time
     },
     "glm": {
         "id": "accounts/fireworks/models/glm-5p2",  # ✅ VERIFIED WORKING
@@ -610,6 +617,44 @@ class ModelRouter:
         # cuda_device variable name
         code = _tracked_sub(r'\bcuda_device\b', 'hip_device', code, 'cuda_device→hip_device')
 
+        # ── NVIDIA helper_cuda.h / helper_functions.h compat shims ──
+        # Those headers are stripped above (no HIP equivalent ships in
+        # ROCm), but full NVIDIA sample programs (not bare kernel snippets)
+        # often call symbols they used to provide. checkCudaErrors has a
+        # simple textual replacement above; these don't, because call sites
+        # vary (assigned to a variable, passed a pointer-to-pointer, etc.) —
+        # define tiny compatible stand-ins instead of guessing every call
+        # site. See docs/fix-plan-self-contained-programs.md, Bug 2.
+        _HELPER_SYMBOLS = ('findCudaDevice', 'sdkCreateTimer', 'sdkStartTimer',
+                            'sdkStopTimer', 'sdkGetTimerValue', 'sdkDeleteTimer',
+                            'StopWatchInterface', 'getLastCudaError')
+        if (any(re.search(r'\b' + sym + r'\b', code) for sym in _HELPER_SYMBOLS)
+                and '_verifier_helper_shims' not in code):
+            shim = (
+                '\n// _verifier_helper_shims — stand-ins for NVIDIA helper_cuda.h /\n'
+                '// helper_functions.h symbols (no HIP/ROCm equivalent ships).\n'
+                '#include <chrono>\n'
+                'struct StopWatchInterface { std::chrono::steady_clock::time_point start; double elapsed_ms = 0; };\n'
+                'static inline int findCudaDevice(int, const char **) { hipSetDevice(0); return 0; }\n'
+                'static inline void sdkCreateTimer(StopWatchInterface **t) { *t = new StopWatchInterface(); }\n'
+                'static inline void sdkStartTimer(StopWatchInterface **t) { (*t)->start = std::chrono::steady_clock::now(); }\n'
+                'static inline void sdkStopTimer(StopWatchInterface **t) {\n'
+                '    auto _now = std::chrono::steady_clock::now();\n'
+                '    (*t)->elapsed_ms = std::chrono::duration<double, std::milli>(_now - (*t)->start).count();\n'
+                '}\n'
+                'static inline float sdkGetTimerValue(StopWatchInterface **t) { return (float)(*t)->elapsed_ms; }\n'
+                'static inline void sdkDeleteTimer(StopWatchInterface **t) { delete *t; *t = nullptr; }\n'
+                'static inline void getLastCudaError(const char *) {}\n\n'
+            )
+            include_lines = list(re.finditer(r'#include\s+[<"].*?[>"]\n', code))
+            if include_lines:
+                insert_pos = include_lines[-1].end()
+                code = code[:insert_pos] + shim + code[insert_pos:]
+            else:
+                code = shim + code
+            changelog.append('NVIDIA helper_cuda/helper_functions compat shims added '
+                              '(findCudaDevice, sdk* timers, StopWatchInterface, getLastCudaError)')
+
         # ── WAVEFRONT_SIZE define ───────────────────────────────────
         # ROCm wavefront is 64 on gfx9 (MI300/MI250). CUDA warp is 32.
         if not re.search(r'#define\s+WAVEFRONT_SIZE', code):
@@ -891,6 +936,43 @@ class ModelRouter:
 
     # ── Phase prompt builders ────────────────────────────────────
 
+    @staticmethod
+    def _is_self_contained(source: str) -> bool:
+        """True when *source* defines its own ``int main(`` — a complete,
+        runnable program, not a bare kernel snippet.
+
+        Mirrors the check verifier.py's ``_generate_harness`` uses to decide
+        whether to wrap a driver around the ported code. Used here to decide
+        whether a fixed character-count truncation is safe to apply to a
+        prompt's source embed: a bare kernel snippet is always well under
+        any of these budgets, but a full NVIDIA sample program can run to
+        15k+ characters with its own ``main()`` near the end — truncating
+        that at a few thousand characters shows Kimi a kernel with no driver
+        and asks it to reproduce a ``main()`` it was never shown (see
+        docs/fix-plan-self-contained-programs.md, Bug 1).
+        """
+        return bool(re.search(r'^\s*int\s+main\s*\(', source, re.MULTILINE))
+
+    @staticmethod
+    def _unresolved_local_headers(source: str) -> List[str]:
+        """Return quoted local ``.cuh``/``.h`` includes in *source* that don't
+        exist anywhere under ``sample_kernels/`` in this repo.
+
+        A full NVIDIA sample may depend on a project-specific header (e.g.
+        ``shfl_integral_image.cuh``) that was never vendored into this repo.
+        ``_fix_ported_code`` strips the ``#include`` line, but any function
+        whose implementation lives only in that header remains an undefined
+        symbol — Kimi cannot port code it cannot see, and inventing a stub
+        would silently change program behavior. See Bug 3.
+        """
+        repo_sample_dir = Path(__file__).resolve().parent.parent / "sample_kernels"
+        missing = []
+        for m in re.finditer(r'#include\s*"([^"]+\.(?:cuh|h|hpp))"', source):
+            fname = m.group(1)
+            if not list(repo_sample_dir.rglob(Path(fname).name)):
+                missing.append(fname)
+        return missing
+
     def _build_deepseek_plan_prompt(self, kernel_source: str,
                                     patterns: List[Dict]) -> str:
         """Build the DeepSeek planner phase prompt with classifier context.
@@ -910,8 +992,12 @@ class ModelRouter:
         if pattern_summary:
             prompt += pattern_summary + "\n"
 
+        # Bug 1: a self-contained program's own main() can sit past a fixed
+        # character budget — truncating here means the planner (and, via its
+        # plan, Kimi) never learns the program has a driver to preserve.
+        source_for_prompt = kernel_source if self._is_self_contained(kernel_source) else kernel_source[:5000]
         prompt += (
-            f"```cuda\n{kernel_source[:5000]}\n```\n\n"
+            f"```cuda\n{source_for_prompt}\n```\n\n"
             "Write a detailed porting plan as a numbered checklist. "
             "For each item: what to change, where (line/construct), and why. "
             "Be specific — a coder agent will follow your plan exactly."
@@ -951,8 +1037,11 @@ class ModelRouter:
         if pattern_summary:
             prompt += pattern_summary + "\n"
 
+        # Bug 1: see _build_deepseek_plan_prompt — don't truncate a
+        # self-contained program's source out from under its own main().
+        source_for_prompt = kernel_source if self._is_self_contained(kernel_source) else kernel_source[:5000]
         prompt += (
-            f"ORIGINAL CUDA KERNEL:\n```cuda\n{kernel_source[:5000]}\n```\n\n"
+            f"ORIGINAL CUDA KERNEL:\n```cuda\n{source_for_prompt}\n```\n\n"
             "Write a detailed porting plan as a numbered checklist, explicitly "
             "different from the previous plan above. For each item: what to "
             "change, where, and why. Be specific — a coder agent will follow "
@@ -982,7 +1071,10 @@ class ModelRouter:
             "- #define WAVEFRONT_SIZE 64 at top\n"
             "- Replace #include <cuda_runtime.h> → #include <hip/hip_runtime.h>\n"
             "- Remove #include <helper_cuda.h>, <helper_functions.h>, <device_launch_parameters.h>\n"
-            "- Remove ALL #include \"*.cuh\" local headers (inline their content if needed)\n\n"
+            "- Remove ALL #include \"*.cuh\" local headers (inline their content if needed)\n"
+            "- checkCudaErrors(x) → (void)(x); findCudaDevice/sdkCreateTimer/sdkStartTimer/"
+            "sdkStopTimer/sdkGetTimerValue/sdkDeleteTimer/StopWatchInterface/getLastCudaError "
+            "have no HIP equivalent — replace with hipSetDevice/std::chrono or remove\n\n"
         )
 
         if deepseek_plan:
@@ -996,14 +1088,42 @@ class ModelRouter:
         if pattern_summary:
             prompt += pattern_summary + "\n"
 
+        # Bug 1: a self-contained program (has its own main()) must be shown
+        # in FULL — truncating a fixed-length embed cut off main() itself for
+        # any source past ~6000 chars, so Kimi ported only the kernels and
+        # never saw (let alone could reproduce) the driver that runs them.
+        self_contained = self._is_self_contained(kernel_source)
+        source_for_prompt = kernel_source if self_contained else kernel_source[:6000]
+        prompt += f"```cuda\n{source_for_prompt}\n```\n\n"
+
+        # Bug 3: a full sample may depend on a project-specific local header
+        # this repo never vendored (e.g. shfl_integral_image.cuh). Kimi can't
+        # port a function it can't see, and inventing a stub would silently
+        # change behavior — tell it to drop the dependent code path instead.
+        missing_headers = self._unresolved_local_headers(kernel_source)
+        if missing_headers:
+            prompt += (
+                f"NOTE: This source includes {', '.join(missing_headers)}, which is NOT "
+                "present in this repository and cannot be ported. Any function whose "
+                "implementation lives only in that header — and any test/code path that "
+                "calls it — must be DROPPED from your port. Do not invent a substitute "
+                "implementation. Port only the self-contained portion of this program "
+                "that does not depend on it.\n\n"
+            )
+
         prompt += (
-            f"```cuda\n{kernel_source[:6000]}\n```\n\n"
             "Respond with JSON: {\"ported_code\": str, \"confidence\": 0-100, "
             "\"changes\": [str], \"explanation\": str}.\n"
             "IMPORTANT: The ported_code field must contain the COMPLETE HIP kernel source. "
             "If the kernel is large, minimize explanation to save tokens. "
             "Prefer full code over partial code with verbose explanation."
         )
+        if self_contained:
+            prompt += (
+                "\nCRITICAL: The CUDA source above has its own main() function. Your "
+                "ported_code MUST also include a complete main() with identical logic, "
+                "ported to HIP APIs. Do NOT strip main() — it drives the full test."
+            )
         return prompt
 
     def _build_kimi_refine_prompt(self, kernel_source: str,
@@ -1063,12 +1183,28 @@ class ModelRouter:
             except Exception:
                 prompt += f"Evaluator feedback (fix ALL):\n{feedback}\n\n"
 
+        # Bug 1: previous_code[:4000] was independently fatal for a
+        # self-contained program — the refine loop handed Kimi a chopped
+        # copy of its OWN prior output and asked for complete code back, so
+        # it could never converge on anything written past char 4000. Judge
+        # self-containment from the original kernel_source (ground truth),
+        # not previous_code, since previous_code may itself be missing
+        # main() precisely because of the bug this fix addresses.
+        self_contained = self._is_self_contained(kernel_source)
+        source_for_prompt = kernel_source if self_contained else kernel_source[:4000]
+        previous_for_prompt = previous_code if self_contained else previous_code[:4000]
         prompt += (
-            f"Original CUDA:\n```cuda\n{kernel_source[:4000]}```\n\n"
-            f"Your previous output:\n```hip\n{previous_code[:4000]}```\n\n"
+            f"Original CUDA:\n```cuda\n{source_for_prompt}```\n\n"
+            f"Your previous output:\n```hip\n{previous_for_prompt}```\n\n"
             "Respond with JSON: {\"ported_code\": str, \"confidence\": 0-100, "
             "\"changes\": [str], \"explanation\": str}."
         )
+        if self_contained:
+            prompt += (
+                "\nCRITICAL: The original CUDA source has its own main() function. Your "
+                "ported_code MUST also include a complete main() with identical logic, "
+                "ported to HIP APIs. Do NOT strip main() — it drives the full test."
+            )
         return prompt
 
     def _build_glm_evaluate_prompt(self, ported_code: str,
@@ -1268,8 +1404,19 @@ class ModelRouter:
         # The spec auto-gen loop converges when the spec matches the kernel's
         # real signature — regex handles 90%+ of cases, LLM fallback covers the rest.
         try:
-            _auto_gen_spec(kernel_name, kernel_source)
-            result["changes"].append(f"[spec] Auto-generated specs/{kernel_name}.json from CUDA source")
+            _generated_spec = _auto_gen_spec(kernel_name, kernel_source)
+            if _generated_spec is None:
+                result["changes"].append(
+                    f"[spec] No __global__ kernel found in source — skipping auto-generation")
+            elif _generated_spec.get("_persisted", True) is False:
+                # Bug 5: a hand-written spec already exists (no auto_generated
+                # marker) — save_spec() refused to overwrite it. Using the
+                # existing spec as-is rather than silently destroying it.
+                result["changes"].append(
+                    f"[spec] Skipped writing specs/{kernel_name}.json — a hand-written "
+                    f"spec already exists there; using it as-is")
+            else:
+                result["changes"].append(f"[spec] Auto-generated specs/{kernel_name}.json from CUDA source")
         except Exception as e:
             result["changes"].append(f"[spec] Auto-generation failed: {e} — using generic harness fallback")
 
@@ -1305,17 +1452,12 @@ class ModelRouter:
 
         # ── Phase 2: Kimi CODES the initial port ──
         if on_phase: on_phase("code", "Kimi K2.7", "generating HIP port from plan")
+        # TRIZ #24 / Bug 1: self-contained-program detection and the "preserve
+        # main()" instruction now both live inside _build_kimi_code_prompt
+        # itself (which also stops truncating the source out from under that
+        # main() — see docs/fix-plan-self-contained-programs.md).
         kimi_prompt = self._build_kimi_code_prompt(kernel_source, patterns,
                                                    deepseek_plan=deepseek_plan_output)
-        # TRIZ #24: If the original CUDA source is self-contained (has int main()),
-        # tell Kimi to preserve it. Kimi may strip main() during porting, making
-        # the harness detection fail and causing harness-origin abort.
-        if re.search(r'^\s*int\s+main\s*\(', kernel_source, re.MULTILINE):
-            kimi_prompt += (
-                "\n\nCRITICAL: The original CUDA source has its own main() function. "
-                "Your ported HIP code MUST also include a main() function with identical "
-                "logic, ported to HIP APIs. Do NOT strip main() — it drives the full test.\n"
-            )
         code = self._call_model("kimi27", kimi_prompt,
                                 system_prompt=SYSTEM_PROMPTS.get("kimi27", ""))
         # I3: Log Kimi code generation
@@ -1449,6 +1591,13 @@ class ModelRouter:
                     # falls outside the ported kernel's spliced range in the harness is one
                     # Kimi cannot fix, because it's not in code Kimi ever wrote or saw.
                     all_harness_origin = cc.get("all_harness_origin", False)
+                    # Bug 6: a missing main() at link time is the single most
+                    # actionable signal available here — the spec says this
+                    # program is self-contained, and the linker is saying the
+                    # ported code doesn't define main(). A raw "undefined
+                    # symbol: main" string doesn't tell Kimi what happened;
+                    # spell it out instead of letting it guess.
+                    main_link_error = "link" in cc.get("error_origins", [])
                     # Bug 4: assign, don't accumulate — see note at the pre-loop check above.
                     result["compile_errors"] = list(compile_errs)
                     result["compile_error_history"].append({"iteration": iteration, "errors": list(compile_errs)})
@@ -1618,6 +1767,11 @@ class ModelRouter:
                         "- Missing or wrong #include directives\n"
                         + (f"- ⚠️ Stagnation: {stagnation_count} iterations without improvement — try a DIFFERENT approach\n"
                            if stagnation_count > 0 else "")
+                        + ("\n⚠️ LINKER ERROR: your ported_code is missing a main() function. "
+                           "The original CUDA source is a complete, self-contained program with "
+                           "its own main() — you MUST include a full main() with identical logic, "
+                           "ported to HIP APIs. Do not drop it.\n"
+                           if main_link_error else "")
                     )
                     # TRIZ #23: Record iteration for prompt evolution
                     opt.record_iteration(
