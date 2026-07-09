@@ -757,7 +757,8 @@ class ModelRouter:
                 f"[glm] Evaluating code (attempt {iteration}/{max_iterations})")
             evaluator = self._call_model(
                 "glm", eval_prompt,
-                system_prompt=SYSTEM_PROMPTS.get("glm", "")
+                system_prompt=SYSTEM_PROMPTS.get("glm", ""),
+                prefill='{"pass":'  # TRIZ #9: force JSON start, prevent prose
             )
             result["iterations_used"] = iteration
 
@@ -998,7 +999,8 @@ class ModelRouter:
         return result
 
     def _call_model(self, model_key: str, prompt: str,
-                    system_prompt: str = "") -> AgentResult:
+                    system_prompt: str = "",
+                    prefill: str = "") -> AgentResult:
         model_info = MODEL_CATALOG[model_key]
         model_id = model_info["id"]
         local_first = model_info.get("local_first", False)
@@ -1013,11 +1015,16 @@ class ModelRouter:
 
         for endpoint in endpoints:
             try:
-                # Build messages with optional system prompt
+                # Build messages with optional system prompt + assistant prefill
                 messages = []
                 if system_prompt:
                     messages.append({"role": "system", "content": system_prompt})
                 messages.append({"role": "user", "content": prompt})
+                # TRIZ #9: Preliminary Anti-Action — assistant prefill forces
+                # GLM to start with JSON, making prose preamble structurally
+                # impossible. The model continues from the prefill.
+                if prefill:
+                    messages.append({"role": "assistant", "content": prefill})
 
                 if endpoint == "local":
                     local_model = model_info.get("local_id", model_id)
@@ -1043,6 +1050,9 @@ class ModelRouter:
                                                   "raw_response": raw_preview[:200]})
                             continue
                         content = data["choices"][0]["message"]["content"]
+                        # TRIZ #9: Prepend prefill for local endpoint too
+                        if prefill:
+                            content = prefill + content
                         self.call_log.append({"model": model_key, "source": "local-vllm", "cost": 0})
                         return AgentResult(model_key, True, content, self._rubric_score_response(content),
                                            0, round((time.perf_counter()-t0)*1000, 1))
@@ -1087,6 +1097,10 @@ class ModelRouter:
                         # Truncation detection: if finish_reason is "length", the output was cut off
                         if finish_reason == "length":
                             content += "\n<!-- TRUNCATED: output hit max_tokens limit -->"
+                        # TRIZ #9: Prepend prefill to content — the API returns
+                        # only the continuation, we need the full string for parsing
+                        if prefill:
+                            content = prefill + content
                         cost = tokens / 1000 * model_info["cost_per_1k"]
                         self.total_cost += cost
                         self.call_log.append({"model": model_key, "tokens": tokens, "cost": cost})

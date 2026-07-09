@@ -552,7 +552,7 @@ int main() {{
             try:
                 if on_progress: on_progress(30, "hipcc starting")
                 if self._hipcc_path == "hipcc":
-                    cmd_line = f"hipcc -o {output_bin} {harness_file} -std=c++17 -O2 --offload-arch={self.offload_arch}"
+                    cmd_line = f"hipcc -o {output_bin} {harness_file} -std=c++17 -O2 --offload-arch={self.offload_arch} -ferror-limit=5"
                     if on_progress: on_progress(40, "hipcc compiling (shell)")
                     result = subprocess.run(
                         cmd_line, shell=True,
@@ -563,7 +563,8 @@ int main() {{
                     if on_progress: on_progress(40, "hipcc compiling (direct)")
                     result = subprocess.run(
                         [self._hipcc_path, "-o", str(output_bin), str(harness_file),
-                         "-std=c++17", "-O2", f"--offload-arch={self.offload_arch}"],
+                         "-std=c++17", "-O2", f"--offload-arch={self.offload_arch}",
+                         "-ferror-limit=5"],
                         capture_output=True, text=True, timeout=60,
                         cwd=str(build_dir)
                     )
