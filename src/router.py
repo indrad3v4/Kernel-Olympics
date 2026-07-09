@@ -96,21 +96,8 @@ MODEL_CATALOG = {
 # already defines the exact shape. json_schema is stricter but not all models support it.
 
 JSON_SCHEMAS = {
-    "glm": {  # GLM is now evaluator — strict schema for pass/fail JSON
-        "type": "json_schema",
-        "json_schema": {
-            "name": "EvaluationResult",
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "pass": {"type": "boolean"},
-                    "issues": {"type": "array", "items": {"type": "string"}},
-                    "feedback": {"type": "string"},
-                    "verdict": {"type": "string"},
-                },
-                "required": ["pass", "issues", "feedback", "verdict"],
-            },
-        },
+    "glm": {  # GLM evaluator — json_object (more widely supported than json_schema)
+        "type": "json_object",
     },
     "kimi27": {
         "type": "json_object",
@@ -140,8 +127,10 @@ SYSTEM_PROMPTS = {
         "You are a HIP kernel code evaluator. "
         "Check ported code for wavefront64 correctness, CUDA remnants, and compilation safety. "
         'Respond with JSON: {"pass":bool,"issues":[str],"feedback":str,"verdict":str}. '
-        "DO NOT include reasoning, explanations, or chain-of-thought. "
-        "Output ONLY the JSON object, nothing before or after."
+        "CRITICAL: Begin your response with the { character. "
+        "DO NOT include reasoning, explanations, greetings, or chain-of-thought. "
+        "Output ONLY the JSON object. The first character MUST be {. "
+        "No text before or after the JSON."
     ),
 }
 
@@ -725,6 +714,8 @@ class ModelRouter:
                     if is_truncated:
                         result["changes"].append("[kimi27] Output was TRUNCATED — requesting shorter response")
                     # Feed compile errors to GLM evaluator as additional feedback
+                    # TRIZ #22: Throwing away — only first 3 errors, filtered by verifier
+                    compile_err_lines = compile_errs[:3] if compile_errs else [cc["compile_output"][:300]]
                     if is_truncated:
                         evaluator_feedback = (
                             "CRITICAL: Your previous response was TRUNCATED (hit token limit). "
@@ -732,12 +723,12 @@ class ModelRouter:
                             "No JSON wrapper, no explanation, no comments. "
                             "Just the raw C++ code with all CUDA→HIP replacements applied.\n\n"
                             f"REAL COMPILER ERRORS (hipcc) — fix these FIRST:\n"
-                            + "\n".join(compile_errs[:5] if compile_errs else [cc["compile_output"][:500]])
+                            + "\n".join(compile_err_lines)
                         )
                     else:
                         evaluator_feedback = (
                             f"REAL COMPILER ERRORS (hipcc) — fix these FIRST:\n"
-                            + "\n".join(compile_errs[:5] if compile_errs else [cc["compile_output"][:500]])
+                            + "\n".join(compile_err_lines)
                             + "\n\nAlso address any static analysis issues below."
                         )
 
@@ -780,9 +771,19 @@ class ModelRouter:
             raw = evaluator.output.strip()
             parsed = None
 
-            # Strategy 1: pure JSON
-            if raw.startswith("{"):
-                try: parsed = json.loads(raw)
+            # ── Prose-stripping: GLM may output "Let me evaluate..." before JSON ──
+            # Find the first { that looks like start of JSON object
+            json_start = raw.find("{")
+            if json_start > 0:
+                raw_json = raw[json_start:]  # strip prose prefix
+            elif json_start == 0:
+                raw_json = raw
+            else:
+                raw_json = raw  # no { at all — will fail all strategies
+
+            # Strategy 1: pure JSON (after prose strip)
+            if raw_json.startswith("{"):
+                try: parsed = json.loads(raw_json)
                 except: pass
 
             # Strategy 2: JSON inside ```json ... ``` markdown
@@ -792,15 +793,15 @@ class ModelRouter:
                     try: parsed = json.loads(m.group(1))
                     except: pass
 
-            # Strategy 3: find {"pass" ... anywhere (safety net)
+            # Strategy 3: find {"pass" ... anywhere with flexible whitespace
             if parsed is None:
-                m = re.search(r'\{"pass"\s*:', raw)
+                m = re.search(r'\{\s*"pass"\s*:', raw)
                 if m:
                     candidate = raw[m.start():]
                     try: parsed = json.loads(candidate)
                     except: pass
                     if parsed is None:
-                        # balanced braces
+                        # balanced braces extraction
                         depth = 0
                         in_string = False
                         escape = False
@@ -837,10 +838,46 @@ class ModelRouter:
                     }
 
             if parsed is None:
+                # ── TRIZ #20: Continuation of useful action ──
+                # Don't break the loop on parse failure. Extract whatever
+                # feedback we can from the raw response and continue refining.
+                prose_feedback = raw[:600] if raw else "No feedback extracted"
                 result["changes"].append(
-                    f'[glm] JSON parse error (iter {iteration}): '
-                    f'raw[:200]={raw[:200]}')
-                break
+                    f'[glm] JSON parse error (iter {iteration}), '
+                    f'continuing with prose feedback')
+                evaluator_feedback = (
+                    f"Evaluator could not be parsed. Raw response (use as feedback):\n"
+                    f"{prose_feedback}\n\n"
+                    "Common issues to fix:\n"
+                    "- __shfl masks must be 64-bit (0xffffffffffffffffULL)\n"
+                    "- __shfl_xor_sync mask 0x1f → 0x3f for wavefront64\n"
+                    "- Replace CUDA headers with hip/hip_runtime.h\n"
+                    "- Remove .cuh local headers\n"
+                    "- WAVEFRONT_SIZE 64\n"
+                )
+                if iteration < max_iterations:
+                    # Continue loop instead of breaking
+                    if on_phase: on_phase("refine", "Kimi K2.7", f"refining (iter {iteration}→{iteration+1}, parse fallback)")
+                    refine_prompt = self._build_kimi_refine_prompt(
+                        kernel_source, result["ported_code"],
+                        evaluator_feedback, patterns,
+                        deepseek_plan=deepseek_plan_output,
+                        iteration=iteration + 1,
+                    )
+                    refine = self._call_model(
+                        "kimi27", refine_prompt,
+                        system_prompt=SYSTEM_PROMPTS.get("kimi27", "")
+                    )
+                    if refine.success:
+                        extracted = self._extract_code(refine.output)
+                        extracted = self._fix_ported_code(extracted)
+                        result["ported_code"] = extracted
+                        result["changes"].append(
+                            f"[kimi27] Refined (parse fallback, iter {iteration}→{iteration+1})")
+                    else:
+                        result["changes"].append(
+                            f"[kimi27] Refinement failed (parse fallback, iter {iteration})")
+                continue  # Don't break — let loop continue
 
             if parsed.get("pass", False):
                 verify_success = True
@@ -893,10 +930,12 @@ class ModelRouter:
                             result["changes"].append(
                                 f"[hipcc] Re-compile after refine {iteration+1}: FAILED: {err_summary[:120]}")
                             # Override feedback with compile errors for next iteration
+                            # TRIZ #22: only first 3 filtered errors
+                            compile_err_lines = compile_errs[:3] if compile_errs else [cc["compile_output"][:300]]
                             evaluator_feedback = (
                                 f"REAL COMPILER ERRORS (hipcc) — fix these FIRST:\n"
-                                + "\n".join(compile_errs[:5] if compile_errs else [cc["compile_output"][:500]])
-                                + f"\n\nPrevious static analysis feedback:\n{evaluator_feedback[:500]}"
+                                + "\n".join(compile_err_lines)
+                                + f"\n\nPrevious static analysis feedback:\n{evaluator_feedback[:400]}"
                             )
 
                     result["changes"].append(

@@ -388,16 +388,38 @@ int main() {{
 
         if on_progress: on_progress(100, "done" if compile_ok else "compile failed")
 
-        # Extract error lines for concise feedback
+        # Extract error lines for concise LLM feedback
+        # TRIZ #22: Throwing away — filter template noise, keep only actionable errors
         errors = []
-        for line in compile_out.splitlines():
-            if line.strip().startswith("error:") or "error:" in line:
-                errors.append(line.strip()[:200])
+        lines = compile_out.splitlines()
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            # Only keep "error:" lines (skip "note:", "warning:", template traces)
+            if "error:" not in stripped:
+                continue
+            # Skip C++ template instantiation noise
+            if "in instantiation of" in stripped:
+                continue
+            if "required from" in stripped:
+                continue
+            # Keep the error line + 1 context line after (often shows the code)
+            errors.append(stripped[:200])
+            # Include the next line if it shows the code caret (^~~~)
+            if i + 1 < len(lines) and lines[i + 1].strip().startswith("|"):
+                errors.append(lines[i + 1].strip()[:200])
+
+        # If no "error:" lines found but compile failed, grab first 3 non-empty lines
+        if not errors and not compile_ok and compile_out:
+            for line in lines:
+                if line.strip() and "note:" not in line.strip():
+                    errors.append(line.strip()[:200])
+                    if len(errors) >= 3:
+                        break
 
         return {
             "compile_success": compile_ok,
             "compile_output": compile_out[:2000] if compile_out else "",
-            "errors": errors[:10],
+            "errors": errors[:8],  # concise — LLM doesn't need 10+ error lines
             "kernel_name": kernel_name,
         }
 
