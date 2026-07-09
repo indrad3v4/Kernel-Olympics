@@ -13,7 +13,7 @@
 | Classify | ✅ | **RED** — shfl_up_sync (high), warp_size_constant × 2 (medium) |
 | Memory | ✅ | 0 cached (first run) |
 | Port | ✅ | GLM(planner) → Kimi K2.7(coder) → DeepSeek(verifier) — 25%, 12s |
-| Verify | ⚠️ | Stored unverified (no hipcc in CI env) |
+| Verify | ⏳ | Pending — run `scripts/verify_on_amd_gpu.py` on AMD Developer Cloud |
 | Cost | $0.0014 | 1 LLM call |
 
 ## Classification Detail
@@ -35,4 +35,4 @@ On an AMD MI300X machine (Jupyter notebook), the pipeline additionally:
 - Runs on real AMD GPU
 - Verifies numeric output matches
 
-See `docs/proof-on-mi300x.md` for GPU proof.
+See `docs/proof-on-mi300x.md` for GPU proof (pending — requires AMD Developer Cloud run).

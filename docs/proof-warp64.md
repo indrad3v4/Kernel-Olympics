@@ -2,7 +2,7 @@
 
 **Kernel:** `warp_reduce_kernel` (shuffle-based reduction)
 **Pattern:** Warp size divergence (NVIDIA warp=32 → AMD wavefront=64)
-**Status:** PORTED ✅ | Compiled ✅ | Executed on AMD MI300X ✅
+**Status:** PORTED ✅ | Compiled ⚠️ pending AMD GPU run | Execution ⚠️ pending AMD GPU run
 
 ## Summary
 
@@ -17,14 +17,14 @@ corrupted data.
 
 | Aspect | Before (CUDA) | After (HIP) |
 |--------|--------------|-------------|
-| Shared memory | `shared[32]` — hardcoded to NVIDIA warp size | `shared[64]` — sized for wavefront64 |
-| Shuffle mask | `0xffffffff` (32-bit) | `0xffffffffffffffffULL` (64-bit) |
-| Shuffle steps | 5 steps: 16, 8, 4, 2, 1 | 6 steps: **32** (if wavefront64), 16, 8, 4, 2, 1 |
-| Warp detection | None (assumes 32) | `warpSize == 64` — runtime check |
-| Portability | NVIDIA only | NVIDIA + AMD (dynamic) |
-| Test harness | No | hipcc compilation + execution + assertion |
+| Shared memory | `shared[32]` — hardcoded to NVIDIA warp size | Kernel body not yet implemented — current `ported_kernels/warp_reduce.hip.cpp` ships an empty `{}` stub |
+| Shuffle mask | `0xffffffff` (32-bit) | Not yet implemented |
+| Shuffle steps | 5 steps: 16, 8, 4, 2, 1 | Not yet implemented |
+| Warp detection | None (assumes 32) | Not yet implemented — no `warpSize` runtime check in current port; launch is `dim3(64,1,1)` only |
+| Portability | NVIDIA only | AMD-targeted launch config; full kernel logic still TODO |
+| Test harness | No | Build/transcript harness not yet run on hardware |
 
-### Expected Output (per block with N=256, 4 blocks, 64 threads/block)
+### Expected Output (per block with N=256, 4 blocks, 64 threads/block — derived, NOT YET VERIFIED ON HARDWARE)
 
 Each block sums 64 elements of 1.0 = **64.0**
 
