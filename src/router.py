@@ -644,18 +644,17 @@ class ModelRouter:
               kernel_name: str = "test_kernel") -> Dict:
         """Route kernel through the loop engineering pipeline.
 
-        Loop: DeepSeek (plan) → Kimi (code) → [hipcc compile check] → GLM (evaluate) → feedback → Kimi refines
+        Loop: DeepSeek (plan) → Kimi (code) → [hipcc compile FIRST] → GLM (evaluate only if compile passes) → feedback → Kimi refines
 
-        The verification loop now has TWO feedback sources:
-          1. GLM evaluator (static code analysis)
-          2. hipcc compiler (real compilation errors) — if verifier is provided
+        TRIZ #13 (Do It In Reverse) / #28 (Mechanical Substitution):
+        The verification loop now compiles FIRST, then evaluates. If hipcc fails,
+        compile errors ARE the feedback — GLM is skipped entirely (saves ~12s/iter).
+        If hipcc passes, GLM runs for semantic checks (shfl correctness, perf).
 
-        TRIZ #20 (Continuation of useful action): iterate until compile passes
-        or max_iterations reached. GLM "pass" alone is NOT enough — hipcc must
-        also succeed. Compile errors override GLM feedback.
-
-        When hipcc fails, compile errors are appended to the GLM feedback,
-        giving Kimi both static AND compile-time feedback to fix.
+        This eliminates the root contradiction where GLM checked static patterns
+        (shfl masks, headers) that _fix_ported_code() regex already handled,
+        said "pass", while hipcc reported real compile errors — giving Kimi
+        conflicting signals every iteration.
 
         Args:
             kernel_source: The CUDA kernel source code.
@@ -758,185 +757,206 @@ class ModelRouter:
             result["cost"] = round(self.total_cost, 4)
             return result
 
-        # ── Phase 3: GLM EVALUATES → loop → Kimi refines → GLM re-evaluates ──
-        # TRIZ #15/#23: per-kernel prompt evolution — checklist adapts to compile errors
+        # ── Phase 3: hipcc COMPILE FIRST → (GLM eval only if compile passes) → Kimi refines ──
+        # TRIZ #13 (Do It In Reverse) / #28 (Mechanical Substitution):
+        # OLD: GLM evaluates (static checklist) → compile → override with compile errors
+        #   Problem: GLM checks shfl masks/headers that _fix_ported_code() regex already
+        #   fixed, so GLM says "pass" while hipcc reports real errors. Kimi gets conflicting
+        #   signals: "GLM says good" + "but compile fails". Wastes ~12s/iter on GLM (84s total).
+        # NEW: Compile FIRST. If compile fails → compile errors ARE the feedback (skip GLM).
+        #   If compile passes → THEN run GLM for semantic check (shfl correctness, perf).
+        # This eliminates conflicting signals and saves the GLM call when compile fails.
         opt = PromptOptimizer()
         prev_error_count = 0  # TRIZ #23: track error delta across iterations
         for iteration in range(1, max_iterations + 1):
             if not result["ported_code"]:
                 break
 
-            eval_prompt = self._build_glm_evaluate_prompt(
-                result["ported_code"], patterns,
-                deepseek_plan=deepseek_plan_output,
-                feedback=evaluator_feedback,
-                iteration=iteration,
-                max_iterations=max_iterations,
-            )
-            if on_phase: on_phase("evaluate", "GLM-5.2", f"evaluating port (attempt {iteration}/{max_iterations})")
-            result["changes"].append(
-                f"[glm] Evaluating code (attempt {iteration}/{max_iterations})")
-            evaluator = self._call_model(
-                "glm", eval_prompt,
-                system_prompt=SYSTEM_PROMPTS.get("glm", ""),
-                prefill='{"pass":'  # TRIZ #9: force JSON start, prevent prose
-            )
-            result["iterations_used"] = iteration
-
-            if not evaluator.success:
-                result["changes"].append(
-                    f"[glm] Call failed (iteration {iteration})")
-                break
-
-            # Parse GLM evaluator JSON response
-            # GLM follows json_schema — should be clean JSON, but keep fallbacks
-            raw = evaluator.output.strip()
-            parsed = None
-
-            # ── Prose-stripping: GLM may output "Let me evaluate..." before JSON ──
-            # Find the first { that looks like start of JSON object
-            json_start = raw.find("{")
-            if json_start > 0:
-                raw_json = raw[json_start:]  # strip prose prefix
-            elif json_start == 0:
-                raw_json = raw
-            else:
-                raw_json = raw  # no { at all — will fail all strategies
-
-            # Strategy 1: pure JSON (after prose strip)
-            if raw_json.startswith("{"):
-                try: parsed = json.loads(raw_json)
-                except: pass
-
-            # Strategy 2: JSON inside ```json ... ``` markdown
-            if parsed is None:
-                m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
-                if m:
-                    try: parsed = json.loads(m.group(1))
-                    except: pass
-
-            # Strategy 3: find {"pass" ... anywhere with flexible whitespace
-            if parsed is None:
-                m = re.search(r'\{\s*"pass"\s*:', raw)
-                if m:
-                    candidate = raw[m.start():]
-                    try: parsed = json.loads(candidate)
-                    except: pass
-                    if parsed is None:
-                        # balanced braces extraction
-                        depth = 0
-                        in_string = False
-                        escape = False
-                        for ci, ch in enumerate(candidate):
-                            if escape:
-                                escape = False
-                                continue
-                            if ch == '\\':
-                                escape = True
-                                continue
-                            if ch == '"' and not escape:
-                                in_string = not in_string
-                            if not in_string:
-                                if ch == '{': depth += 1
-                                elif ch == '}':
-                                    depth -= 1
-                                    if depth == 0:
-                                        try: parsed = json.loads(candidate[:ci+1])
-                                        except: pass
-                                        break
-
-            # Strategy 4: regex field extraction (last resort)
-            if parsed is None:
-                pass_match = re.search(r'"pass"\s*:\s*(true|false)', raw, re.IGNORECASE)
-                if pass_match:
-                    issues_match = re.findall(r'"issues"\s*:\s*\[(.*?)\]', raw, re.DOTALL)
-                    feedback_match = re.search(r'"feedback"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
-                    verdict_match = re.search(r'"verdict"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
-                    parsed = {
-                        "pass": pass_match.group(1).lower() == "true",
-                        "issues": [s.strip().strip('"') for s in issues_match[0].split(',')] if issues_match else [],
-                        "feedback": feedback_match.group(1) if feedback_match else "",
-                        "verdict": verdict_match.group(1) if verdict_match else "",
-                    }
-
-            if parsed is None:
-                # ── TRIZ #20: Continuation of useful action ──
-                # Don't break the loop on parse failure. Extract whatever
-                # feedback we can from the raw response and continue refining.
-                prose_feedback = raw[:600] if raw else "No feedback extracted"
-                result["changes"].append(
-                    f'[glm] JSON parse error (iter {iteration}), '
-                    f'continuing with prose feedback')
-                evaluator_feedback = (
-                    f"Evaluator could not be parsed. Raw response (use as feedback):\n"
-                    f"{prose_feedback}\n\n"
-                    "Common issues to fix:\n"
-                    "- __shfl masks must be 64-bit (0xffffffffffffffffULL)\n"
-                    "- __shfl_xor_sync mask 0x1f → 0x3f for wavefront64\n"
-                    "- Replace CUDA headers with hip/hip_runtime.h\n"
-                    "- Remove .cuh local headers\n"
-                    "- WAVEFRONT_SIZE 64\n"
-                )
-                if iteration < max_iterations:
-                    # Continue loop instead of breaking
-                    if on_phase: on_phase("refine", "Kimi K2.7", f"refining (iter {iteration}→{iteration+1}, parse fallback)")
-                    refine_prompt = self._build_kimi_refine_prompt(
-                        kernel_source, result["ported_code"],
-                        evaluator_feedback, patterns,
-                        deepseek_plan=deepseek_plan_output,
-                        iteration=iteration + 1,
-                    )
-                    refine = self._call_model(
-                        "kimi27", refine_prompt,
-                        system_prompt=SYSTEM_PROMPTS.get("kimi27", "")
-                    )
-                    if refine.success:
-                        extracted = self._extract_code(refine.output)
-                        extracted = self._fix_ported_code(extracted)
-                        result["ported_code"] = extracted
-                        result["changes"].append(
-                            f"[kimi27] Refined (parse fallback, iter {iteration}→{iteration+1})")
-                    else:
-                        result["changes"].append(
-                            f"[kimi27] Refinement failed (parse fallback, iter {iteration})")
-                continue  # Don't break — let loop continue
-
-            if parsed.get("pass", False):
-                verify_success = True
-                verify_passed = True
-                result["changes"].append(
-                    f"[glm] Passed evaluation (iteration {iteration})")
-                # TRIZ #20/#23: Compile-gate — GLM pass alone is NOT enough.
-                # If hipcc hasn't compiled successfully, keep refining.
-                if compile_passed or not verifier:
-                    result["orchestrator_passed"] = True
-                    break  # Truly converged — both GLM + hipcc passed
-                else:
+            # ── Step 1: hipcc compile check FIRST ──────────────────────────
+            # TRIZ #13: Reverse the order — compile before evaluate.
+            # If compile fails, compile errors ARE the feedback. Skip GLM entirely.
+            compile_failed_this_iter = False
+            if verifier and hasattr(verifier, 'quick_compile_check'):
+                if on_phase: on_phase("compile", "hipcc", f"compile-first check (attempt {iteration}/{max_iterations})")
+                cc = verifier.quick_compile_check(result["ported_code"], kernel_name=kernel_name)
+                if cc["compile_success"]:
                     result["changes"].append(
-                        f"[glm] GLM passed but hipcc NOT compiled — continuing (compile-gate)")
-                    # Force compile errors as feedback for next iteration
+                        f"[hipcc] Compile-first check {iteration}: PASSED ✅")
+                    result["compile_errors"] = []
+                    compile_passed = True
+                else:
+                    compile_failed_this_iter = True
+                    compile_errs = cc.get("errors", [])
+                    result["compile_errors"].extend(compile_errs)
+                    err_summary = "; ".join(compile_errs[:3]) if compile_errs else cc["compile_output"][:300]
+                    result["changes"].append(
+                        f"[hipcc] Compile-first check {iteration}: FAILED: {err_summary[:120]}")
+                    # Compile errors ARE the feedback — no need for GLM static analysis
+                    compile_err_lines = compile_errs[:3] if compile_errs else [cc["compile_output"][:300]]
                     evaluator_feedback = (
-                        "GLM static analysis PASSED, but hipcc compilation FAILED. "
-                        "The code has real compiler errors that must be fixed. "
-                        "Focus on:\n"
+                        f"REAL COMPILER ERRORS (hipcc) — fix these FIRST (iteration {iteration}):\n"
+                        + "\n".join(compile_err_lines)
+                        + "\n\nFocus on:\n"
                         "- Missing HIP API calls (cuda* not converted to hip*)\n"
                         "- Undefined functions/macros (checkCudaErrors, etc.)\n"
                         "- Type mismatches (hipError_t vs cudaError_t)\n"
-                        f"Compile errors:\n{'; '.join(result['compile_errors'][:5])}\n"
+                        "- Missing or wrong #include directives\n"
+                    )
+                    # TRIZ #23: Record iteration for prompt evolution
+                    opt.record_iteration(
+                        prev_error_count, len(compile_errs), opt.get_checklist()
+                    )
+                    prev_error_count = len(compile_errs)
+
+            result["iterations_used"] = iteration
+
+            # ── Step 2: If compile passed → run GLM for semantic evaluation ──
+            # TRIZ #28: GLM is now ONLY used when code actually compiles —
+            #   it checks semantic correctness (shfl masks, perf), not compile errors.
+            # If compile failed (or no verifier), skip GLM — go straight to Kimi refine.
+            parsed = None  # will stay None if GLM is skipped
+            if not compile_failed_this_iter:
+                eval_prompt = self._build_glm_evaluate_prompt(
+                    result["ported_code"], patterns,
+                    deepseek_plan=deepseek_plan_output,
+                    feedback=evaluator_feedback,
+                    iteration=iteration,
+                    max_iterations=max_iterations,
+                )
+                if on_phase: on_phase("evaluate", "GLM-5.2", f"semantic eval (attempt {iteration}/{max_iterations}, compile passed)")
+                result["changes"].append(
+                    f"[glm] Evaluating code (attempt {iteration}/{max_iterations}, compile passed)")
+                evaluator = self._call_model(
+                    "glm", eval_prompt,
+                    system_prompt=SYSTEM_PROMPTS.get("glm", ""),
+                    prefill='{"pass":'  # TRIZ #9: force JSON start, prevent prose
+                )
+
+                if not evaluator.success:
+                    result["changes"].append(
+                        f"[glm] Call failed (iteration {iteration})")
+                    break
+
+                # Parse GLM evaluator JSON response
+                # GLM follows json_schema — should be clean JSON, but keep fallbacks
+                raw = evaluator.output.strip()
+                parsed = None
+
+                # ── Prose-stripping: GLM may output "Let me evaluate..." before JSON ──
+                # Find the first { that looks like start of JSON object
+                json_start = raw.find("{")
+                if json_start > 0:
+                    raw_json = raw[json_start:]  # strip prose prefix
+                elif json_start == 0:
+                    raw_json = raw
+                else:
+                    raw_json = raw  # no { at all — will fail all strategies
+
+                # Strategy 1: pure JSON (after prose strip)
+                if raw_json.startswith("{"):
+                    try: parsed = json.loads(raw_json)
+                    except: pass
+
+                # Strategy 2: JSON inside ```json ... ``` markdown
+                if parsed is None:
+                    m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
+                    if m:
+                        try: parsed = json.loads(m.group(1))
+                        except: pass
+
+                # Strategy 3: find {"pass" ... anywhere with flexible whitespace
+                if parsed is None:
+                    m = re.search(r'\{\s*"pass"\s*:', raw)
+                    if m:
+                        candidate = raw[m.start():]
+                        try: parsed = json.loads(candidate)
+                        except: pass
+                        if parsed is None:
+                            # balanced braces extraction
+                            depth = 0
+                            in_string = False
+                            escape = False
+                            for ci, ch in enumerate(candidate):
+                                if escape:
+                                    escape = False
+                                    continue
+                                if ch == '\\':
+                                    escape = True
+                                    continue
+                                if ch == '"' and not escape:
+                                    in_string = not in_string
+                                if not in_string:
+                                    if ch == '{': depth += 1
+                                    elif ch == '}':
+                                        depth -= 1
+                                        if depth == 0:
+                                            try: parsed = json.loads(candidate[:ci+1])
+                                            except: pass
+                                            break
+
+                # Strategy 4: regex field extraction (last resort)
+                if parsed is None:
+                    pass_match = re.search(r'"pass"\s*:\s*(true|false)', raw, re.IGNORECASE)
+                    if pass_match:
+                        issues_match = re.findall(r'"issues"\s*:\s*\[(.*?)\]', raw, re.DOTALL)
+                        feedback_match = re.search(r'"feedback"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+                        verdict_match = re.search(r'"verdict"\s*:\s*"((?:[^"\\]|\\.)*)"', raw)
+                        parsed = {
+                            "pass": pass_match.group(1).lower() == "true",
+                            "issues": [s.strip().strip('"') for s in issues_match[0].split(',')] if issues_match else [],
+                            "feedback": feedback_match.group(1) if feedback_match else "",
+                            "verdict": verdict_match.group(1) if verdict_match else "",
+                        }
+
+                if parsed is None:
+                    # ── TRIZ #20: Continuation of useful action ──
+                    # Don't break the loop on parse failure. Extract whatever
+                    # feedback we can from the raw response and continue refining.
+                    prose_feedback = raw[:600] if raw else "No feedback extracted"
+                    result["changes"].append(
+                        f'[glm] JSON parse error (iter {iteration}), '
+                        f'continuing with prose feedback')
+                    evaluator_feedback = (
+                        f"Evaluator could not be parsed. Raw response (use as feedback):\n"
+                        f"{prose_feedback}\n\n"
+                        "Common issues to fix:\n"
+                        "- __shfl masks must be 64-bit (0xffffffffffffffffULL)\n"
+                        "- __shfl_xor_sync mask 0x1f → 0x3f for wavefront64\n"
+                        "- Replace CUDA headers with hip/hip_runtime.h\n"
+                        "- Remove .cuh local headers\n"
+                        "- WAVEFRONT_SIZE 64\n"
                     )
 
-            # Evaluation failed — extract feedback for refinement
-            verify_success = True
-            evaluator_feedback = parsed.get("feedback", "")
-            issues = parsed.get("issues", [])
-            if issues:
+            # ── Step 3: Convergence check ───────────────────────────────────
+            # Converged when: compile passed AND GLM passed (or no GLM needed).
+            # If compile passed and GLM says pass → done!
+            if parsed is not None and parsed.get("pass", False):
+                verify_success = True
+                verify_passed = True
                 result["changes"].append(
-                    f"[glm] Iteration {iteration}: "
-                    f"{' | '.join(issues[:3])}")
+                    f"[glm] Passed semantic evaluation (iteration {iteration})")
+                # Compile already passed (we only ran GLM because it did),
+                # or there's no verifier (GLM pass is sufficient in that case).
+                result["orchestrator_passed"] = True
+                break  # Truly converged — compile + GLM both passed
+
+            # ── Step 4: Kimi refines with whatever feedback we have ──────────
+            # If compile failed → feedback = compile errors (set in Step 1)
+            # If GLM failed/parsed None → feedback = GLM feedback or parse fallback
+            # If GLM parsed but not pass → feedback = GLM issues
+            if parsed is not None and not parsed.get("pass", False):
+                verify_success = True
+                evaluator_feedback = parsed.get("feedback", "")
+                issues = parsed.get("issues", [])
+                if issues:
+                    result["changes"].append(
+                        f"[glm] Iteration {iteration}: "
+                        f"{' | '.join(issues[:3])}")
 
             if iteration < max_iterations:
-                # Loop back: Kimi refines with GLM evaluator feedback
-                if on_phase: on_phase("refine", "Kimi K2.7", f"refining port with GLM feedback (iter {iteration}→{iteration+1})")
+                # Loop back: Kimi refines with feedback
+                feedback_label = "compile errors" if compile_failed_this_iter else "GLM feedback"
+                if on_phase: on_phase("refine", "Kimi K2.7", f"refining with {feedback_label} (iter {iteration}→{iteration+1})")
                 # TRIZ #15: Evolve prompt based on compile error patterns
                 evolved = opt.evolve_prompt(result.get("compile_errors", []))
                 result["changes"].append(f"[prompt-v{evolved.version_id}] Checklist evolved: {len(evolved.checklist)} items")
@@ -955,39 +975,8 @@ class ModelRouter:
                     extracted = self._extract_code(refine.output)
                     extracted = self._fix_ported_code(extracted)
                     result["ported_code"] = extracted
-
-                    # ── In-loop hipcc re-compile after refinement ──
-                    if verifier and hasattr(verifier, 'quick_compile_check'):
-                        if on_phase: on_phase("compile", "hipcc", f"re-compile after refine (iter {iteration+1})")
-                        cc = verifier.quick_compile_check(extracted, kernel_name=kernel_name)
-                        if cc["compile_success"]:
-                            result["changes"].append(
-                                f"[hipcc] Re-compile after refine {iteration+1}: PASSED ✅")
-                            # Clear compile errors since they're fixed
-                            result["compile_errors"] = []
-                            compile_passed = True
-                        else:
-                            compile_errs = cc.get("errors", [])
-                            result["compile_errors"].extend(compile_errs)
-                            err_summary = "; ".join(compile_errs[:3]) if compile_errs else cc["compile_output"][:300]
-                            result["changes"].append(
-                                f"[hipcc] Re-compile after refine {iteration+1}: FAILED: {err_summary[:120]}")
-                            # Override feedback with compile errors for next iteration
-                            # TRIZ #22: only first 3 filtered errors
-                            compile_err_lines = compile_errs[:3] if compile_errs else [cc["compile_output"][:300]]
-                            evaluator_feedback = (
-                                f"REAL COMPILER ERRORS (hipcc) — fix these FIRST:\n"
-                                + "\n".join(compile_err_lines)
-                                + f"\n\nPrevious static analysis feedback:\n{evaluator_feedback[:400]}"
-                            )
-                            # TRIZ #23: Record iteration for prompt evolution
-                            opt.record_iteration(
-                                prev_error_count, len(compile_errs), opt.get_checklist()
-                            )
-                            prev_error_count = len(compile_errs)
-
                     result["changes"].append(
-                        f"[kimi27] Refined with evaluator feedback "
+                        f"[kimi27] Refined with {feedback_label} "
                         f"(iteration {iteration} → {iteration + 1})")
                 else:
                     result["changes"].append(
