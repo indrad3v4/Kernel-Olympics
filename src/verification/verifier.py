@@ -185,11 +185,18 @@ class VerificationAgent:
         harness-authored driver code — see :meth:`_classify_error_origin`.
         """
         import re
-        if re.search(r'^\s*int\s+main\s*\(', ported_kernel_source, re.MULTILINE):
+
+        # ── TRIZ #24 (Intermediary): Check spec FIRST for self-contained flag ──
+        # The spec was auto-generated from the ORIGINAL CUDA source which
+        # definitively tells us whether this is a full program or a bare
+        # kernel. Kimi may strip int main() during porting, making the regex
+        # check below unreliable. The spec is the authoritative source.
+        spec = self.load_spec(kernel_name)
+        if spec is not None and spec.get("self_contained", False):
             return ported_kernel_source, 1, len(ported_kernel_source.splitlines())
 
-        # Try loading the spec
-        spec = self.load_spec(kernel_name)
+        if re.search(r'^\s*int\s+main\s*\(', ported_kernel_source, re.MULTILINE):
+            return ported_kernel_source, 1, len(ported_kernel_source.splitlines())
 
         if spec is not None:
             return self._harness_from_spec(spec, ported_kernel_source)

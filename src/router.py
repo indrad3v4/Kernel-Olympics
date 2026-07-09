@@ -1307,6 +1307,15 @@ class ModelRouter:
         if on_phase: on_phase("code", "Kimi K2.7", "generating HIP port from plan")
         kimi_prompt = self._build_kimi_code_prompt(kernel_source, patterns,
                                                    deepseek_plan=deepseek_plan_output)
+        # TRIZ #24: If the original CUDA source is self-contained (has int main()),
+        # tell Kimi to preserve it. Kimi may strip main() during porting, making
+        # the harness detection fail and causing harness-origin abort.
+        if re.search(r'^\s*int\s+main\s*\(', kernel_source, re.MULTILINE):
+            kimi_prompt += (
+                "\n\nCRITICAL: The original CUDA source has its own main() function. "
+                "Your ported HIP code MUST also include a main() function with identical "
+                "logic, ported to HIP APIs. Do NOT strip main() — it drives the full test.\n"
+            )
         code = self._call_model("kimi27", kimi_prompt,
                                 system_prompt=SYSTEM_PROMPTS.get("kimi27", ""))
         # I3: Log Kimi code generation
