@@ -129,6 +129,21 @@ def verification_failure_label(ver_result: dict) -> str:
 
 SPINNER = "|/-\\"
 
+# T2.1: the single source of truth for the run banner.
+# The double-banner regression kept coming back because the banner was a bare
+# print() inside Display.__init__ and nothing stopped a second Display from being
+# constructed. Every banner now goes through here, and test_pipeline_integrity
+# asserts a run emits exactly one.
+BANNER_TEXT = "╔═ Kernel Olympics ═══════════════════════════════╗"
+
+
+def _render_banner(silent: bool = False) -> None:
+    """Print the run banner. The ONLY place the banner is emitted."""
+    if silent:
+        return
+    print(bold(BANNER_TEXT))
+
+
 class Display:
     """Live-updating terminal display. Zero dependencies, pure ANSI."""
 
@@ -142,8 +157,7 @@ class Display:
         self._counter = 0
         self._headers_printed = 0
         self._start_time = time.time()
-        if not silent:
-            print(bold("╔═ Kernel Olympics ═══════════════════════════════╗"))
+        _render_banner(silent=silent)
 
     def phase(self, name: str, icon: str):
         self._counter += 1
@@ -234,7 +248,9 @@ class KernelOlympics:
         self.router = ModelRouter()
         self.verifier = VerificationAgent()
         self.reporter = ReportGenerator()
-        self.disp = Display()
+        # T2.1: a second `self.disp = Display()` used to sit here. It printed the
+        # banner a second time AND silently dropped `silent=silent`, so --silent
+        # was ignored for the entire run. Display is constructed once, above.
 
     def run(self, input_paths: list[str], reference_dir: str = "sample_kernels/reference") -> dict:
         pipeline_state = {"phase": "initializing", "patterns_before": 0, "patterns_after": 0,
@@ -358,6 +374,12 @@ class KernelOlympics:
                         verifier=self.verifier,
                         kernel_name=Path(cr['file']).stem
                     )
+                    if port_result.get("timed_out"):
+                        self.disp.file_done(
+                            Path(cr['file']).name,
+                            f"{yellow('TIMEOUT')} {dim('wall-clock budget spent — best attempt kept')}",
+                            ok=False,
+                        )
 
                     # Close out the LAST phase with its duration
                     if _phase_state["phase"] is not None:
@@ -782,20 +804,11 @@ def doctor():
         except (FileNotFoundError, _sp.TimeoutExpired):
             continue
     if not hipcc_found:
-        try:
-            _r = _sp.run("which hipcc 2>/dev/null || command -v hipcc 2>/dev/null",
-                         shell=True, capture_output=True, text=True, timeout=5)
-            if _r.stdout.strip():
-                hipcc_found = _r.stdout.strip()
-        except _sp.TimeoutExpired:
-            pass
-    if not hipcc_found:
-        try:
-            _r = _sp.run("hipcc --version", shell=True, capture_output=True, text=True, timeout=5)
-            if _r.returncode == 0:
-                hipcc_found = "hipcc"
-        except _sp.TimeoutExpired:
-            pass
+        # PATH lookup without a shell — shutil.which() is what the old
+        # `which hipcc || command -v hipcc` pipeline was emulating, and the
+        # separate `hipcc --version` shell probe was already covered by the
+        # bare "hipcc" candidate above.
+        hipcc_found = shutil.which("hipcc")
     _check("hipcc (ROCm)", bool(hipcc_found),
            f"at {hipcc_found}" if hipcc_found else "not found — GPU verification unavailable", warn=True)
 
