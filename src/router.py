@@ -62,6 +62,7 @@ MODEL_CATALOG = {
         "local_first": False,
         "max_tokens": 2048,      # planner needs room for reasoning
         "temperature": 0.3,      # creativity for diverse plans
+        "timeout": 120,          # TRIZ #1: planner is prose-heavy, needs moderate time
     },
     "kimi27": {
         "id": "accounts/fireworks/models/kimi-k2p7-code",  # ✅ VERIFIED WORKING
@@ -71,6 +72,7 @@ MODEL_CATALOG = {
         "local_first": False,
         "max_tokens": 8192,      # coder needs room for full kernel + JSON wrapper
         "temperature": 0.1,      # code generation needs precision
+        "timeout": 180,          # TRIZ #1: coder with 8192 tokens needs the most time
     },
     "glm": {
         "id": "accounts/fireworks/models/glm-5p2",  # ✅ VERIFIED WORKING
@@ -80,6 +82,7 @@ MODEL_CATALOG = {
         "local_first": False,
         "max_tokens": 1024,      # evaluator output is compact (pass/fail + issues)
         "temperature": 0.0,      # deterministic evaluation
+        "timeout": 120,          # TRIZ #1: evaluator, compact output
     },
     "gemma4": {
         "id": "accounts/fireworks/models/gemma-4-31b-it",  # Fireworks hosted
@@ -90,6 +93,7 @@ MODEL_CATALOG = {
         "local_first": True,     # Try localhost:8000 first, then Fireworks
         "max_tokens": 1024,
         "temperature": 0.0,
+        "timeout": 60,           # TRIZ #1: fast verification model
     },
 }
 
@@ -289,6 +293,31 @@ class ModelRouter:
         match = _re.search(r'__global__\s+void.*', text, _re.DOTALL)
         if match:
             return match.group(0).strip()
+
+        # ── Strategy 3b: TRIZ #22 — Salvage code from truncated responses ──
+        # When JSON is truncated mid-generation, the above strategies may fail.
+        # Look for raw C/C++ patterns that indicate kernel code is present
+        # even if the JSON wrapper is incomplete.
+        has_include = _re.search(r'#include\s*[<"]', text)
+        has_global = _re.search(r'__global__', text)
+        has_hip_ref = _re.search(r'\bhip\b', text, _re.IGNORECASE)
+        if has_include or has_global:
+            # Find the earliest code-like construct and capture from there
+            # to the end of the text (truncated responses don't have clean ends)
+            candidates = []
+            inc_match = _re.search(r'#include\s*[<"].*', text, _re.DOTALL)
+            if inc_match:
+                candidates.append(inc_match.start())
+            glob_match = _re.search(r'__global__.*', text, _re.DOTALL)
+            if glob_match:
+                candidates.append(glob_match.start())
+            if candidates:
+                start = min(candidates)
+                salvaged = text[start:].strip()
+                # Remove trailing incomplete JSON artifacts
+                salvaged = _re.sub(r'["\}]\s*$', '', salvaged).strip()
+                if len(salvaged) > 20:  # sanity check
+                    return salvaged
 
         # ── Strategy 4: Fallback ──
         return text.strip()
@@ -1043,6 +1072,7 @@ class ModelRouter:
         model_info = MODEL_CATALOG[model_key]
         model_id = model_info["id"]
         local_first = model_info.get("local_first", False)
+        model_timeout = model_info.get("timeout", 90)
         t0 = time.perf_counter()
 
         # Try in order: local-first for Gemma, Fireworks-first for others
@@ -1107,44 +1137,53 @@ class ModelRouter:
                     if schema:
                         payload["response_format"] = schema
                     data_bytes = json.dumps(payload).encode()
-                    req = urllib.request.Request(
-                        f"{self.base_url}/chat/completions",
-                        data=data_bytes,
-                        headers={
-                            "Authorization": f"Bearer {self.api_key}",
-                            "Content-Type": "application/json"
-                        }
-                    )
-                    with urllib.request.urlopen(req, timeout=90) as resp:
-                        raw = resp.read()
+                    # TRIZ #11: Retry once with 2x timeout on timeout failure
+                    for attempt in range(2):
                         try:
-                            data = json.loads(raw)
-                        except json.JSONDecodeError as e:
-                            source = "fireworks"
-                            raw_preview = raw[:500].decode(errors="replace")
-                            self.call_log.append({"model": model_key, "source": source,
-                                                  "error": f"JSON parse failed: {e}",
-                                                  "raw_response": raw_preview[:200]})
-                            continue
-                        content = data["choices"][0]["message"]["content"]
-                        finish_reason = data["choices"][0].get("finish_reason", "")
-                        usage = data.get("usage", {})
-                        tokens = (
-                            usage.get("total_tokens", 0)
-                            or usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
-                        )
-                        # Truncation detection: if finish_reason is "length", the output was cut off
-                        if finish_reason == "length":
-                            content += "\n<!-- TRUNCATED: output hit max_tokens limit -->"
-                        # TRIZ #9: Prepend prefill to content — the API returns
-                        # only the continuation, we need the full string for parsing
-                        if prefill:
-                            content = prefill + content
-                        cost = tokens / 1000 * model_info["cost_per_1k"]
-                        self.total_cost += cost
-                        self.call_log.append({"model": model_key, "tokens": tokens, "cost": cost})
-                        return AgentResult(model_key, True, content, self._rubric_score_response(content),
-                                           tokens, round((time.perf_counter()-t0)*1000, 1))
+                            req = urllib.request.Request(
+                                f"{self.base_url}/chat/completions",
+                                data=data_bytes,
+                                headers={
+                                    "Authorization": f"Bearer {self.api_key}",
+                                    "Content-Type": "application/json"
+                                }
+                            )
+                            with urllib.request.urlopen(req, timeout=model_timeout * (attempt + 1)) as resp:
+                                raw = resp.read()
+                            break  # success — exit retry loop
+                        except urllib.error.URLError as e:
+                            if "timed out" in str(e).lower() and attempt == 0:
+                                # Retry with 2x timeout
+                                continue
+                            raise  # Re-raise for outer handler
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError as e:
+                        source = "fireworks"
+                        raw_preview = raw[:500].decode(errors="replace")
+                        self.call_log.append({"model": model_key, "source": source,
+                                              "error": f"JSON parse failed: {e}",
+                                              "raw_response": raw_preview[:200]})
+                        continue
+                    content = data["choices"][0]["message"]["content"]
+                    finish_reason = data["choices"][0].get("finish_reason", "")
+                    usage = data.get("usage", {})
+                    tokens = (
+                        usage.get("total_tokens", 0)
+                        or usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+                    )
+                    # Truncation detection: if finish_reason is "length", the output was cut off
+                    if finish_reason == "length":
+                        content += "\n<!-- TRUNCATED: output hit max_tokens limit -->"
+                    # TRIZ #9: Prepend prefill to content — the API returns
+                    # only the continuation, we need the full string for parsing
+                    if prefill:
+                        content = prefill + content
+                    cost = tokens / 1000 * model_info["cost_per_1k"]
+                    self.total_cost += cost
+                    self.call_log.append({"model": model_key, "tokens": tokens, "cost": cost})
+                    return AgentResult(model_key, True, content, self._rubric_score_response(content),
+                                       tokens, round((time.perf_counter()-t0)*1000, 1))
             except Exception as e:
                 source = "local-vllm" if endpoint == "local" else "fireworks"
                 err_msg = str(e)[:200]
@@ -1164,7 +1203,7 @@ class ModelRouter:
                                 "Content-Type": "application/json"
                             }
                         )
-                        with urllib.request.urlopen(req, timeout=90) as resp:
+                        with urllib.request.urlopen(req, timeout=model_timeout) as resp:
                             raw = resp.read()
                             data = json.loads(raw)
                             content = data["choices"][0]["message"]["content"]
