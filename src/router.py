@@ -41,6 +41,154 @@ def _force_ipv4():
 _force_ipv4()
 
 
+def _extract_balanced_json(text: str):
+    """Extract the first complete JSON object from text using balanced-brace counting.
+
+    Counts opening/closing braces while respecting string literals (ignores braces
+    inside quoted strings). Returns parsed dict or None.
+    """
+    start = text.find("{")
+    if start < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = text[start:i + 1]
+                try:
+                    return json.loads(candidate)
+                except Exception:
+                    return None
+    return None
+
+
+def _extract_arrays_regex(text: str):
+    """Extract individual arrays from malformed JSON using targeted regexes.
+
+    Tries to parse 'fixes', 'missing_includes', and 'wrong_apis' arrays separately,
+    then assembles a minimal dict. Returns dict or None.
+    """
+    result = {}
+
+    # Extract fixes array — each element is a JSON object
+    fixes_match = re.search(r'"fixes"\s*:\s*\[', text)
+    if fixes_match:
+        arr_start = fixes_match.end() - 1  # position of '['
+        # Find balanced bracket
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(arr_start, len(text)):
+            ch = text[i]
+            if esc:
+                esc = False
+                continue
+            if ch == "\\":
+                esc = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    arr_text = text[arr_start:i + 1]
+                    try:
+                        result["fixes"] = json.loads(arr_text)
+                    except Exception:
+                        # Try parsing individual objects within the array
+                        objs = re.findall(r'\{[^{}]*\}', arr_text, re.DOTALL)
+                        parsed = []
+                        for o in objs:
+                            try:
+                                parsed.append(json.loads(o))
+                            except Exception:
+                                pass
+                        if parsed:
+                            result["fixes"] = parsed
+                    break
+
+    # Extract missing_includes array
+    mi_match = re.search(r'"missing_includes"\s*:\s*\[(.*?)\]', text, re.DOTALL)
+    if mi_match:
+        try:
+            result["missing_includes"] = json.loads("[" + mi_match.group(1) + "]")
+        except Exception:
+            # Extract quoted strings as fallback
+            incs = re.findall(r'"([^"]*)"', mi_match.group(1))
+            if incs:
+                result["missing_includes"] = incs
+
+    # Extract wrong_apis array
+    wa_match = re.search(r'"wrong_apis"\s*:\s*\[', text)
+    if wa_match:
+        arr_start = wa_match.end() - 1
+        depth = 0
+        in_str = False
+        esc = False
+        for i in range(arr_start, len(text)):
+            ch = text[i]
+            if esc:
+                esc = False
+                continue
+            if ch == "\\":
+                esc = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    arr_text = text[arr_start:i + 1]
+                    try:
+                        result["wrong_apis"] = json.loads(arr_text)
+                    except Exception:
+                        objs = re.findall(r'\{[^{}]*\}', arr_text, re.DOTALL)
+                        parsed = []
+                        for o in objs:
+                            try:
+                                parsed.append(json.loads(o))
+                            except Exception:
+                                pass
+                        if parsed:
+                            result["wrong_apis"] = parsed
+                    break
+
+    # Extract summary if present
+    sum_match = re.search(r'"summary"\s*:\s*"((?:[^"\\]|\\.)*)"', text)
+    if sum_match:
+        result["summary"] = sum_match.group(1)
+
+    return result if result else None
+
+
 # ── Model catalog ────────────────────────────────────────────────
 # ✅ VERIFIED WORKING on Fireworks API (tested, confirmed):
 #   - kimi-k2p6    (planner — complex kernel logic, multi-step reasoning)
@@ -664,6 +812,27 @@ class ModelRouter:
         )
         return prompt
 
+    @staticmethod
+    def _normalize_error(err: str) -> str:
+        """Normalize a compile error line for semantic diffing (TRIZ #3/#22/#28).
+
+        Strips volatile parts (line/column numbers, temp build paths, excess
+        whitespace) so the same error at a different line/file path compares
+        equal.  The error type + message is the semantic key.
+        """
+        import re as _re
+        s = err.strip()
+        # Strip temp build paths: /tmp/verifier_build_xxx/file.cpp → file.cpp
+        s = _re.sub(r'/tmp/\S+/(\S+)', r'\1', s)
+        # Strip leading file:line:col: prefix → keep "error:" / "warning:" etc.
+        # Matches patterns like: file.cpp:67:5: error: ...
+        s = _re.sub(r'^[\w./-]+:\d+:\d+:\s*', '', s)
+        # Also handle file:line: (no column) prefix
+        s = _re.sub(r'^[\w./-]+:\d+:\s*', '', s)
+        # Collapse whitespace
+        s = _re.sub(r'\s+', ' ', s).strip()
+        return s
+
     def _build_glm_error_analysis_prompt(self, ported_code: str,
                                          compile_errors: List[str],
                                          iteration: int,
@@ -835,7 +1004,8 @@ class ModelRouter:
         # This eliminates conflicting signals and saves the GLM call when compile fails.
         opt = PromptOptimizer()
         prev_error_count = 0  # TRIZ #23: track error delta across iterations
-        prev_errors_set = set()  # TRIZ #22: track which errors we've already shown
+        prev_errors_set  = set()  # TRIZ #22: track which errors we've already shown (raw)
+        prev_errors_norm = set()  # TRIZ #3/#22: normalized set for semantic diffing
         stagnation_count = 0  # TRIZ #15: count iterations with no improvement
         error_history = []  # TRIZ #17: cap error context to last 2 iterations
         for iteration in range(1, max_iterations + 1):
@@ -859,11 +1029,16 @@ class ModelRouter:
                     compile_errs = cc.get("errors", [])
                     result["compile_errors"].extend(compile_errs)
 
-                    # TRIZ #22: Only feed NEW errors to Kimi (diff vs previous iteration)
+                    # TRIZ #3/#22/#28: Semantic error diffing — normalize before
+                    # comparing so the same error at a different line number is
+                    # NOT flagged as "new" every iteration.
                     current_errors_set = set(e.strip() for e in compile_errs if e.strip())
-                    new_errors = current_errors_set - prev_errors_set
-                    resolved_errors = prev_errors_set - current_errors_set
-                    prev_errors_set = current_errors_set
+                    current_norm_set   = set(self._normalize_error(e) for e in compile_errs if e.strip())
+                    new_errors_norm    = current_norm_set - prev_errors_norm
+                    resolved_errors    = prev_errors_norm - current_norm_set
+                    new_errors         = current_errors_set - prev_errors_set   # raw diff (for display)
+                    prev_errors_set    = current_errors_set
+                    prev_errors_norm   = current_norm_set
 
                     # TRIZ #23: Track convergence — error count delta
                     current_err_count = len(compile_errs)
@@ -969,18 +1144,38 @@ class ModelRouter:
                             else:
                                 raw_glm_json = raw_glm
                             glm_analysis = None
+
+                            # ── Strategy 1: Direct json.loads (strip prose prefix) ──
                             try:
                                 glm_analysis = json.loads(raw_glm_json)
-                            except:
-                                # Try extracting just the fixes array
-                                m = re.search(r'\{.*"fixes".*\}', raw_glm, re.DOTALL)
-                                if m:
-                                    try: glm_analysis = json.loads(m.group(0))
-                                    except: pass
+                            except Exception:
+                                pass
 
-                            if glm_analysis and glm_analysis.get("fixes"):
+                            # ── Strategy 2: Balanced-brace extraction ──
+                            # Count opening/closing braces respecting string literals,
+                            # extract the complete JSON object starting from first '{'.
+                            if glm_analysis is None:
+                                glm_analysis = _extract_balanced_json(raw_glm)
+
+                            # ── Strategy 3: Targeted regex extraction of individual arrays ──
+                            if glm_analysis is None:
+                                glm_analysis = _extract_arrays_regex(raw_glm)
+
+                            # ── Strategy 4: Last-resort minimal structure ──
+                            if glm_analysis is None:
+                                first_brace = raw_glm.find("{")
+                                last_brace = raw_glm.rfind("}")
+                                if first_brace >= 0 and last_brace > first_brace:
+                                    glm_analysis = {"fixes": [], "_raw": raw_glm[first_brace:last_brace+1]}
+
+                            # ── Build feedback from parsed analysis ──
+                            fixes = glm_analysis.get("fixes", []) if glm_analysis else []
+                            missing_inc = glm_analysis.get("missing_includes", []) if glm_analysis else []
+                            wrong_apis = glm_analysis.get("wrong_apis", []) if glm_analysis else []
+
+                            if glm_analysis and (fixes or missing_inc or wrong_apis):
                                 # Build structured feedback for Kimi
-                                fixes = sorted(glm_analysis["fixes"],
+                                fixes = sorted(fixes,
                                     key=lambda x: x.get("priority", 99))
                                 fix_lines = []
                                 for f in fixes[:7]:
@@ -989,14 +1184,18 @@ class ModelRouter:
                                         f"    Root cause: {f.get('root_cause', '?')[:120]}\n"
                                         f"    Fix: {f.get('exact_fix', '?')[:150]}"
                                     )
-                                missing_inc = glm_analysis.get("missing_includes", [])
-                                wrong_apis = glm_analysis.get("wrong_apis", [])
 
                                 evaluator_feedback = (
                                     f"GLM ERROR ANALYSIS (iteration {iteration}):\n"
-                                    f"GLM analyzed {len(compile_errs)} compiler errors and identified {len(fixes)} root causes.\n\n"
-                                    f"PRIORITY FIXES:\n" + "\n".join(fix_lines) + "\n"
+                                    f"GLM analyzed {len(compile_errs)} compiler errors"
                                 )
+                                if fixes:
+                                    evaluator_feedback += (
+                                        f" and identified {len(fixes)} root causes.\n\n"
+                                        f"PRIORITY FIXES:\n" + "\n".join(fix_lines) + "\n"
+                                    )
+                                else:
+                                    evaluator_feedback += ".\n\n"
                                 if missing_inc:
                                     evaluator_feedback += (
                                         f"\nMISSING INCLUDES (add these):\n"
