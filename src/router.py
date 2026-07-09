@@ -1889,51 +1889,10 @@ class ModelRouter:
                             # let hard-stagnation abort still fire if even the
                             # new strategy fails.
 
-                    # ── TRIZ #13 + #24: GLM → DeepSeek re-plan EVERY time GLM analyzes errors ──
-                    # Per user spec, the loop is:
-                    #   DeepSeek > Kimi > GLM > DeepSeek (refresh strategy) > Kimi
-                    # GLM's analysis is the corrective loop that closes the iterated
-                    # port. Without a fresh DeepSeek plan, Kimi keeps generating
-                    # code under the same broken strategy — the limit cycle we
-                    # saw in production runs.
-                    #
-                    # Trigger: compile failed AND GLM produced an analysis.
-                    #          (When compile passes, GLM does semantic eval which
-                    #          is NOT a "compile error analysis" — no re-plan needed;
-                    #          the working code is the goal.)
-                    # Cap:    replan_count budget = max_iterations//2 prevents
-                    #         infinite re-plan loops on improbable kernels.
-                    glm_analysis = None  # scope binding for this block
-                    if (compile_failed_this_iter
-                            and replan_count < max(max_iterations // 2, 1)
-                            and iteration < max_iterations
-                            and compile_errs):
-                        result["changes"].append(
-                            f"[orch] GLM→DeepSeek escalation: refresh strategy "
-                            f"with GLM error context (iter {iteration}, "
-                            f"replan {replan_count + 1}/{max(max_iterations // 2, 1)})."
-                        )
-                        print(f"║  │  🔄 GLM→DeepSeek: refresh strategy "
-                              f"({replan_count + 1}/{max(max_iterations // 2, 1)})"
-                              f"{'':<14}║")
-                        if on_phase: on_phase("plan", "DeepSeek-v4-pro",
-                            f"re-planning from GLM (iter {iteration})")
-                        replan_prompt = self._build_deepseek_replan_prompt(
-                            kernel_source, patterns, result["ported_code"],
-                            compile_errs, deepseek_plan_output,
-                        )
-                        re_plan = self._call_model(
-                            "deepseek", replan_prompt,
-                            system_prompt=SYSTEM_PROMPTS.get("deepseek", ""),
-                        )
-                        replan_count += 1
-                        if re_plan.success:
-                            deepseek_plan_output = re_plan.output
-                            result["changes"].append(
-                                f"[deepseek] Refreshed strategy from GLM "
-                                f"(iter {iteration}, replan_count={replan_count}, "
-                                f"plan chars={len(re_plan.output)})"
-                            )
+                    # Re-plan after GLM analysis is now further down (after the
+                    # GLM error block). Earlier placement (here) made the visual
+                    # order DeepSeek > Kimi > DeepSeek > GLM, but the spec is
+                    # DeepSeek > Kimi > GLM > DeepSeek > Kimi.
 
                     # ── Bug 5, trigger 2 / Bug 7: hard stagnation abort ──
                     # After multiple re-plans failed to converge, more iterations won't help.
@@ -2152,6 +2111,63 @@ class ModelRouter:
                             result["changes"].append(
                                 f"[glm] Error analyst call failed — using raw compile errors")
                             print(f"║  │  ⚠ GLM analyst call failed — falling back to raw errors{'':<18}║")
+
+            # ── TRIZ #13 + #24: GLM → DeepSeek informed re-plan, AFTER GLM analysis ──
+            # User-specified loop: DeepSeek(plan) > Kimi(code) > GLM(analyze) >
+            # DeepSeek(re-plan informed by GLM) > Kimi(refine under fresh plan).
+            #
+            # The block fires AFTER glm_analysis is computed so we can include it in
+            # the re-plan prompt. Earlier blocks elsewhere fired BEFORE GLM and
+            # gave DeepSeek raw compile errors only — visual order was broken and
+            # the re-plan prompt was uninformed.
+            #
+            # Triggers: compile failed AND we have ~half the iteration budget left
+            # for re-plans AND no hard-stagnation abort already happened.
+            if (compile_failed_this_iter
+                    and replan_count < max(max_iterations // 2, 1)
+                    and iteration < max_iterations
+                    and compile_errs
+                    and result.get("abort_reason") != "hard_stagnation"):
+                glm_summary = ""
+                if glm_analysis is not None:
+                    try:
+                        glm_summary = (
+                            f"\nGLM ANALYST SAYS ({len(compile_errs)} errors):\n"
+                            f"{json.dumps(glm_analysis, indent=2)[:1500]}\n"
+                        )
+                    except (TypeError, ValueError) as e:
+                        logger.debug("Failed to dump glm_analysis: %s", e)
+                replan_prompt = (
+                    f"You produced a CUDA→HIP plan earlier that yielded code still failing to compile.\n"
+                    f"This is re-plan attempt {replan_count + 1}/{max(max_iterations // 2, 1)}.\n"
+                    f"{glm_summary}\n"
+                    f"RECURRING COMPILE ERRORS:\n{chr(10).join(compile_errs[:8])}\n\n"
+                    f"LAST HIP CODE:\n```hip\n{result.get('ported_code', '')[:3000]}\n```\n\n"
+                    f"ORIGINAL CUDA:\n```cuda\n{kernel_source[:3000]}\n```\n\n"
+                    "Produce a DIFFERENT porting strategy from the previous plan. "
+                    "Be specific and concrete, not mechanical substitution."
+                )
+                result["changes"].append(
+                    f"[orch] GLM→DeepSeek informed re-plan "
+                    f"({replan_count + 1}/{max(max_iterations // 2, 1)}, iter {iteration})"
+                )
+                print(f"║  │  🔄 GLM→DeepSeek: informed re-plan "
+                      f"({replan_count + 1}/{max(max_iterations // 2, 1)}){'':<14}║")
+                if on_phase: on_phase("replan", "DeepSeek-v4-pro",
+                    f"informed re-plan after GLM (iter {iteration})")
+                re_plan = self._call_model(
+                    "deepseek", replan_prompt,
+                    system_prompt=SYSTEM_PROMPTS.get("deepseek", ""),
+                )
+                replan_count += 1
+                if re_plan.success:
+                    deepseek_plan_output = re_plan.output
+                    result["changes"].append(
+                        f"[deepseek] Informed re-plan landed "
+                        f"(iter {iteration}, {len(re_plan.output)} chars)"
+                    )
+                    print(f"║  │  🧠 DeepSeek-v4-pro re-plan landed "
+                          f"({len(re_plan.output)} chars){'':<14}║")
 
             result["iterations_used"] = iteration
 
