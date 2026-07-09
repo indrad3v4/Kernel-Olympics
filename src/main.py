@@ -15,6 +15,7 @@ Usage:
 
 import argparse
 import json
+import logging
 import os
 import sys
 import time
@@ -171,8 +172,8 @@ class KernelOlympics:
         for fp in input_paths:
             try:
                 file_sources[fp] = Path(fp).read_text(encoding="utf-8")
-            except:
-                pass
+            except (OSError, UnicodeDecodeError) as e:
+                logging.debug("Failed to read %s: %s", fp, e)
 
         if not file_sources:
             print("\033[91m✖ ERROR: no readable input files found — nothing scanned.\033[0m")

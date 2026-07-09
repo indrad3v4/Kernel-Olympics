@@ -15,9 +15,14 @@ import re
 import os
 import socket
 import time
+import uuid
+import logging
 import urllib.request
+from pathlib import Path
 from typing import Dict, List, Optional, Callable
 from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 from prompt_evolution import prompt_opt, PromptOptimizer
 
@@ -1020,14 +1025,30 @@ class ModelRouter:
                                    deepseek_plan: str = "",
                                    feedback: str = "",
                                    iteration: int = 1,
-                                   max_iterations: int = 3) -> str:
+                                   max_iterations: int = 3,
+                                   regex_changelog: Optional[List[str]] = None) -> str:
         """Build the GLM evaluator prompt.
 
         Role: GLM-Evaluator — strict JSON output. Checks ported code for
         wavefront64 correctness, CUDA remnants, and compilation safety.
         System prompt already defines role + JSON contract.
+
+        Args:
+            regex_changelog: List of regex post-processing fixes already
+                applied by _fix_ported_code(). When provided, GLM is told
+                not to re-flag these already-fixed issues, preventing
+                false-positive feedback on regex-handled patterns.
         """
         prompt = f"Evaluate this ported HIP kernel (iteration {iteration}/{max_iterations}).\n\n"
+
+        # A3: Regex transparency — tell GLM what _fix_ported_code already fixed
+        if regex_changelog:
+            fixes_text = "\n".join(f"  - {fix}" for fix in regex_changelog)
+            prompt += (
+                "The following automatic regex fixes were already applied to this code.\n"
+                "Do NOT re-flag these — they are resolved:\n"
+                f"{fixes_text}\n\n"
+            )
 
         prompt += (
             "Checks:\n"
@@ -1207,10 +1228,13 @@ class ModelRouter:
         if code.success:
             coder_success = True
             extracted = self._extract_code(code.output)
-            extracted = self._fix_ported_code(extracted)
+            extracted = self._fix_ported_code(extracted, return_changelog=True)
+            if isinstance(extracted, tuple):
+                extracted, regex_changelog = extracted
+            else:
+                regex_changelog = []
             result["ported_code"] = extracted
-
-            # ── In-loop hipcc compile check (TRIZ: compiler feedback INTO loop) ──
+            result["regex_changelog"] = regex_changelog  # A3: track regex fixes
             if verifier and hasattr(verifier, 'quick_compile_check'):
                 if on_phase: on_phase("compile", "hipcc", "in-loop compilation check")
                 cc = verifier.quick_compile_check(extracted, kernel_name=kernel_name)
@@ -1436,8 +1460,8 @@ class ModelRouter:
                             # ── Strategy 1: Direct json.loads (strip prose prefix) ──
                             try:
                                 glm_analysis = json.loads(raw_glm_json)
-                            except Exception:
-                                pass
+                            except (json.JSONDecodeError, TypeError, ValueError) as e:
+                                logger.debug("GLM error analysis JSON parse failed: %s", e)
 
                             # ── Strategy 2: Balanced-brace extraction ──
                             # Count opening/closing braces respecting string literals,
@@ -1525,6 +1549,7 @@ class ModelRouter:
                     feedback=evaluator_feedback,
                     iteration=iteration,
                     max_iterations=max_iterations,
+                    regex_changelog=result.get("regex_changelog"),
                 )
                 if on_phase: on_phase("evaluate", "GLM-5.2", f"semantic eval (attempt {iteration}/{max_iterations}, compile passed)")
                 result["changes"].append(
@@ -1558,14 +1583,14 @@ class ModelRouter:
                 # Strategy 1: pure JSON (after prose strip)
                 if raw_json.startswith("{"):
                     try: parsed = json.loads(raw_json)
-                    except: pass
+                    except (json.JSONDecodeError, TypeError, ValueError) as e: logger.debug("GLM JSON parse strategy 1 failed: %s", e)
 
                 # Strategy 2: JSON inside ```json ... ``` markdown
                 if parsed is None:
                     m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', raw, re.DOTALL)
                     if m:
                         try: parsed = json.loads(m.group(1))
-                        except: pass
+                        except (json.JSONDecodeError, TypeError, ValueError) as e: logger.debug("GLM JSON parse strategy 2 failed: %s", e)
 
                 # Strategy 3: find {"pass" ... anywhere with flexible whitespace
                 if parsed is None:
@@ -1573,7 +1598,7 @@ class ModelRouter:
                     if m:
                         candidate = raw[m.start():]
                         try: parsed = json.loads(candidate)
-                        except: pass
+                        except (json.JSONDecodeError, TypeError, ValueError) as e: logger.debug("GLM JSON parse strategy 3 failed: %s", e)
                         if parsed is None:
                             # balanced braces extraction
                             depth = 0
@@ -1594,7 +1619,7 @@ class ModelRouter:
                                         depth -= 1
                                         if depth == 0:
                                             try: parsed = json.loads(candidate[:ci+1])
-                                            except: pass
+                                            except (json.JSONDecodeError, TypeError, ValueError) as e: logger.debug("GLM JSON parse strategy 3 (balanced) failed: %s", e)
                                             break
 
                 # Strategy 4: regex field extraction (last resort)
@@ -1676,8 +1701,13 @@ class ModelRouter:
                 )
                 if refine.success:
                     extracted = self._extract_code(refine.output)
-                    extracted = self._fix_ported_code(extracted)
+                    extracted = self._fix_ported_code(extracted, return_changelog=True)
+                    if isinstance(extracted, tuple):
+                        extracted, regex_changelog = extracted
+                    else:
+                        regex_changelog = []
                     result["ported_code"] = extracted
+                    result["regex_changelog"] = regex_changelog  # A3: track regex fixes
                     result["changes"].append(
                         f"[kimi27] Refined with {feedback_label} "
                         f"(iteration {iteration} → {iteration + 1})")
@@ -1694,7 +1724,8 @@ class ModelRouter:
         if result["ported_code"]:
             if on_phase: on_phase("verify", "Gemma 4", "final verification")
             gemma_prompt = self._build_glm_evaluate_prompt(
-                result["ported_code"], patterns
+                result["ported_code"], patterns,
+                regex_changelog=result.get("regex_changelog"),
             )
             verify = self._call_model("gemma4", gemma_prompt,
                                       system_prompt=SYSTEM_PROMPTS.get("glm", ""))
