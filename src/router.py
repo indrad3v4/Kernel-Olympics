@@ -80,6 +80,11 @@ def _extract_balanced_json(text: str):
     return None
 
 
+def _strip_trailing_commas(s: str) -> str:
+    """Remove trailing commas before } or ] that make JSON invalid."""
+    return re.sub(r',\s*([}\]])', r'\1', s)
+
+
 def _extract_arrays_regex(text: str):
     """Extract individual arrays from malformed JSON using targeted regexes.
 
@@ -123,7 +128,7 @@ def _extract_arrays_regex(text: str):
                         parsed = []
                         for o in objs:
                             try:
-                                parsed.append(json.loads(o))
+                                parsed.append(json.loads(_strip_trailing_commas(o)))
                             except Exception:
                                 pass
                         if parsed:
@@ -174,7 +179,7 @@ def _extract_arrays_regex(text: str):
                         parsed = []
                         for o in objs:
                             try:
-                                parsed.append(json.loads(o))
+                                parsed.append(json.loads(_strip_trailing_commas(o)))
                             except Exception:
                                 pass
                         if parsed:
