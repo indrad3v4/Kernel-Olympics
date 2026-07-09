@@ -254,7 +254,7 @@ class KernelOlympics:
                         _phase_state["detail"] = detail
                         elapsed = time.perf_counter() - t0
                         icons = {"plan": "🧠", "code": "⚡", "evaluate": "🔬",
-                                 "refine": "🔁", "verify": "✅"}
+                                 "refine": "🔁", "verify": "✅", "compile": "🔨"}
                         icon = icons.get(phase, "●")
                         print(f"║  {icon} {bold(model):<16} {dim(detail):<38} {cyan(f'{elapsed:.1f}s')}")
 
@@ -281,7 +281,9 @@ class KernelOlympics:
 
                     port_result = self.router.route(
                         source, cr.get("findings", []),
-                        on_phase=_on_phase
+                        on_phase=_on_phase,
+                        verifier=self.verifier,
+                        kernel_name=Path(cr['file']).stem
                     )
 
                     _stop_spinner.set()
@@ -298,9 +300,9 @@ class KernelOlympics:
                     # Show orchestrator loop details
                     iters = port_result.get("iterations_used", 1)
                     orch_passed = port_result.get("orchestrator_passed", False)
-                    orch_changes = [c for c in port_result.get("changes", []) if "[deepseek]" in c or "[glm]" in c or "[kimi27]" in c or "orchestrator" in str(c).lower()]
+                    orch_changes = [c for c in port_result.get("changes", []) if "[deepseek]" in c or "[glm]" in c or "[kimi27]" in c or "[hipcc]" in c or "orchestrator" in str(c).lower()]
                     if orch_changes:
-                        for ch in orch_changes[:3]:  # Show up to 3 orchestrator changes
+                        for ch in orch_changes[:5]:  # Show up to 5 orchestrator changes
                             print(f"║  🧠 {dim(ch[:70]):<64}║")
                     tag = "✅ PASSED" if orch_passed else f"🔁 {iters}/{3} iterations"
                     self.disp.file_done(Path(cr['file']).name, f"GLM-eval {tag} ({port_result.get('confidence', 0)}%, {llm_elapsed:.0f}s)", ok=orch_passed)
@@ -311,17 +313,57 @@ class KernelOlympics:
                     port_result["from_cache"] = False
                     port_result["llm_time_s"] = round(llm_elapsed, 1)
 
-                # Phase 5: Verification
+                # Phase 5: Verification (with 0-100% compile progress bar)
                 self.disp.phase("Verifying", "✅")
                 ref_path = Path(reference_dir) / f"{Path(cr['file']).stem}_output.txt"
                 reference_output = ref_path.read_text(encoding="utf-8") if ref_path.exists() else ""
 
+                # Live compile progress bar callback
+                _compile_pct = [0]
+                _compile_stage = [""]
+                _compile_stop = threading.Event()
+                _compile_spin = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]
+
+                def _compile_progress(pct: int, stage: str):
+                    _compile_pct[0] = pct
+                    _compile_stage[0] = stage
+
+                def _compile_bar():
+                    si = 0
+                    while not _compile_stop.is_set():
+                        si = (si + 1) % len(_compile_spin)
+                        pct = _compile_pct[0]
+                        stage = _compile_stage[0]
+                        # Progress bar: [████████░░░░░░░░] 45%
+                        filled = pct // 5
+                        bar = "█" * filled + "░" * (20 - filled)
+                        sys.stdout.write(
+                            f"\r║  {_compile_spin[si]} {bold('hipcc'):<10} "
+                            f"[{cyan(bar)}] {cyan(f'{pct:3d}%')} "
+                            f"{dim(stage[:28]):<30}"
+                        )
+                        sys.stdout.flush()
+                        time.sleep(0.1)
+
+                ct = threading.Thread(target=_compile_bar, daemon=True)
+                ct.start()
+
                 ver_result = self.verifier.verify(
                     hip_source=port_result.get("ported_code", source),
                     cuda_reference_output=reference_output,
-                    kernel_name=Path(cr['file']).stem
+                    kernel_name=Path(cr['file']).stem,
+                    on_progress=_compile_progress
                 )
+
+                _compile_stop.set()
+                ct.join(timeout=1)
+                sys.stdout.write("\r" + " " * 80 + "\r")  # clear progress bar
+                sys.stdout.flush()
+
                 ver_result["confidence"] = port_result.get("confidence", 0)
+                # Attach in-loop compile errors to verification result
+                if port_result.get("compile_errors"):
+                    ver_result["in_loop_compile_errors"] = port_result["compile_errors"]
                 verification_results.append(ver_result)
 
                 # Always save ported kernel to ported_kernels/

@@ -613,6 +613,10 @@ CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explan
             # Fix 8c: threadIdx.* 32 pattern (pointer arithmetic, e.g., &shared[threadIdx.y * 32])
             line = threadidx_32_re.sub(r'\1 WAVEFRONT_SIZE ', line)
 
+            # Fix 8c2: threadIdx.* % 32 → % WAVEFRONT_SIZE (lane ID calculation)
+            if threadidx_mod32_re.search(line):
+                line = threadidx_mod32_re.sub(r'\1WAVEFRONT_SIZE ', line)
+
             # Fix 8d: #define TILE_SIZE 32 → #define TILE_SIZE WAVEFRONT_SIZE
             if define_tile_re.search(line):
                 line = define_tile_re.sub('#define TILE_SIZE WAVEFRONT_SIZE  // AMD wavefront', line)
@@ -627,6 +631,10 @@ CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explan
 
             # Fix 8f: tid & 0x1f == 0 → tid & 0x3f == 0 (warp mask check)
             line = tid_warp_mask_re.sub(r'\1 0x3f\2', line)
+
+            # Fix 8f2: & 31 (decimal warp mask) → & 63 for wavefront64
+            if re.search(r'&\s*31\b', line) and 'threadIdx' in line:
+                line = re.sub(r'(&\s*)31(\b)', r'\g<1>63', line)
 
             # Fix 8g: blockIdx.* * TILE_SIZE → blockIdx.* * WAVEFRONT_SIZE
             line = blockidx_tile_re.sub(r'\1 WAVEFRONT_SIZE', line)
@@ -673,6 +681,14 @@ CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explan
 
             # Fix 14: threadIdx.x/tid < 32 → < WAVEFRONT_SIZE (warp divergence boundary)
             line = warp_divergent_32_re.sub(r'\1 WAVEFRONT_SIZE \2', line)
+
+            # Fix 14b: Loop bound in shuffle/scan patterns — offset < 32 → offset < WAVEFRONT_SIZE
+            # Common in warp scan (Hillis-Steele): for (int offset = 1; offset < 32; offset *= 2)
+            # On wavefront64, need 6 steps (1,2,4,8,16,32) to cover all 64 lanes
+            if re.search(r'for\s*\(\s*int\s+offset\s*=\s*1\s*;\s*offset\s*<\s*32\b', line):
+                line = re.sub(r'(offset\s*<\s*)32(\b)', r'\1WAVEFRONT_SIZE\2', line)
+                if "shuffle loop bound" not in str(changes):
+                    changes.append("shuffle scan loop bound offset < 32 → offset < WAVEFRONT_SIZE (6 steps for wavefront64)")
 
 
             # Track what changed

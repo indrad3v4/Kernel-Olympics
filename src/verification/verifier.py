@@ -364,8 +364,46 @@ int main() {{
 
     # ── Verify method (using persistent build directory) ────────────
 
+    def quick_compile_check(self, hip_source: str, kernel_name: str = "test_kernel",
+                            on_progress=None) -> Dict:
+        """Fast in-loop compilation check — no run, no diff.
+
+        Used INSIDE the Kimi→GLM loop to feed real hipcc errors back to Kimi.
+        Returns dict with compile_success, compile_output, and errors list.
+        """
+        if on_progress: on_progress(0, "writing source")
+        kernel_build_dir = self.build_dir / f"loop_{kernel_name}"
+        kernel_build_dir.mkdir(parents=True, exist_ok=True)
+
+        src_file = kernel_build_dir / f"{kernel_name}.hip.cpp"
+        src_file.write_text(hip_source, encoding="utf-8")
+
+        if on_progress: on_progress(15, "generating harness")
+        harness = self._generate_harness(kernel_name, "", hip_source)
+        harness_file = kernel_build_dir / f"test_{kernel_name}.cpp"
+        harness_file.write_text(harness, encoding="utf-8")
+
+        if on_progress: on_progress(30, "starting hipcc")
+        compile_ok, compile_out = self._compile(harness_file, kernel_build_dir, kernel_name)
+
+        if on_progress: on_progress(100, "done" if compile_ok else "compile failed")
+
+        # Extract error lines for concise feedback
+        errors = []
+        for line in compile_out.splitlines():
+            if line.strip().startswith("error:") or "error:" in line:
+                errors.append(line.strip()[:200])
+
+        return {
+            "compile_success": compile_ok,
+            "compile_output": compile_out[:2000] if compile_out else "",
+            "errors": errors[:10],
+            "kernel_name": kernel_name,
+        }
+
     def verify(self, hip_source: str, cuda_reference_output: str = "",
-               test_input: str = "", kernel_name: str = "test_kernel") -> Dict:
+               test_input: str = "", kernel_name: str = "test_kernel",
+               on_progress=None) -> Dict:
         """
         Verify a ported HIP kernel:
         1. Write source to persistent build directory
@@ -377,6 +415,8 @@ int main() {{
         var or an auto-created temporary directory) so artifacts survive
         across calls for inspection and to avoid re-creating the build
         tree each time.
+
+        on_progress: optional callback(percent: int, stage: str) for live progress bar.
         """
         result = {
             "kernel": kernel_name,
@@ -402,17 +442,23 @@ int main() {{
         kernel_build_dir = self.build_dir / kernel_name
         kernel_build_dir.mkdir(parents=True, exist_ok=True)
 
-        # Write source
+        # Step 1: Write source (0→10%)
+        if on_progress: on_progress(5, "writing source")
         src_file = kernel_build_dir / f"{kernel_name}.hip.cpp"
         src_file.write_text(hip_source, encoding="utf-8")
 
-        # Generate spec-driven harness
+        # Step 2: Generate harness (10→20%)
+        if on_progress: on_progress(15, "generating test harness")
         harness = self._generate_harness(kernel_name, test_input, hip_source)
         harness_file = kernel_build_dir / f"test_{kernel_name}.cpp"
         harness_file.write_text(harness, encoding="utf-8")
 
-        # Step 1: Compile
-        compile_ok, compile_out = self._compile(harness_file, kernel_build_dir, kernel_name)
+        # Step 3: Compile with hipcc (20→70%)
+        if on_progress: on_progress(25, "starting hipcc compilation")
+        compile_ok, compile_out = self._compile(
+            harness_file, kernel_build_dir, kernel_name, on_progress=on_progress
+        )
+        if on_progress: on_progress(70, "compilation complete" if compile_ok else "compilation failed")
         result["compile_success"] = compile_ok
         result["compile_output"] = compile_out[:1000] if compile_out else ""
 
@@ -429,20 +475,25 @@ int main() {{
             except Exception as e:
                 print(f"║ ⚠️ Failed to save ported kernel to {manual_path}: {e}")
                 pass
+            if on_progress: on_progress(100, "failed — saved for manual hipcc")
             result["passed"] = False
             return result
 
-        # Step 2: Run
+        # Step 4: Run executable (70→90%)
+        if on_progress: on_progress(75, "running compiled kernel")
         run_ok, run_output, benchmark = self._run(kernel_build_dir, kernel_name)
+        if on_progress: on_progress(90, "run complete" if run_ok else "run failed")
         result["run_success"] = run_ok
         result["run_output"] = run_output[:1000] if run_output else ""
         result["benchmark_us"] = benchmark
 
         if not run_ok:
+            if on_progress: on_progress(100, "run failed")
             result["passed"] = False
             return result
 
-        # Step 3: Diff against reference (try spec path first, fallback to param)
+        # Step 5: Diff against reference (90→100%)
+        if on_progress: on_progress(95, "diffing against CUDA reference")
         ref_text = cuda_reference_output
         spec_ref_path = spec.get("_reference_path") if spec else None
         if spec_ref_path and not ref_text:
@@ -461,30 +512,40 @@ int main() {{
             result["diff_report"] = "No reference — marked pass (compiled + ran successfully)"
             result["passed"] = True
 
+        if on_progress: on_progress(100, "PASSED ✅" if result["passed"] else "DIFF FAILED")
         return result
 
     # ── Compile / Run / Diff helpers (unchanged from original) ──────
 
-    def _compile(self, harness_file: Path, build_dir: Path, kernel_name: str) -> tuple:
-        """Compile HIP kernel with hipcc."""
+    def _compile(self, harness_file: Path, build_dir: Path, kernel_name: str,
+                 on_progress=None) -> tuple:
+        """Compile HIP kernel with hipcc.
+
+        on_progress: optional callback(percent: int, stage: str) — called
+        at key compilation milestones so the UI can show a 0-100% bar.
+        """
         output_bin = build_dir / kernel_name
 
         if self._hipcc_available:
             try:
+                if on_progress: on_progress(30, "hipcc starting")
                 if self._hipcc_path == "hipcc":
                     cmd_line = f"hipcc -o {output_bin} {harness_file} -std=c++17 -O2 --offload-arch={self.offload_arch}"
+                    if on_progress: on_progress(40, "hipcc compiling (shell)")
                     result = subprocess.run(
                         cmd_line, shell=True,
                         capture_output=True, text=True, timeout=60,
                         cwd=str(build_dir)
                     )
                 else:
+                    if on_progress: on_progress(40, "hipcc compiling (direct)")
                     result = subprocess.run(
                         [self._hipcc_path, "-o", str(output_bin), str(harness_file),
                          "-std=c++17", "-O2", f"--offload-arch={self.offload_arch}"],
                         capture_output=True, text=True, timeout=60,
                         cwd=str(build_dir)
                     )
+                if on_progress: on_progress(65, "hipcc finished")
                 return result.returncode == 0, result.stdout + result.stderr
             except (subprocess.TimeoutExpired, FileNotFoundError) as e:
                 manual_dir = Path.cwd() / "ported_kernels"

@@ -244,26 +244,76 @@ class ModelRouter:
         Post-processing safety net applied after every Kimi code generation
         and refinement pass. Catches common issues the LLM may miss.
         """
-        # Replace CUDA headers with HIP equivalents
-        code = re.sub(r'#include\s*<cuda_runtime\.h>', '#include <hip/hip_runtime.h>', code)
-        code = re.sub(r'#include\s*<cuda_runtime_api\.h>', '#include <hip/hip_runtime.h>', code)
-        code = re.sub(r'#include\s*"cuda_runtime\.h"', '#include <hip/hip_runtime.h>', code)
-        # Remove NVIDIA helper headers — not available in ROCm
-        code = re.sub(r'#include\s*<helper_cuda\.h>\n?', '', code)
-        code = re.sub(r'#include\s*<helper_functions\.h>\n?', '', code)
-        code = re.sub(r'#include\s*"helper_cuda\.h"\n?', '', code)
-        code = re.sub(r'#include\s*"helper_functions\.h"\n?', '', code)
+        # ── Comprehensive CUDA header replacement ──────────────────
+        # Core CUDA runtime → HIP
+        code = re.sub(r'#include\s*[<"]cuda_runtime\.h[>"]', '#include <hip/hip_runtime.h>', code)
+        code = re.sub(r'#include\s*[<"]cuda_runtime_api\.h[>"]', '#include <hip/hip_runtime.h>', code)
+        # CUDA math → HIP (hip already includes math)
+        code = re.sub(r'#include\s*[<"]cuda_math\.h[>"]\n?', '', code)
+        # NVIDIA helper headers — NOT in ROCm, remove
+        code = re.sub(r'#include\s*[<"]helper_cuda\.h[>"]\n?', '', code)
+        code = re.sub(r'#include\s*[<"]helper_functions\.h[>"]\n?', '', code)
+        code = re.sub(r'#include\s*[<"]helper_string\.h[>"]\n?', '', code)
+        code = re.sub(r'#include\s*[<"]helper_timer\.h[>"]\n?', '', code)
+        code = re.sub(r'#include\s*[<"]helper_image\.h[>"]\n?', '', code)
+        code = re.sub(r'#include\s*[<"]helper_gl\.h[>"]\n?', '', code)
+        # CUDA device launch — not needed in HIP
+        code = re.sub(r'#include\s*[<"]device_launch_parameters\.h[>"]\n?', '', code)
+        # CUDA random, FFT, BLAS, sparse, solver — need HIP equivalents
+        code = re.sub(r'#include\s*[<"]curand\.h[>"]', '#include <hiprand/hiprand.h>', code)
+        code = re.sub(r'#include\s*[<"]curand_kernel\.h[>"]', '#include <hiprand/hiprand_kernel.h>', code)
+        code = re.sub(r'#include\s*[<"]cufft\.h[>"]', '#include <hipfft/hipfft.h>', code)
+        code = re.sub(r'#include\s*[<"]cublas_v2\.h[>"]', '#include <hipblas/hipblas.h>', code)
+        code = re.sub(r'#include\s*[<"]cusparse\.h[>"]', '#include <hipsparse/hipsparse.h>', code)
+        code = re.sub(r'#include\s*[<"]cusolver_common\.h[>"]', '#include <hipsolver/hipsolver.h>', code)
+        # NVRTC → no HIP equivalent, remove
+        code = re.sub(r'#include\s*[<"]nvrtc\.h[>"]\n?', '', code)
         # Remove project-specific .cuh headers — not available in HIP port
         code = re.sub(r'#include\s*"[^"]*\.cuh"\n?', '', code)
-        code = re.sub(r'#include\s*<[^>]*\.cuh>\n?', '', code)
-        # Remove device_launch_parameters.h — not needed in HIP
-        code = re.sub(r'#include\s*<device_launch_parameters\.h>\n?', '', code)
+        code = re.sub(r"#include\s*<[^>]*\.cuh>\n?", '', code)
+        # Remove any remaining CUDA-specific includes
+        code = re.sub(r'#include\s*[<"][^>"]*cuda[^>"]*[>"]\n?', '', code, flags=re.IGNORECASE)
 
-        # Inject #define WAVEFRONT_SIZE 64 if not already defined
+        # ── API renames: cuda* → hip* ──────────────────────────────
+        code = re.sub(r'\bcudaMalloc\b', 'hipMalloc', code)
+        code = re.sub(r'\bcudaFree\b', 'hipFree', code)
+        code = re.sub(r'\bcudaMemcpy\b', 'hipMemcpy', code)
+        code = re.sub(r'\bcudaMemcpyAsync\b', 'hipMemcpyAsync', code)
+        code = re.sub(r'\bcudaMemset\b', 'hipMemset', code)
+        code = re.sub(r'\bcudaDeviceSynchronize\b', 'hipDeviceSynchronize', code)
+        code = re.sub(r'\bcudaGetLastError\b', 'hipGetLastError', code)
+        code = re.sub(r'\bcudaError_t\b', 'hipError_t', code)
+        code = re.sub(r'\bcudaSuccess\b', 'hipSuccess', code)
+        code = re.sub(r'\bcudaGetDeviceCount\b', 'hipGetDeviceCount', code)
+        code = re.sub(r'\bcudaSetDevice\b', 'hipSetDevice', code)
+        code = re.sub(r'\bcudaGetDeviceProperties\b', 'hipGetDeviceProperties', code)
+        code = re.sub(r'\bcudaDeviceProp\b', 'hipDeviceProp_t', code)
+        code = re.sub(r'\bcudaStreamCreate\b', 'hipStreamCreate', code)
+        code = re.sub(r'\bcudaStreamSynchronize\b', 'hipStreamSynchronize', code)
+        code = re.sub(r'\bcudaEventCreate\b', 'hipEventCreate', code)
+        code = re.sub(r'\bcudaEventRecord\b', 'hipEventRecord', code)
+        code = re.sub(r'\bcudaEventSynchronize\b', 'hipEventSynchronize', code)
+        code = re.sub(r'\bcudaEventElapsedTime\b', 'hipEventElapsedTime', code)
+        # cudaMemcpyKind
+        code = re.sub(r'\bcudaMemcpyHostToDevice\b', 'hipMemcpyHostToDevice', code)
+        code = re.sub(r'\bcudaMemcpyDeviceToHost\b', 'hipMemcpyDeviceToHost', code)
+        code = re.sub(r'\bcudaMemcpyDeviceToDevice\b', 'hipMemcpyDeviceToDevice', code)
+        # Pinned memory
+        code = re.sub(r'\bcudaMallocHost\b', 'hipHostMalloc', code)
+        code = re.sub(r'\bcudaFreeHost\b', 'hipHostFree', code)
+        # Events
+        code = re.sub(r'\bcudaEvent_t\b', 'hipEvent_t', code)
+        # Device queries
+        code = re.sub(r'\bcudaGetDevice\b', 'hipDeviceGet', code)
+        # checkCudaErrors macro — stub it out (no HIP equivalent)
+        code = re.sub(r'\bcheckCudaErrors\s*\(', '(void)(', code)
+        # cuda_device variable name
+        code = re.sub(r'\bcuda_device\b', 'hip_device', code)
+
+        # ── WAVEFRONT_SIZE define ───────────────────────────────────
         # ROCm wavefront is 64 on gfx9 (MI300/MI250). CUDA warp is 32.
         if not re.search(r'#define\s+WAVEFRONT_SIZE', code):
-            # Insert after the last #include line (or at top if no includes)
-            include_lines = list(re.finditer(r'#include\s+[<"].*[>"]\n', code))
+            include_lines = list(re.finditer(r'#include\s+[<"].*?[>"]\n', code))
             if include_lines:
                 last_include = include_lines[-1]
                 insert_pos = last_include.end()
@@ -271,20 +321,37 @@ class ModelRouter:
             else:
                 code = '#define WAVEFRONT_SIZE 64\n' + code
 
-        # Fix __shfl_xor_sync mask: 0x1f (5-bit, warp32) → 0x3f (6-bit, wavefront64)
+        # ── Shuffle intrinsics: fix masks for wavefront64 ──────────
+        # __shfl_xor_sync mask: 0x1f (5-bit, warp32) → 0x3f (6-bit, wavefront64)
         code = re.sub(
             r'(__shfl_xor_sync\s*\()0x1f(,)',
             r'\g<1>0x3f\g<2>',
             code
         )
-        # Fix __shfl_down_sync mask: 32-bit 0xffffffff → 64-bit for wavefront64
+        # __shfl_up_sync / __shfl_down_sync mask: 0x1f → 0x3f
         code = re.sub(
-            r'(__shfl_\w+_sync\()0x[fF]{8}(,)',
+            r'(__shfl_up_sync\s*\()0x1f(,)',
+            r'\g<1>0x3f\g<2>',
+            code
+        )
+        code = re.sub(
+            r'(__shfl_down_sync\s*\()0x1f(,)',
+            r'\g<1>0x3f\g<2>',
+            code
+        )
+        # Full-width masks: 0xffffffff → 64-bit
+        code = re.sub(
+            r'(__shfl_\w+_sync\s*\()0x[fF]{8}(,)',
             r'\g<1>0xffffffffffffffffULL\g<2>',
             code
         )
         # Replace __syncwarp() with __syncthreads() for wavefront64 safety
         code = re.sub(r'\b__syncwarp\s*\(\s*\)', '__syncthreads()', code)
+
+        # ── Warp size constant: 32 → 64 ────────────────────────────
+        # Only replace standalone 32 in warp-size contexts, NOT array sizes
+        code = re.sub(r'\bwarpSize\b', '64', code)
+        code = re.sub(r'\bWARP_SIZE\b(?!\s*64)', 'WAVEFRONT_SIZE', code)
 
         return code
 
@@ -504,21 +571,32 @@ class ModelRouter:
 
     def route(self, kernel_source: str, patterns: List[Dict],
               max_iterations: int = 3,
-              on_phase=None) -> Dict:
+              on_phase=None,
+              verifier=None,
+              kernel_name: str = "test_kernel") -> Dict:
         """Route kernel through the loop engineering pipeline.
 
-        Loop: DeepSeek (plan) → Kimi (code) → GLM (evaluate) → feedback → Kimi refines
+        Loop: DeepSeek (plan) → Kimi (code) → [hipcc compile check] → GLM (evaluate) → feedback → Kimi refines
+
+        The verification loop now has TWO feedback sources:
+          1. GLM evaluator (static code analysis)
+          2. hipcc compiler (real compilation errors) — if verifier is provided
+
+        When hipcc fails, compile errors are appended to the GLM feedback,
+        giving Kimi both static AND compile-time feedback to fix.
 
         Args:
             kernel_source: The CUDA kernel source code.
             patterns: List of classifier-detected patterns.
             max_iterations: Maximum Kimi→GLM cycles (default 3).
             on_phase: Optional callback(phase: str, detail: str) for live progress.
+            verifier: Optional VerificationAgent for in-loop hipcc compile checks.
+            kernel_name: Name of kernel (for verifier build dir isolation).
 
         Returns:
             {"ported_code": ..., "confidence": ..., "changes": [...],
              "model_used": ..., "cost": ..., "orchestrator_passed": ...,
-             "iterations_used": ...}
+             "iterations_used": ..., "compile_errors": [...]}
         """
         if not self.api_key:
             return {"ported_code": "", "confidence": 0,
@@ -528,7 +606,8 @@ class ModelRouter:
 
         result = {"ported_code": "", "confidence": 0,
                   "changes": [], "model_used": "", "cost": 0,
-                  "orchestrator_passed": False, "iterations_used": 0}
+                  "orchestrator_passed": False, "iterations_used": 0,
+                  "compile_errors": []}
 
         # Track pipeline phase outcomes for rubric scoring
         planner_success = False
@@ -561,6 +640,25 @@ class ModelRouter:
             extracted = self._extract_code(code.output)
             extracted = self._fix_ported_code(extracted)
             result["ported_code"] = extracted
+
+            # ── In-loop hipcc compile check (TRIZ: compiler feedback INTO loop) ──
+            if verifier and hasattr(verifier, 'quick_compile_check'):
+                if on_phase: on_phase("compile", "hipcc", "in-loop compilation check")
+                cc = verifier.quick_compile_check(extracted, kernel_name=kernel_name)
+                if cc["compile_success"]:
+                    result["changes"].append("[hipcc] In-loop compile: PASSED ✅")
+                else:
+                    compile_errs = cc.get("errors", [])
+                    result["compile_errors"].extend(compile_errs)
+                    err_summary = "; ".join(compile_errs[:3]) if compile_errs else cc["compile_output"][:300]
+                    result["changes"].append(f"[hipcc] In-loop compile FAILED: {err_summary[:120]}")
+                    # Feed compile errors to GLM evaluator as additional feedback
+                    evaluator_feedback = (
+                        f"REAL COMPILER ERRORS (hipcc) — fix these FIRST:\n"
+                        + "\n".join(compile_errs[:5] if compile_errs else [cc["compile_output"][:500]])
+                        + "\n\nAlso address any static analysis issues below."
+                    )
+
             result["changes"].append("[kimi27] Generated ported kernel")
             result["model_used"] = "kimi27"
         else:
@@ -696,6 +794,29 @@ class ModelRouter:
                     extracted = self._extract_code(refine.output)
                     extracted = self._fix_ported_code(extracted)
                     result["ported_code"] = extracted
+
+                    # ── In-loop hipcc re-compile after refinement ──
+                    if verifier and hasattr(verifier, 'quick_compile_check'):
+                        if on_phase: on_phase("compile", "hipcc", f"re-compile after refine (iter {iteration+1})")
+                        cc = verifier.quick_compile_check(extracted, kernel_name=kernel_name)
+                        if cc["compile_success"]:
+                            result["changes"].append(
+                                f"[hipcc] Re-compile after refine {iteration+1}: PASSED ✅")
+                            # Clear compile errors since they're fixed
+                            result["compile_errors"] = []
+                        else:
+                            compile_errs = cc.get("errors", [])
+                            result["compile_errors"].extend(compile_errs)
+                            err_summary = "; ".join(compile_errs[:3]) if compile_errs else cc["compile_output"][:300]
+                            result["changes"].append(
+                                f"[hipcc] Re-compile after refine {iteration+1}: FAILED: {err_summary[:120]}")
+                            # Override feedback with compile errors for next iteration
+                            evaluator_feedback = (
+                                f"REAL COMPILER ERRORS (hipcc) — fix these FIRST:\n"
+                                + "\n".join(compile_errs[:5] if compile_errs else [cc["compile_output"][:500]])
+                                + f"\n\nPrevious static analysis feedback:\n{evaluator_feedback[:500]}"
+                            )
+
                     result["changes"].append(
                         f"[kimi27] Refined with evaluator feedback "
                         f"(iteration {iteration} → {iteration + 1})")
