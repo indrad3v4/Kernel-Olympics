@@ -497,6 +497,8 @@ class VerificationAgent:
         # TRIZ #22: Throwing away — filter template noise, keep only actionable errors
         errors = []
         origins = []  # parallel to primary error lines only (not caret context lines)
+        error_context = []  # TRIZ #24: the ACTUAL source lines at each error location
+        harness_lines = harness.splitlines()
         lines = compile_out.splitlines()
         for i, line in enumerate(lines):
             stripped = line.strip()
@@ -511,6 +513,22 @@ class VerificationAgent:
             # Keep the error line + 1 context line after (often shows the code)
             errors.append(stripped[:200])
             origins.append(self._classify_error_origin(stripped, kernel_start, kernel_end))
+            # Hidden resource: we HAVE the compiled file in memory and hipcc
+            # gives an exact line number — extract the offending source lines
+            # deterministically instead of asking an LLM to count to line N
+            # in a 15k-char blob. This is what exposed the 2026-07-09 failure
+            # (every error lived in post-processor-injected shim lines the
+            # models were never shown in isolation).
+            lm = re.search(r':(\d+):\d+:\s*(?:fatal )?error:', stripped)
+            if lm:
+                err_line_no = int(lm.group(1))  # 1-indexed
+                lo = max(0, err_line_no - 2)
+                hi = min(len(harness_lines), err_line_no + 1)
+                snippet = "\n".join(
+                    f"  {n + 1:>4}{'>' if n + 1 == err_line_no else ' '} {harness_lines[n][:160]}"
+                    for n in range(lo, hi)
+                )
+                error_context.append(snippet)
             # Include the next line if it shows the code caret (^~~~)
             if i + 1 < len(lines) and lines[i + 1].strip().startswith("|"):
                 errors.append(lines[i + 1].strip()[:200])
@@ -534,6 +552,10 @@ class VerificationAgent:
             "compile_output": compile_out[:2000] if compile_out else "",
             "errors": errors[:8],  # concise — LLM doesn't need 10+ error lines
             "error_origins": origins[:8],
+            # Kept SEPARATE from "errors": the loop's new/resolved diffing and
+            # cycle detection hash the error strings — folding volatile source
+            # context into them would make every error look "new" every time.
+            "error_context": error_context[:8],
             "all_harness_origin": all_harness_origin,
             "compile_log_path": compile_log_path,
             "kernel_name": kernel_name,
