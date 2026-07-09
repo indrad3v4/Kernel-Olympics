@@ -1582,6 +1582,28 @@ class ModelRouter:
               verifier=None,
               kernel_name: str = "test_kernel",
               max_seconds: Optional[float] = None) -> Dict:
+        """P1.1: deterministic warp-size pre-pass, then the LLM loop.
+
+        The rewriter fixes the mechanical warp32→wavefront64 hazards up front
+        so the model only has to refine the residue (instead of re-deriving
+        warp arithmetic every ~150s iteration). Its changes are merged into
+        the result under both ``changes`` and ``warp_rewrite``.
+        """
+        from warp_rewriter import rewrite_warp_size
+        kernel_source, warp_changes = rewrite_warp_size(kernel_source)
+        result = self._route_inner(kernel_source, patterns, max_iterations,
+                                   on_phase, verifier, kernel_name, max_seconds)
+        if warp_changes and isinstance(result, dict):
+            result["changes"] = list(warp_changes) + list(result.get("changes", []))
+            result["warp_rewrite"] = warp_changes
+        return result
+
+    def _route_inner(self, kernel_source: str, patterns: List[Dict],
+              max_iterations: int = 10,
+              on_phase=None,
+              verifier=None,
+              kernel_name: str = "test_kernel",
+              max_seconds: Optional[float] = None) -> Dict:
         """Route kernel through the loop engineering pipeline.
 
         Loop: DeepSeek (plan) → Kimi (code) → [hipcc compile FIRST] → GLM (evaluate only if compile passes) → feedback → Kimi refines

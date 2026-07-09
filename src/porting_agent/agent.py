@@ -140,8 +140,24 @@ CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explan
 
     def port_kernel(self, source_code: str, context: str = "",
                     cached_pattern: Optional[Dict] = None) -> Dict:
-        """Port a CUDA kernel to ROCm/HIP using LLM."""
-        
+        """Port a CUDA kernel to ROCm/HIP.
+
+        P1.1: a deterministic warp-size rewrite runs FIRST, so the mechanical
+        wavefront-64 hazards are fixed before the LLM/template ever sees the
+        code. Its changes are merged into the result so they're reported.
+        """
+        from warp_rewriter import rewrite_warp_size
+        source_code, warp_changes = rewrite_warp_size(source_code)
+        result = self._port_kernel_llm(source_code, context, cached_pattern)
+        if warp_changes and isinstance(result, dict):
+            result["changes"] = list(warp_changes) + list(result.get("changes", []))
+            result["warp_rewrite"] = warp_changes
+        return result
+
+    def _port_kernel_llm(self, source_code: str, context: str = "",
+                         cached_pattern: Optional[Dict] = None) -> Dict:
+        """Port a CUDA kernel to ROCm/HIP using LLM (or template fallback)."""
+
         # TRIZ: Fix source code BEFORE any LLM/template processing
         fixed_source = self._fix_ported_code(source_code)
         

@@ -404,6 +404,15 @@ class KernelOlympics:
                         # run the final iteration's state is what matters, not iteration 1's.
                         for ch in orch_changes[-5:]:
                             print(f"║  🧠 {dim(ch[:70]):<64}║")
+                    # P1.1: surface the deterministic warp-rewrite pass — the
+                    # mechanical wavefront-64 fixes applied before the LLM ran.
+                    warp_changes = port_result.get("warp_rewrite", [])
+                    if warp_changes:
+                        self.disp.file_done(
+                            Path(cr['file']).name,
+                            f"🔧 warp-rewrite: {len(warp_changes)} deterministic fix kind(s) "
+                            f"applied pre-LLM", ok=True)
+
                     compile_ok = port_result.get("compile_passed", False)
                     # T0.1: the porting phase runs an in-loop compile of the bare
                     # kernel — it is NOT the authoritative verdict. The verifier
