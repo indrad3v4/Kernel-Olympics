@@ -34,6 +34,7 @@ class VerificationResult:
     run_output: str
     diff_report: str
     benchmark_us: Optional[float] = None
+    run_exit_code: Optional[int] = None
     spec_name: Optional[str] = None
 
 
@@ -231,8 +232,17 @@ class VerificationAgent:
         Errors in harness-authored lines (the driver's own main/mallocs/launch
         call) are not fixable by refining the ported kernel — no amount of
         LLM feedback can fix a line the model never wrote or saw.
+
+        Bug 6: linker diagnostics (``ld.lld: error: undefined symbol: ...``)
+        have no ``file:line:col:`` prefix, so they used to fall through to
+        "unknown" — invisible to the harness-origin early abort and
+        indistinguishable from a truly unclassifiable line. Given their own
+        origin ("link") lets a caller give targeted guidance (e.g. "you
+        dropped main() — restore it") instead of a raw linker string.
         """
         import re
+        if re.search(r'undefined (?:symbol|reference to)[\s\S]{0,10}\bmain\b', error_line):
+            return "link"
         m = re.search(r':(\d+):\d+:\s*(?:fatal )?error:', error_line)
         if not m:
             return "unknown"
@@ -556,6 +566,7 @@ class VerificationAgent:
             "run_output": "",
             "diff_report": "",
             "benchmark_us": None,
+            "run_exit_code": None,
             "spec_used": None,
             "hipcc_available": self._hipcc_available,
             "hipcc_path": getattr(self, "_hipcc_path", "not found"),
@@ -613,11 +624,12 @@ class VerificationAgent:
 
         # Step 4: Run executable (70→90%)
         if on_progress: on_progress(75, "running compiled kernel")
-        run_ok, run_output, benchmark = self._run(kernel_build_dir, kernel_name)
+        run_ok, run_output, benchmark, run_exit_code = self._run(kernel_build_dir, kernel_name)
         if on_progress: on_progress(90, "run complete" if run_ok else "run failed")
         result["run_success"] = run_ok
         result["run_output"] = run_output[:1000] if run_output else ""
         result["benchmark_us"] = benchmark
+        result["run_exit_code"] = run_exit_code
 
         if not run_ok:
             if on_progress: on_progress(100, "run failed")
@@ -750,7 +762,14 @@ class VerificationAgent:
             return False, msg, log_path
 
     def _run(self, build_dir: Path, kernel_name: str) -> tuple:
-        """Run the compiled HIP kernel."""
+        """Run the compiled HIP kernel.
+
+        Returns (run_ok, output, benchmark_us, exit_code). ``exit_code`` is
+        ``None`` when the binary couldn't be launched at all (missing, timed
+        out) — distinct from a real non-zero exit, so callers can tell
+        "never ran" from "ran and failed" (e.g. the NVIDIA sample's
+        EXIT_WAIVED=2 on unsupported hardware vs. a genuine crash).
+        """
         binary = build_dir / kernel_name
         if binary.exists() and os.access(binary, os.X_OK):
             try:
@@ -762,10 +781,10 @@ class VerificationAgent:
                 )
                 elapsed = (time.perf_counter() - start) * 1_000_000  # microseconds
                 output = result.stdout + result.stderr
-                return result.returncode == 0, output, round(elapsed, 2)
+                return result.returncode == 0, output, round(elapsed, 2), result.returncode
             except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-                return False, str(e), None
-        return False, "Binary not found — compile step may have failed.", None
+                return False, str(e), None, None
+        return False, "Binary not found — compile step may have failed.", None, None
 
     def _diff(self, actual_output: str, expected_output: str) -> tuple:
         """Compare actual output against CUDA reference output."""
