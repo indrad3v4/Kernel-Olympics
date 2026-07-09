@@ -13,6 +13,7 @@ import os
 import sys
 import contextlib
 import json
+import urllib.error
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -32,7 +33,9 @@ os.environ.update(_env_snapshot)
 from router import (
     ModelRouter, AgentResult, Deadline, PipelineTimeoutError,
     PROMPT_VERSION, SYSTEM_PROMPTS, MAX_PIPELINE_SECONDS,
-    STAGNATION_ABORT_THRESHOLD, MAX_REPLANS,
+    STAGNATION_ABORT_THRESHOLD, MAX_REPLANS, MODEL_CATALOG,
+    PLAN_BUDGET_FRACTION, CODE_RESERVE_FRACTION, COMPILE_RESERVE_SECONDS,
+    MIN_LLM_TIMEOUT_SECONDS,
 )
 
 
@@ -168,6 +171,571 @@ class TestCallModelBudget:
 
         assert seen, "expected at least one request attempt"
         assert all(t <= 31 for t in seen), f"timeout escaped the budget: {seen}"
+
+
+# ── HIPIFY: mechanical translation + compile-first fast path ─────────────
+
+SIMPLE_CUDA = """
+#include <cuda_runtime.h>
+__global__ void vadd(float* a, float* b, float* c, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) c[i] = a[i] + b[i];
+}
+int main() { float* d; cudaMalloc(&d, 4); cudaFree(d); return 0; }
+"""
+
+
+def _clean_verifier():
+    v = MagicMock()
+    v.quick_compile_check.return_value = {"compile_success": True, "errors": [], "output": ""}
+    v.quick_run_check.return_value = {"run_success": True}
+    return v
+
+
+class TestHipifySource:
+    def test_translates_cuda_api_and_headers(self):
+        out, log = ModelRouter._hipify_source(SIMPLE_CUDA)
+        assert "cudaMalloc" not in out and "hipMalloc" in out
+        assert "cudaFree" not in out and "hipFree" in out
+        assert "cuda_runtime.h" not in out and "hip/hip_runtime.h" in out
+        assert log, "no changelog produced"
+
+    def test_is_idempotent(self):
+        """The hipified source passes through _fix_ported_code again after Kimi.
+        If the transform were not idempotent it would corrupt on the second pass —
+        which is exactly what the post-processor did before it was fixed."""
+        once, _ = ModelRouter._hipify_source(SIMPLE_CUDA)
+        twice, _ = ModelRouter._hipify_source(once)
+        assert once == twice
+
+    def test_leaves_no_residual_cuda_symbols_on_a_simple_kernel(self):
+        out, _ = ModelRouter._hipify_source(SIMPLE_CUDA)
+        assert ModelRouter._residual_cuda_symbols(out) == []
+
+    def test_residual_symbols_are_reported(self):
+        assert "cudaGraphLaunch" in ModelRouter._residual_cuda_symbols(
+            "cudaGraphLaunch(g, s);")
+
+
+class TestWavefrontGate:
+    def test_shfl_needs_semantics(self):
+        assert ModelRouter._needs_wavefront_semantics("__shfl_up_sync(0xffffffff, v, 1);")
+
+    def test_warpsize_needs_semantics(self):
+        assert ModelRouter._needs_wavefront_semantics("int l = tid % warpSize;")
+
+    def test_plain_kernel_does_not(self):
+        assert not ModelRouter._needs_wavefront_semantics(SIMPLE_CUDA)
+
+    def test_classifier_findings_also_trip_the_gate(self):
+        """Belt and braces: the regex may miss a spelling the classifier caught."""
+        assert ModelRouter._needs_wavefront_semantics(
+            "int x = 1;", patterns=[{"pattern": "shfl_up_sync", "severity": "high"}])
+
+    def test_the_real_outlier_kernel_needs_semantics(self):
+        src = (Path(__file__).resolve().parents[1]
+               / "sample_kernels" / "cuda" / "nvidia_shfl_scan.cu").read_text(encoding="utf-8")
+        assert ModelRouter._needs_wavefront_semantics(src)
+
+
+class TestFastPath:
+    def test_mechanical_port_that_compiles_and_runs_skips_every_llm(self, router):
+        with patch.object(ModelRouter, '_call_model') as mc:
+            result = router.route(SIMPLE_CUDA, [], verifier=_clean_verifier(),
+                                  kernel_name="test_fastok", max_seconds=0)
+        assert mc.call_count == 0, "fast path must not call any model"
+        assert result["fast_path_used"] is True
+        assert result["model_used"] == "hipify"
+        assert result["compile_passed"] is True
+        assert result["orchestrator_passed"] is True
+        assert result["cost"] == 0
+        assert any("skipped DeepSeek, Kimi and GLM" in c for c in result["changes"])
+
+    def test_compiles_but_crashes_falls_through_to_the_models(self, router):
+        """RUN-FIRST: a mechanical port that compiles and SIGSEGVs is not a port.
+        This is the 2026-07-09 failure — shared memory sized blockDim/32."""
+        v = MagicMock()
+        v.quick_compile_check.return_value = {"compile_success": True, "errors": [], "output": ""}
+        v.quick_run_check.return_value = {
+            "run_success": False, "signal": "SIGSEGV", "run_exit_code": -11, "run_output": ""}
+
+        def side_effect(model_key, *a, **k):
+            if model_key == "kimi27":
+                return AgentResult(model_key, True, f"```cpp\n{HIP_OK}\n```", 0.5)
+            return AgentResult(model_key, True, '{"pass": true}', 0.5)
+
+        with patch.object(ModelRouter, '_call_model', side_effect=side_effect) as mc:
+            result = router.route(SIMPLE_CUDA, [], max_iterations=1, verifier=v,
+                                  kernel_name="test_fastcrash", max_seconds=0)
+
+        assert result["fast_path_used"] is False
+        assert mc.call_count > 0, "must fall through to the coder"
+        assert any("did not run clean" in c for c in result["changes"])
+
+    def test_compile_failure_falls_through_to_the_models(self, router):
+        v = MagicMock()
+        v.quick_compile_check.return_value = {
+            "compile_success": False, "errors": ["e1", "e2"], "output": "", "error_context": []}
+
+        def side_effect(model_key, *a, **k):
+            if model_key == "kimi27":
+                return AgentResult(model_key, True, f"```cpp\n{HIP_OK}\n```", 0.5)
+            return AgentResult(model_key, True, '{"fixes": []}', 0.5)
+
+        with patch.object(ModelRouter, '_call_model', side_effect=side_effect) as mc:
+            result = router.route(SIMPLE_CUDA, [], max_iterations=1, verifier=v,
+                                  kernel_name="test_fastnocompile", max_seconds=0)
+
+        assert result["fast_path_used"] is False
+        assert mc.call_count > 0
+        assert any("did not compile" in c for c in result["changes"])
+
+    def test_warp_kernel_skips_the_fast_path_without_spending_a_compile(self, router):
+        """The gate exists to avoid burning ~20s of a 180s budget on a compile
+        whose outcome the source already tells us."""
+        v = _clean_verifier()
+
+        def side_effect(model_key, *a, **k):
+            if model_key == "kimi27":
+                return AgentResult(model_key, True, f"```cpp\n{HIP_OK}\n```", 0.5)
+            return AgentResult(model_key, True, '{"pass": true}', 0.5)
+
+        with patch.object(ModelRouter, '_call_model', side_effect=side_effect):
+            result = router.route(CUDA_SRC, [], max_iterations=1, verifier=v,
+                                  kernel_name="test_warpgate", max_seconds=0)
+
+        assert result["fast_path_used"] is False
+        assert any("uses warp-level primitives" in c for c in result["changes"])
+        # exactly the loop's own compiles — no extra fast-path probe
+        assert not any("did not compile" in c or "did not run clean" in c
+                       for c in result["changes"])
+
+    def test_fast_path_false_disables_it(self, router):
+        def side_effect(model_key, *a, **k):
+            if model_key == "kimi27":
+                return AgentResult(model_key, True, f"```cpp\n{HIP_OK}\n```", 0.5)
+            return AgentResult(model_key, True, '{"pass": true}', 0.5)
+
+        with patch.object(ModelRouter, '_call_model', side_effect=side_effect) as mc:
+            result = router.route(SIMPLE_CUDA, [], max_iterations=1,
+                                  verifier=_clean_verifier(),
+                                  kernel_name="test_fastoff", max_seconds=0,
+                                  fast_path=False)
+        assert result["fast_path_used"] is False
+        assert mc.call_count > 0
+
+    def test_non_dict_compile_result_is_never_read_as_a_pass(self, router):
+        """A MagicMock quick_compile_check returns a MagicMock, which is truthy.
+        The fast-path probe must read that as 'no information', never as a pass —
+        otherwise a mocked verifier ships an unverified kernel."""
+        v = MagicMock()
+        # first call is the fast-path probe (no information); the loop's own
+        # compiles afterwards return a real dict
+        v.quick_compile_check.side_effect = [
+            MagicMock(),
+            {"compile_success": False, "errors": ["e"], "output": "", "error_context": []},
+            {"compile_success": False, "errors": ["e"], "output": "", "error_context": []},
+        ]
+
+        def side_effect(model_key, *a, **k):
+            if model_key == "kimi27":
+                return AgentResult(model_key, True, f"```cpp\n{HIP_OK}\n```", 0.5)
+            return AgentResult(model_key, True, '{"fixes": []}', 0.5)
+
+        with patch.object(ModelRouter, '_call_model', side_effect=side_effect) as mc:
+            result = router.route(SIMPLE_CUDA, [], max_iterations=1, verifier=v,
+                                  kernel_name="test_fastmock", max_seconds=0)
+        assert result["fast_path_used"] is False
+        assert mc.call_count > 0, "must fall through to the models"
+
+    def test_reproducibility_logging_cannot_crash_a_port(self, router):
+        """json.dumps raises TypeError on a non-serializable value, and the run-dir
+        logging guarded only OSError — so a verifier returning anything unusual
+        killed route() from inside a debug-logging block."""
+        class _FalsyUnserializable:
+            """Stands in for e.g. a numpy.bool_ or a mock: usable as a boolean,
+            fatal to json.dumps."""
+            def __bool__(self): return False
+
+        import json as _json
+        with pytest.raises(TypeError):
+            _json.dumps({"compile_success": _FalsyUnserializable()})
+
+        v = MagicMock()
+        v.quick_compile_check.return_value = {
+            "compile_success": _FalsyUnserializable(),
+            "errors": ["error: undeclared identifier"],
+            "output": "", "error_context": []}
+
+        def side_effect(model_key, *a, **k):
+            if model_key == "kimi27":
+                return AgentResult(model_key, True, f"```cpp\n{HIP_OK}\n```", 0.5)
+            return AgentResult(model_key, True, '{"fixes": []}', 0.5)
+
+        with patch.object(ModelRouter, '_call_model', side_effect=side_effect):
+            result = router.route(SIMPLE_CUDA, [], max_iterations=1, verifier=v,
+                                  kernel_name="test_logcrash", max_seconds=0)
+        assert result["ported_code"], "logging killed the port"
+
+
+class TestAdaptiveTokens:
+    def test_small_kernel_gets_far_less_than_the_ceiling(self):
+        n = ModelRouter._compute_adaptive_max_tokens("x" * 2000)
+        assert n < MODEL_CATALOG["kimi27"]["max_tokens"]
+
+    def test_floor_protects_tiny_kernels_from_truncation(self):
+        assert ModelRouter._compute_adaptive_max_tokens("int main(){}") == 2048
+
+    def test_large_kernel_clamps_to_the_catalog_ceiling(self):
+        n = ModelRouter._compute_adaptive_max_tokens("x" * 200_000)
+        assert n == MODEL_CATALOG["kimi27"]["max_tokens"]
+
+    def test_override_never_raises_the_catalog_ceiling(self, router):
+        seen = []
+
+        class _Resp:
+            def __init__(self, b): self.b = b
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self): return self.b
+
+        def fake(req, timeout=None):
+            seen.append(json.loads(req.data.decode())["max_tokens"])
+            return _Resp(json.dumps({
+                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                "usage": {"total_tokens": 1}}).encode())
+
+        with patch("urllib.request.urlopen", side_effect=fake):
+            router._call_model("glm", "p", max_tokens_override=999_999)
+        assert seen == [MODEL_CATALOG["glm"]["max_tokens"]]
+
+
+class TestPreprocessedSourcePrompts:
+    def test_code_prompt_embeds_the_draft_and_narrows_the_checklist(self, router):
+        draft, _ = ModelRouter._hipify_source(SIMPLE_CUDA)
+        p = router._build_kimi_code_prompt(SIMPLE_CUDA, [], preprocessed_source=draft)
+        assert "HIP DRAFT TO EDIT" in p
+        assert "do NOT re-port" in p.lower() or "Do NOT re-port" in p
+        assert "reference only" in p
+        # The mechanical checklist block is dropped; the semantics block is kept.
+        # (checkCudaErrors is still *named* in the prose, as work already done.)
+        assert ModelRouter._MECHANICAL_CHECKLIST not in p
+        assert ModelRouter._WAVEFRONT_CHECKLIST in p
+
+    def test_code_prompt_elides_the_original_but_embeds_the_draft_whole(self, router):
+        """The draft is edited, so it must be complete (a self-contained program
+        truncated below its own main() can never be reproduced — Bug 1). The CUDA
+        original is only reference: re-sending it whole doubled the prompt."""
+        big = (Path(__file__).resolve().parents[1]
+               / "sample_kernels" / "cuda" / "nvidia_shfl_scan.cu").read_text(encoding="utf-8")
+        draft, _ = ModelRouter._hipify_source(big)
+        p = router._build_kimi_code_prompt(big, [], preprocessed_source=draft)
+
+        assert draft in p, "the draft Kimi must edit was truncated"
+        assert big not in p, "the whole CUDA original was re-embedded alongside the draft"
+        assert "original elided" in p
+        assert len(p) < len(big) + len(draft), "prompt carries both sources in full"
+
+    def test_code_prompt_without_a_draft_keeps_the_full_checklist(self, router):
+        p = router._build_kimi_code_prompt(SIMPLE_CUDA, [])
+        assert "HIP DRAFT TO EDIT" not in p
+        assert ModelRouter._MECHANICAL_CHECKLIST in p
+        assert ModelRouter._WAVEFRONT_CHECKLIST in p
+
+    def test_refine_prompt_states_the_mechanical_pass_is_done(self, router):
+        draft, _ = ModelRouter._hipify_source(SIMPLE_CUDA)
+        p = router._build_kimi_refine_prompt(
+            SIMPLE_CUDA, HIP_OK, "errors", [], preprocessed_source=draft)
+        assert "MECHANICAL PASS ALREADY APPLIED" in p
+
+    def test_refine_prompt_does_not_re_embed_the_draft(self, router):
+        """Re-sending the draft would grow the prompt this parameter shrinks."""
+        draft, _ = ModelRouter._hipify_source(SIMPLE_CUDA)
+        with_draft = router._build_kimi_refine_prompt(
+            SIMPLE_CUDA, HIP_OK, "errors", [], preprocessed_source=draft)
+        without = router._build_kimi_refine_prompt(SIMPLE_CUDA, HIP_OK, "errors", [])
+        assert len(with_draft) - len(without) < len(draft), "draft was re-embedded"
+
+    def test_refine_prompt_names_cuda_symbols_that_crept_back(self, router):
+        draft, _ = ModelRouter._hipify_source(SIMPLE_CUDA)
+        regressed = "#include <hip/hip_runtime.h>\nint main(){ cudaMalloc(&d,4); }"
+        p = router._build_kimi_refine_prompt(
+            SIMPLE_CUDA, regressed, "errors", [], preprocessed_source=draft)
+        assert "reintroduced CUDA symbols" in p
+        assert "cudaMalloc" in p
+
+    def test_route_passes_the_draft_and_adaptive_tokens_to_every_kimi_call(self, router):
+        """The three edits the source prompt asked for: initial port, refine, retry."""
+        seen = []
+
+        def side_effect(model_key, prompt, **k):
+            if model_key == "kimi27":
+                seen.append(k.get("max_tokens_override"))
+                return AgentResult(model_key, True, f"```cpp\n{HIP_OK}\n```", 0.5)
+            return AgentResult(model_key, True, '{"fixes": []}', 0.5)
+
+        v = MagicMock()
+        v.quick_compile_check.return_value = {
+            "compile_success": False, "errors": ["e"], "output": "", "error_context": []}
+
+        with patch.object(ModelRouter, '_call_model', side_effect=side_effect):
+            router.route(CUDA_SRC, [], max_iterations=2, verifier=v,
+                         kernel_name="test_kimitokens", max_seconds=0)
+
+        assert len(seen) >= 2, "expected an initial port and at least one refine"
+        assert all(t is not None for t in seen), "a kimi call lacked max_tokens_override"
+        assert all(t <= MODEL_CATALOG["kimi27"]["max_tokens"] for t in seen)
+
+
+# ── P0: phase budgets — no phase may starve the ones behind it ───────────
+
+def _instant_fireworks(seen, content="```cpp\nint main(){}\n```"):
+    """Fake urlopen that answers instantly and records the timeout it was given."""
+    class _Resp:
+        def __init__(self, body): self._body = body
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self): return self._body
+
+    def fake(req, timeout=None):
+        seen.append((req.full_url, timeout))
+        body = json.dumps({
+            "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+            "usage": {"total_tokens": 10},
+        }).encode()
+        return _Resp(body)
+    return fake
+
+
+class TestPhaseCapArithmetic:
+    def test_unlimited_has_no_cap(self):
+        assert Deadline(0).phase_cap(0.2) is None
+
+    def test_cap_is_a_share_of_the_total_budget(self):
+        assert Deadline(180).phase_cap(0.2) == pytest.approx(36, abs=0.5)
+
+    def test_reserve_is_held_back_for_later_phases(self):
+        # 180s budget, reserve 124s → only 56s could remain, but the 20% share is tighter
+        cap = Deadline(180).phase_cap(0.2, reserve_s=124)
+        assert cap == pytest.approx(36, abs=0.5)
+
+    def test_reserve_wins_when_it_is_the_tighter_limit(self):
+        # 180s budget, reserve 160s → 20s left, tighter than the 36s share
+        cap = Deadline(180).phase_cap(0.2, reserve_s=160)
+        assert cap == pytest.approx(20, abs=0.5)
+
+    def test_cap_goes_negative_when_the_phase_cannot_run(self):
+        assert Deadline(40).phase_cap(0.2, reserve_s=47) < 0
+
+    def test_has_at_least(self):
+        assert Deadline(0).has_at_least(1e9)          # unlimited
+        assert Deadline(100).has_at_least(50)
+        d = Deadline(100); d._t0 -= 80
+        assert not d.has_at_least(50)
+
+
+class TestPhaseBudgets:
+    def test_planner_cannot_outlive_its_slice(self, router):
+        """The 2026-07-10 regression: DeepSeek's own timeout is 120s of a 180s
+        budget, so an 86.9s plan left the coder nothing. The request must now be
+        issued with a timeout no larger than PLAN_BUDGET_FRACTION of the budget."""
+        assert MODEL_CATALOG["deepseek"]["timeout"] == 120, "premise changed"
+        seen = []
+        verifier = MagicMock()
+        verifier.quick_compile_check.return_value = {
+            "compile_success": True, "errors": [], "output": ""}
+        verifier.quick_run_check.return_value = {"run_success": True}
+
+        with patch("urllib.request.urlopen", side_effect=_instant_fireworks(seen)):
+            router.route(CUDA_SRC, [], max_iterations=1, verifier=verifier,
+                         kernel_name="test_plancap", max_seconds=180)
+
+        assert seen, "no request issued"
+        plan_timeout = seen[0][1]
+        expected = 180 * PLAN_BUDGET_FRACTION
+        assert plan_timeout <= expected + 1, (
+            f"planner got {plan_timeout}s; must be capped at ~{expected}s, "
+            f"not the model's own 120s")
+
+    def test_coder_gets_the_rest_minus_a_compile_reserve(self, router):
+        seen = []
+        verifier = MagicMock()
+        verifier.quick_compile_check.return_value = {
+            "compile_success": True, "errors": [], "output": ""}
+        verifier.quick_run_check.return_value = {"run_success": True}
+
+        with patch("urllib.request.urlopen", side_effect=_instant_fireworks(seen)):
+            router.route(CUDA_SRC, [], max_iterations=1, verifier=verifier,
+                         kernel_name="test_codecap", max_seconds=180)
+
+        # second request is the coder; it may not claim the compile reserve
+        assert len(seen) >= 2
+        code_timeout = seen[1][1]
+        assert code_timeout <= 180 - COMPILE_RESERVE_SECONDS + 1
+
+    def test_planner_is_skipped_when_it_would_starve_the_coder(self, router):
+        """A 40s budget cannot afford a plan at all. Skip it rather than spend the
+        clock finding out — and still produce a port."""
+        seen = []
+        verifier = MagicMock()
+        verifier.quick_compile_check.return_value = {
+            "compile_success": True, "errors": [], "output": ""}
+        verifier.quick_run_check.return_value = {"run_success": True}
+
+        with patch("urllib.request.urlopen", side_effect=_instant_fireworks(seen)):
+            result = router.route(CUDA_SRC, [], max_iterations=1, verifier=verifier,
+                                  kernel_name="test_planskip", max_seconds=40)
+
+        assert any("Planning SKIPPED" in c for c in result["changes"])
+        # the coder still ran, and no deepseek request was ever issued
+        assert result["ported_code"], "skipping the plan must not skip the port"
+        assert any("[kimi27]" in c for c in result["changes"])
+
+    def test_planner_timeout_is_not_reported_as_a_model_failure(self, router):
+        """A planner that overran its slice is a budget event, not a broken endpoint."""
+        def slow_plan(model_key, *a, **k):
+            if model_key == "deepseek":
+                return AgentResult(model_key, False, "", 0.0)   # what a capped timeout returns
+            return AgentResult(model_key, True, f"```cpp\n{HIP_OK}\n```", 0.5)
+
+        verifier = MagicMock()
+        verifier.quick_compile_check.return_value = {
+            "compile_success": True, "errors": [], "output": ""}
+        verifier.quick_run_check.return_value = {"run_success": True}
+
+        with patch.object(ModelRouter, '_call_model', side_effect=slow_plan):
+            result = router.route(CUDA_SRC, [], max_iterations=1, verifier=verifier,
+                                  kernel_name="test_planslow", max_seconds=180)
+
+        assert any("did not finish within its" in c for c in result["changes"])
+        assert not any("Planning FAILED" in c for c in result["changes"])
+        assert result["ported_code"], "the port must still happen without a plan"
+
+    def test_phase_cap_bounds_the_retry_too(self, router):
+        """kimi27 retries at 2x its timeout. Under a 30s cap the retry may not
+        turn 30s into 60s — that would spend the reserve the cap protects."""
+        router._deadline = Deadline(0)  # unlimited pipeline: isolate the phase cap
+        seen = []
+
+        def fake_urlopen(req, timeout=None):
+            seen.append(timeout)
+            raise urllib.error.URLError("timed out")
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            router._call_model("kimi27", "p", max_seconds=30)
+
+        assert seen, "no attempt made"
+        assert all(t <= 30.5 for t in seen), f"retry escaped the phase cap: {seen}"
+
+    def test_failed_glm_analyst_does_not_crash_the_route(self, router):
+        """Regression: glm_analysis was bound only inside `if glm_err.success:`,
+        yet the GLM-informed re-plan read it unconditionally. A failed analyst
+        call — the very case its "falling back to raw errors" branch exists for —
+        raised UnboundLocalError and took the whole run down."""
+        def side_effect(model_key, *a, **k):
+            if model_key == "kimi27":
+                return AgentResult(model_key, True, f"```cpp\n{HIP_OK}\n```", 0.5)
+            if model_key == "glm":
+                return AgentResult(model_key, False, "", 0.0)   # analyst call fails
+            return AgentResult(model_key, True, "plan", 0.5)
+
+        verifier = MagicMock()
+        verifier.quick_compile_check.return_value = {
+            "compile_success": False, "errors": ["error: undeclared identifier"],
+            "output": "", "error_context": []}
+
+        with patch.object(ModelRouter, '_call_model', side_effect=side_effect):
+            result = router.route(CUDA_SRC, [], max_iterations=2, verifier=verifier,
+                                  kernel_name="test_glmfail", max_seconds=0)
+
+        assert any("Error analyst call failed" in c for c in result["changes"])
+        assert result["iterations_used"] >= 1
+
+    def test_timeout_does_not_claim_a_compiling_attempt_when_none_compiled(self, router):
+        """T0.1: 'returning the best compiling attempt (iter 0)' was printed even
+        when no iteration ever compiled."""
+        def side_effect(model_key, *a, **k):
+            if model_key == "kimi27":
+                return AgentResult(model_key, True, f"```cpp\n{HIP_OK}\n```", 0.5)
+            return AgentResult(model_key, True, "plan", 0.5)
+
+        verifier = MagicMock()
+        verifier.quick_compile_check.return_value = {
+            "compile_success": False, "errors": ["e"], "output": "", "error_context": []}
+
+        calls = {"n": 0}
+
+        def fake_exhausted(self):
+            calls["n"] += 1
+            return calls["n"] > 1     # survive iteration 1's check, die at iteration 2's
+
+        with patch.object(ModelRouter, '_call_model', side_effect=side_effect), \
+             patch.object(Deadline, 'exhausted', fake_exhausted):
+            result = router.route(CUDA_SRC, [], max_iterations=5, verifier=verifier,
+                                  kernel_name="test_nocompile")
+
+        assert result["timed_out"] is True
+        assert result["compile_passed"] is False
+        budget_lines = [c for c in result["changes"] if c.startswith("[budget] Wall-clock limit")
+                        and "reached" in c]
+        assert budget_lines, "no timeout line emitted"
+        assert not any("best compiling attempt" in c for c in budget_lines), \
+            "claimed a compiling attempt when nothing compiled"
+        assert any("nothing compiled" in c for c in budget_lines)
+
+    def test_checklist_version_is_not_double_prefixed(self, router):
+        """`[prompt-v{version_id}]` rendered as `[prompt-vv2]`, and read as though
+        it were router.PROMPT_VERSION. It is the PromptOptimizer's checklist."""
+        def side_effect(model_key, *a, **k):
+            if model_key == "kimi27":
+                return AgentResult(model_key, True, f"```cpp\n{HIP_OK}\n```", 0.5)
+            return AgentResult(model_key, True, '{"fixes": []}', 0.5)
+
+        verifier = MagicMock()
+        verifier.quick_compile_check.return_value = {
+            "compile_success": False, "errors": ["e"], "output": "", "error_context": []}
+
+        with patch.object(ModelRouter, '_call_model', side_effect=side_effect):
+            result = router.route(CUDA_SRC, [], max_iterations=2, verifier=verifier,
+                                  kernel_name="test_checklist", max_seconds=0)
+
+        joined = "\n".join(result["changes"])
+        assert "-vv" not in joined, "doubled version prefix"
+        assert "[checklist v" in joined
+
+    def test_iteration_is_not_entered_without_room_for_compile_and_a_call(self, router):
+        """Entering an iteration costs an uninterruptible hipcc run. With less than
+        COMPILE_RESERVE + MIN_LLM on the clock, that compile buys errors nobody
+        will act on."""
+        floor = COMPILE_RESERVE_SECONDS + MIN_LLM_TIMEOUT_SECONDS
+
+        def side_effect(model_key, *a, **k):
+            if model_key == "kimi27":
+                return AgentResult(model_key, True, f"```cpp\n{HIP_OK}\n```", 0.5)
+            return AgentResult(model_key, True, "plan", 0.5)
+
+        verifier = MagicMock()
+        verifier.quick_compile_check.return_value = {
+            "compile_success": False, "errors": ["e"], "output": ""}
+
+        calls = {"n": 0}
+        real_has = Deadline.has_at_least
+
+        def fake_has(self, seconds):
+            # plenty of budget until the loop asks for a full iteration's worth
+            if seconds == floor:
+                calls["n"] += 1
+                return False
+            return real_has(self, seconds)
+
+        with patch.object(ModelRouter, '_call_model', side_effect=side_effect), \
+             patch.object(Deadline, 'has_at_least', fake_has):
+            result = router.route(CUDA_SRC, [], max_iterations=10, verifier=verifier,
+                                  kernel_name="test_floor", max_seconds=180)
+
+        assert calls["n"] >= 1, "iteration floor was never consulted"
+        assert result["timed_out"] is True
+        assert result["iterations_used"] == 0
 
 
 # ── P0: route() honours the wall-clock budget ────────────────────────────
@@ -461,11 +1029,22 @@ class TestBannerSingleSource:
         assert buf.getvalue().count(main.BANNER_TEXT) == 1
 
     def test_silent_pipeline_emits_no_banner(self):
-        """The duplicate Display() also dropped silent=silent."""
+        """The duplicate Display() also dropped silent=silent.
+
+        run_daemon() is the only caller that passes silent=True, so this is the
+        path the regression actually broke: a banner on every daemon start.
+        """
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            main.KernelOlympics(silent=True)
+            main.KernelOlympics(fresh=False, silent=True)  # exactly what run_daemon() does
         assert buf.getvalue().count(main.BANNER_TEXT) == 0
+
+    def test_run_daemon_still_requests_silence(self):
+        """Pins the caller, not just the callee: if run_daemon() ever stops
+        passing silent=True, the test above silently stops protecting anything."""
+        src = Path(main.__file__).read_text(encoding="utf-8")
+        daemon_body = src.split("def run_daemon(", 1)[1]
+        assert "KernelOlympics(fresh=fresh, silent=True)" in daemon_body
 
 
 # ── P2: prompt versioning ────────────────────────────────────────────────
