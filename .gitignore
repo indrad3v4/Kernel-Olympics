@@ -1,6 +1,11 @@
 # Build artifacts
 ported_kernels/
-data/
+# `data/*`, not `data/` — git cannot re-include a file whose parent directory is
+# excluded, and data/prompt_changelog.json is a tracked deliverable (see
+# prompts/CHANGELOG.md). Ignoring the contents instead of the directory lets the
+# negation below work.
+data/*
+!data/prompt_changelog.json
 pattern_memory.db
 __pycache__/
 *.pyc
@@ -12,6 +17,10 @@ __pycache__/
 !sample_kernels/reference/*.json
 !sample_kernels/reference/*_output.txt
 !src/verification/specs/*.json
+!data/prompt_changelog.json
+
+# Runs (per-invocation reproducibility logs)
+runs/
 
 # Environment
 .env
