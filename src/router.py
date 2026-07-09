@@ -19,6 +19,8 @@ import urllib.request
 from typing import Dict, List, Optional, Callable
 from dataclasses import dataclass, field
 
+from prompt_evolution import prompt_opt, PromptOptimizer
+
 
 def _force_ipv4():
     """Monkey-patch socket to prefer IPv4 for HTTP connections.
@@ -546,24 +548,33 @@ class ModelRouter:
                                   feedback: str,
                                   patterns: List[Dict],
                                   deepseek_plan: str = "",
-                                  iteration: int = 1) -> str:
+                                  iteration: int = 1,
+                                  checklist_override: list[str] = None) -> str:
         """Build the Kimi refinement prompt for orchestration loop iterations.
 
         Kimi receives the original kernel, its previous output, and
         GLM evaluator's specific feedback to fix issues.
+
+        TRIZ #15 (Dynamics): checklist_override allows the PromptOptimizer to
+        inject an evolved checklist instead of the static fallback.
         """
+        # TRIZ #15: Use evolved checklist if provided, else fallback to static
+        checklist = checklist_override if checklist_override else [
+            "__shfl_xor_sync mask 0x1f → 0x3f for wavefront64",
+            "__shfl_down_sync masks → 0xffffffffffffffffULL (64-bit)",
+            "warpSize 32 → WAVEFRONT_SIZE 64 or dynamic",
+            "shared memory sized for warp 32 → WAVEFRONT_SIZE (64)",
+            "__syncwarp() → __syncthreads()",
+            "#define WAVEFRONT_SIZE 64 at top",
+            "Replace #include <cuda_runtime.h> → #include <hip/hip_runtime.h>",
+            "Remove #include <helper_cuda.h>, <helper_functions.h>, <device_launch_parameters.h>",
+            'Remove ALL #include "*.cuh" local headers',
+        ]
+
+        checklist_text = "\n".join(f"- {item}" for item in checklist)
         prompt = (
             f"Fix your ported HIP kernel based on evaluator feedback (iteration {iteration}).\n\n"
-            "CHECKLIST:\n"
-            "- __shfl_xor_sync mask 0x1f → 0x3f for wavefront64\n"
-            "- __shfl_down_sync masks → 0xffffffffffffffffULL (64-bit)\n"
-            "- warpSize 32 → WAVEFRONT_SIZE 64 or dynamic\n"
-            "- shared memory sized for warp 32 → WAVEFRONT_SIZE (64)\n"
-            "- __syncwarp() → __syncthreads()\n"
-            "- #define WAVEFRONT_SIZE 64 at top\n"
-            "- Replace #include <cuda_runtime.h> → #include <hip/hip_runtime.h>\n"
-            "- Remove #include <helper_cuda.h>, <helper_functions.h>, <device_launch_parameters.h>\n"
-            "- Remove ALL #include \"*.cuh\" local headers\n\n"
+            f"CHECKLIST:\n{checklist_text}\n\n"
         )
 
         if deepseek_plan:
@@ -713,6 +724,7 @@ class ModelRouter:
                 else:
                     compile_errs = cc.get("errors", [])
                     result["compile_errors"].extend(compile_errs)
+                    prev_error_count = len(compile_errs)  # TRIZ #23: baseline for prompt evolution
                     err_summary = "; ".join(compile_errs[:3]) if compile_errs else cc["compile_output"][:300]
                     result["changes"].append(f"[hipcc] In-loop compile FAILED: {err_summary[:120]}")
                     # Check if the code was truncated
@@ -747,6 +759,9 @@ class ModelRouter:
             return result
 
         # ── Phase 3: GLM EVALUATES → loop → Kimi refines → GLM re-evaluates ──
+        # TRIZ #15/#23: per-kernel prompt evolution — checklist adapts to compile errors
+        opt = PromptOptimizer()
+        prev_error_count = 0  # TRIZ #23: track error delta across iterations
         for iteration in range(1, max_iterations + 1):
             if not result["ported_code"]:
                 break
@@ -922,11 +937,15 @@ class ModelRouter:
             if iteration < max_iterations:
                 # Loop back: Kimi refines with GLM evaluator feedback
                 if on_phase: on_phase("refine", "Kimi K2.7", f"refining port with GLM feedback (iter {iteration}→{iteration+1})")
+                # TRIZ #15: Evolve prompt based on compile error patterns
+                evolved = opt.evolve_prompt(result.get("compile_errors", []))
+                result["changes"].append(f"[prompt-v{evolved.version_id}] Checklist evolved: {len(evolved.checklist)} items")
                 refine_prompt = self._build_kimi_refine_prompt(
                     kernel_source, result["ported_code"],
                     evaluator_feedback, patterns,
                     deepseek_plan=deepseek_plan_output,
                     iteration=iteration + 1,
+                    checklist_override=evolved.checklist,
                 )
                 refine = self._call_model(
                     "kimi27", refine_prompt,
@@ -961,6 +980,11 @@ class ModelRouter:
                                 + "\n".join(compile_err_lines)
                                 + f"\n\nPrevious static analysis feedback:\n{evaluator_feedback[:400]}"
                             )
+                            # TRIZ #23: Record iteration for prompt evolution
+                            opt.record_iteration(
+                                prev_error_count, len(compile_errs), opt.get_checklist()
+                            )
+                            prev_error_count = len(compile_errs)
 
                     result["changes"].append(
                         f"[kimi27] Refined with evaluator feedback "
@@ -972,6 +996,7 @@ class ModelRouter:
             # else: max iterations reached, accept current output
 
         result["compile_passed"] = compile_passed
+        result["prompt_versions"] = opt.get_stats()  # TRIZ #15/#23: prompt evolution summary
 
         # ── Phase 4: Gemma 4 final verification ──
         if result["ported_code"]:
