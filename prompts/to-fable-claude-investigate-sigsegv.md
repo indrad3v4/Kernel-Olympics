@@ -19,17 +19,29 @@ This fix is **new**. The first real run with it is below.
 
 ## The Crash
 
-### Full run log
+### Full run log (actual)
 ```
-Kernel:  sample_kernels/cuda/nvidia_shfl_scan.cu  (419 lines, coverage 99.8%)
-Patterns:  [high] L78: shfl_up_sync, [medium] L253+L280: warp_size_constant
-Pipeline:  DeepSeek (0.5s) → Kimi (145.8s) → hipcc (1.2s)
+╔═ Kernel Olympics ═══════════════════════════════╗
+║ 🔍 Scanning...                                             ║
+║  ✓ nvidia_shfl_scan.cu: coverage: 99.8%                    ║
+║ ● Scanning 1 files scanned                          0.0s   ║
+║ ⚠️ Classifying...                                         ║
+║  → nvidia_shfl_scan.cu: [medium] L253: warp_size_constant, ║
+║    [medium] L280: warp_size_constant, [high] L78: shfl_up_sync║
+║ ● Classifying RED: 1  YELLOW: 0  GREEN: 0              0.0s║
+║ 🧠 Memory Cache...                                         ║
+║ ● Memory Cache 0 cached patterns (first run)            0.0s║
+║ 🤖 Porting...                                              ║
+║ ● Porting  DeepSeek (plan) → Kimi (code) → GLM (eval) 0.0s║
+║  🧠 DeepSeek-v4-pro planning CUDA→HIP strategy             0.5s
+║  ⚡ Kimi K2.7 generating HIP port from plan          145.8s
+║  🔨 hipcc    in-loop compilation check              1.2s
+║  │  💥 RUNTIME CRASH: SIGSEGV — compiled code is not working code║
+║  🔨 hipcc    compile-first check (attempt 1/10)     1.6s
+║  🔬 GLM-5.2  semantic eval (attempt 1/10, compile passed) 43.9s
 ```
-```
-💥 RUNTIME CRASH: SIGSEGV — compiled code is not working code
-hipcc    compile-first check (attempt 1/10)     1.6s
-🔬 GLM-5.2  semantic eval (attempt 1/10, compile passed) 43.9s
-```
+
+**Iteration 1.** First plan, first code gen, first compile — passed. But binary SIGSEGV'd.
 
 ### What we know
 
@@ -48,6 +60,38 @@ The code **compiles** but **crashes**. This means:
 - All syntax, types, and API calls are valid HIP
 - The runtime behavior diverges from CUDA semantics on at least one code path
 - `hipcc` can't catch this — it's a semantic/runtime issue, not a syntactic one
+
+## Repo
+
+**Everything you need is in one repo:**
+https://github.com/indrad3v4/Kernel-Olympics
+
+Clone it. Read the code. There are no secrets — every system prompt, every regex, every harness template is there. The `ported_kernels/nvidia_shfl_scan.hip.cpp` file (July 8 version, PRE-PR8) still shows `__shfl_up_sync(mask, value, i, width)` with 4 args and the mask — confirm the PR #8 post-processor now strips those correctly and independently verify the crash is NOT from that code path.
+
+### Critical contradiction to resolve first
+
+The CUDA kernel uses `warpSize` as a **device-side built-in variable** — on NVIDIA it's always 32, on AMD it's the wavefront size (64 on MI300X). The host code hardcodes `32` in two places:
+
+| What | CUDA (32-lane warp) | AMD (64-lane wavefront) |
+|------|--------------------|------------------------|
+| Device: `lane_id = id % warpSize` | `% 32` → 0-31 | `% 64` → 0-63 |
+| Device: `warp_id = threadIdx.x / warpSize` | `/ 32` → 0-7 | `/ 64` → 0-3 |
+| Device: `for i=1..width` where width=32 | 6 steps (1,2,4,8,16,32) on 32 lanes | 6 steps on 64 lanes — only covers lanes 0-31 within each half-wavefront |
+| Host: `nWarps = blockSize / 32` | `256/32 = 8` warps | `256/32 = 8` (host calc unchanged) |
+| Host: `shmem_sz = nWarps * sizeof(int)` | 32 bytes, 8 ints | 32 bytes, 8 ints — but only 4 threads write to it |
+| Host: `shfl_scan_test<<<...>>>(d_data, 32, ...)` | width=32 = full warp | width=32 = half wavefront |
+
+**The contradiction:** On AMD, `warpSize = 64` (device constant) but `width = 32` (host parameter). The scan only covers 32 lanes per group, but lanes 32-63 exist and execute the scan separately. The `lane_id >= i` guard for i=32 means ALL lanes 32-63 add their `__shfl_up` result — but the shuffle with width=32 isolates them into a different group. The results are correct WITHIN each 32-lane group but the algorithm assumes groups are INDEPENDENT warps, not sub-groups of the same wavefront sharing the same warp_id.
+
+**First question for Fable to answer:** Is the SIGSEGV in the kernel (GPU-side, illegal memory access) or in the harness (host-side, null pointer / bad device pointer / uninitialized device)? If GPU-side, the most likely candidates are:
+1. `sums[warp_id]` collision — multiple threads with same warp_id write to the same shared memory location (race, but not crash)
+2. The `uniform_add` kernel reads `partial_sums[blockIdx.x]` where partial_sums was allocated by the PREVIOUS kernel and might have been freed or corrupted
+3. The shared memory allocation `shmem_sz` is 32 bytes, but the kernel uses 2× the expected storage due to wavefront64 splitting
+
+If host-side, check:
+1. `findCudaDevice` shim calls `hipSetDevice(0)` without `hipInit(0)` — no context
+2. `hipMalloc` moved after `hipSetDevice` — correct but device might not be ready
+3. The harness self-contained program wraps the CUDA-style `findCudaDevice(argc, argv)` call — the shim might not handle `argc=0` or other edge cases
 
 ## Investigation Framework (TRIZ-based)
 
