@@ -291,7 +291,8 @@ class KernelOlympics:
                     if orch_changes:
                         for ch in orch_changes[:5]:  # Show up to 5 orchestrator changes
                             print(f"║  🧠 {dim(ch[:70]):<64}║")
-                    tag = "✅ PASSED" if orch_passed else f"🔁 {iters}/{3} iterations"
+                    compile_ok = port_result.get("compile_passed", False)
+                    tag = "✅ PASSED" if orch_passed else (f"✅ COMPILED" if compile_ok else f"🔁 {iters}/10 iterations")
                     self.disp.file_done(Path(cr['file']).name, f"GLM-eval {tag} ({port_result.get('confidence', 0)}%, {llm_elapsed:.0f}s)", ok=orch_passed)
                     save_path = Path.cwd() / "ported_kernels" / (Path(cr["file"]).stem + ".hip.cpp")
                     print(f"║  📁 Ported kernel → {bold(str(save_path)):<47}║")

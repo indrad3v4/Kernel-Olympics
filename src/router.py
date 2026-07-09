@@ -627,7 +627,7 @@ class ModelRouter:
     # ── Main routing logic ──────────────────────────────────────
 
     def route(self, kernel_source: str, patterns: List[Dict],
-              max_iterations: int = 3,
+              max_iterations: int = 10,
               on_phase=None,
               verifier=None,
               kernel_name: str = "test_kernel") -> Dict:
@@ -639,13 +639,17 @@ class ModelRouter:
           1. GLM evaluator (static code analysis)
           2. hipcc compiler (real compilation errors) — if verifier is provided
 
+        TRIZ #20 (Continuation of useful action): iterate until compile passes
+        or max_iterations reached. GLM "pass" alone is NOT enough — hipcc must
+        also succeed. Compile errors override GLM feedback.
+
         When hipcc fails, compile errors are appended to the GLM feedback,
         giving Kimi both static AND compile-time feedback to fix.
 
         Args:
             kernel_source: The CUDA kernel source code.
             patterns: List of classifier-detected patterns.
-            max_iterations: Maximum Kimi→GLM cycles (default 3).
+            max_iterations: Maximum Kimi→GLM cycles (default 10).
             on_phase: Optional callback(phase: str, detail: str) for live progress.
             verifier: Optional VerificationAgent for in-loop hipcc compile checks.
             kernel_name: Name of kernel (for verifier build dir isolation).
@@ -664,7 +668,7 @@ class ModelRouter:
         result = {"ported_code": "", "confidence": 0,
                   "changes": [], "model_used": "", "cost": 0,
                   "orchestrator_passed": False, "iterations_used": 0,
-                  "compile_errors": []}
+                  "compile_errors": [], "compile_passed": False}
 
         # Track pipeline phase outcomes for rubric scoring
         planner_success = False
@@ -672,6 +676,7 @@ class ModelRouter:
         verify_success = False
         verify_passed = False
         evaluator_feedback = ""
+        compile_passed = False  # TRIZ #23: track compile state as feedback signal
         deepseek_plan_output = ""
 
         # ── Phase 1: DeepSeek PLANS the port (reasoning model — prose OK) ──
@@ -704,6 +709,7 @@ class ModelRouter:
                 cc = verifier.quick_compile_check(extracted, kernel_name=kernel_name)
                 if cc["compile_success"]:
                     result["changes"].append("[hipcc] In-loop compile: PASSED ✅")
+                    compile_passed = True
                 else:
                     compile_errs = cc.get("errors", [])
                     result["compile_errors"].extend(compile_errs)
@@ -883,10 +889,26 @@ class ModelRouter:
             if parsed.get("pass", False):
                 verify_success = True
                 verify_passed = True
-                result["orchestrator_passed"] = True
                 result["changes"].append(
                     f"[glm] Passed evaluation (iteration {iteration})")
-                break  # Converged — exit loop
+                # TRIZ #20/#23: Compile-gate — GLM pass alone is NOT enough.
+                # If hipcc hasn't compiled successfully, keep refining.
+                if compile_passed or not verifier:
+                    result["orchestrator_passed"] = True
+                    break  # Truly converged — both GLM + hipcc passed
+                else:
+                    result["changes"].append(
+                        f"[glm] GLM passed but hipcc NOT compiled — continuing (compile-gate)")
+                    # Force compile errors as feedback for next iteration
+                    evaluator_feedback = (
+                        "GLM static analysis PASSED, but hipcc compilation FAILED. "
+                        "The code has real compiler errors that must be fixed. "
+                        "Focus on:\n"
+                        "- Missing HIP API calls (cuda* not converted to hip*)\n"
+                        "- Undefined functions/macros (checkCudaErrors, etc.)\n"
+                        "- Type mismatches (hipError_t vs cudaError_t)\n"
+                        f"Compile errors:\n{'; '.join(result['compile_errors'][:5])}\n"
+                    )
 
             # Evaluation failed — extract feedback for refinement
             verify_success = True
@@ -924,6 +946,7 @@ class ModelRouter:
                                 f"[hipcc] Re-compile after refine {iteration+1}: PASSED ✅")
                             # Clear compile errors since they're fixed
                             result["compile_errors"] = []
+                            compile_passed = True
                         else:
                             compile_errs = cc.get("errors", [])
                             result["compile_errors"].extend(compile_errs)
@@ -947,6 +970,8 @@ class ModelRouter:
                         f"[kimi27] Refinement failed (iteration {iteration})")
                     break
             # else: max iterations reached, accept current output
+
+        result["compile_passed"] = compile_passed
 
         # ── Phase 4: Gemma 4 final verification ──
         if result["ported_code"]:
