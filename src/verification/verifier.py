@@ -896,25 +896,23 @@ class VerificationAgent:
             except (FileNotFoundError, subprocess.TimeoutExpired):
                 continue
 
-        # Second: try with shell=True (handles Jupyter's PATH)
-        try:
-            result = subprocess.run("hipcc --version", shell=True,
-                                    capture_output=True, text=True, timeout=5)
-            if result.returncode == 0:
-                self._hipcc_path = "hipcc"
-                return True
-        except subprocess.TimeoutExpired:
-            pass
-
-        # Third: search via shell PATH
-        try:
-            result = subprocess.run("command -v hipcc 2>/dev/null || which hipcc 2>/dev/null",
-                                    shell=True, capture_output=True, text=True, timeout=5)
-            if result.stdout.strip():
-                self._hipcc_path = result.stdout.strip()
-                return True
-        except subprocess.TimeoutExpired:
-            pass
+        # Second: resolve through PATH without a shell.
+        # This replaces two shell=True probes ("hipcc --version" and
+        # "command -v hipcc || which hipcc"). The first was already subsumed by
+        # the bare "hipcc" entry in the loop above — /bin/sh resolves against the
+        # same inherited PATH — and the second is precisely what shutil.which does,
+        # minus the shell. Keeps the project's own list-form policy (see the
+        # "no shell=True to prevent injection" note in _compile).
+        found = shutil.which("hipcc")
+        if found:
+            try:
+                result = subprocess.run([found, "--version"],
+                                        capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    self._hipcc_path = found
+                    return True
+            except (FileNotFoundError, subprocess.TimeoutExpired):
+                pass
 
         # Fourth: glob search
         import glob
