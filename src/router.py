@@ -627,10 +627,19 @@ class ModelRouter:
         # site. See docs/fix-plan-self-contained-programs.md, Bug 2.
         if ('_verifier_helper_shims' not in code
                 and ModelRouter._is_self_contained(code)):
+            # The shim is injected BEFORE the code's first #include (so its
+            # symbols are declared before any use), which means it CANNOT
+            # rely on the program's own includes — it must bring everything
+            # it references. hipSetDevice lives in hip/hip_runtime.h; omitting
+            # it here made every self-contained port fail with 'use of
+            # undeclared identifier' at hipSetDevice's exact column (56),
+            # re-injected on every refine iteration — unfixable by the LLM
+            # loop because the corruption post-dates the model's output.
+            # (No #pragma once: this lands in the main file, not a header.)
             shim = (
                 '\n// _verifier_helper_shims — stand-ins for NVIDIA helper_cuda.h /\n'
                 '// helper_functions.h symbols (no HIP/ROCm equivalent ships).\n'
-                '#pragma once\n'
+                '#include <hip/hip_runtime.h>\n'
                 '#include <chrono>\n'
                 'struct StopWatchInterface { std::chrono::steady_clock::time_point start; double elapsed_ms = 0; };\n'
                 'static inline int findCudaDevice(int, const char **) { hipSetDevice(0); return 0; }\n'
@@ -729,7 +738,11 @@ class ModelRouter:
 
         # ── Warp size constant: 32 → 64 ────────────────────────────
         # Only replace standalone 32 in warp-size contexts, NOT array sizes
-        code = _tracked_sub(r'\bwarpSize\b', '64', code, 'warpSize→64')
+        # (?<!#define ) — a macro NAME must stay an identifier: Kimi
+        # plausibly emits '#define warpSize 64', and the unguarded
+        # substitution turned it into '#define 64 64' → hipcc 'macro name
+        # must be an identifier'. Uses in macro BODIES / code still convert.
+        code = _tracked_sub(r'(?<!#define )\bwarpSize\b', '64', code, 'warpSize→64')
         code = _tracked_sub(r'\bWARP_SIZE\b(?!\s*64)', 'WAVEFRONT_SIZE', code, 'WARP_SIZE→WAVEFRONT_SIZE')
 
         if return_changelog:
@@ -1361,7 +1374,8 @@ class ModelRouter:
                                          iteration: int,
                                          patterns: List[Dict],
                                          error_delta: int = 0,
-                                         stagnation_count: int = 0) -> str:
+                                         stagnation_count: int = 0,
+                                         error_context: List[str] = None) -> str:
         """Build GLM prompt for compile-error analysis (TRIZ #28).
 
         When hipcc fails, GLM analyzes the compile errors + code and tells
@@ -1371,8 +1385,23 @@ class ModelRouter:
         error_delta: prev - current (positive = improvement, negative = regression).
         stagnation_count: how many consecutive iterations without improvement.
         Both are derived from normalized error sets for stable tracking.
+
+        error_context: the exact source lines at each error location,
+        extracted deterministically by verifier.quick_compile_check(). This
+        prompt only shows GLM the first 3000 chars of the code, and the
+        honesty rule below forbids explaining errors it can't locate — so
+        without these snippets, any error past char 3000 is structurally
+        unanalyzable and GLM's output degrades to empty/priority-only fixes
+        (the "1 fixes, 0 includes, 0 APIs" plateau in the 2026-07-09 run).
         """
         err_text = "\n".join(compile_errors[:10])
+        ctx_text = ""
+        if error_context:
+            ctx_text = (
+                "\nSOURCE AT ERROR LOCATIONS (exact lines from the compiled file — "
+                "these count as 'found in the code' for the rule below):\n"
+                + "\n---\n".join(error_context[:6]) + "\n"
+            )
 
         regression_hint = ""
         if error_delta < 0:
@@ -1392,7 +1421,8 @@ class ModelRouter:
             f"You are a HIP/ROCm compile error analyst. Kimi generated code that fails to compile.\n"
             f"Analyze the compiler errors and tell Kimi EXACTLY what to fix.\n\n"
             f"COMPILER ERRORS (hipcc, iteration {iteration}):\n"
-            f"{err_text}\n\n"
+            f"{err_text}\n"
+            f"{ctx_text}\n"
             f"CURRENT CODE (first 3000 chars):\n"
             f"```hip\n{ported_code[:3000]}\n```\n\n"
             "Analyze each error and provide:\n"
@@ -1687,6 +1717,19 @@ class ModelRouter:
                 else:
                     compile_failed_this_iter = True
                     compile_errs = cc.get("errors", [])
+                    # TRIZ #24 (hidden resource): the exact source lines at each
+                    # error location, extracted deterministically from the file
+                    # hipcc actually compiled. Without this, every agent reasons
+                    # from error STRINGS alone — the 2026-07-09 run burned 6
+                    # iterations on errors living in post-processor-injected
+                    # shim lines nobody ever looked at.
+                    err_ctx_block = ""
+                    if cc.get("error_context"):
+                        err_ctx_block = (
+                            "\nSOURCE AT ERROR LOCATIONS (exact lines from the file hipcc compiled — "
+                            "fix THESE lines, do not guess):\n"
+                            + "\n---\n".join(cc["error_context"][:6]) + "\n"
+                        )
                     # Bug 5: computed deterministically from line numbers in verifier.py
                     # (_classify_error_origin), not guessed by an LLM — an error whose line
                     # falls outside the ported kernel's spliced range in the harness is one
@@ -1980,6 +2023,7 @@ class ModelRouter:
                     evaluator_feedback = (
                         feedback_intro
                         + structured_errs
+                        + err_ctx_block
                         + "\n\nFocus on:\n"
                         "- Missing HIP API calls (cuda* not converted to hip*)\n"
                         "- Undefined functions/macros (checkCudaErrors, etc.)\n"
@@ -2019,7 +2063,8 @@ class ModelRouter:
                         print(f"║  │  🔍 GLM analyzing {len(compile_errs)} compile errors for Kimi{'':<30}║")
                         glm_err_prompt = self._build_glm_error_analysis_prompt(
                             result["ported_code"], compile_errs, iteration, patterns,
-                            error_delta=error_delta, stagnation_count=stagnation_count)
+                            error_delta=error_delta, stagnation_count=stagnation_count,
+                            error_context=cc.get("error_context"))
                         glm_err = self._call_model(
                             "glm", glm_err_prompt,
                             system_prompt="You are a HIP/ROCm compile error analyst. Respond ONLY with JSON.",
