@@ -407,7 +407,7 @@ class TestFixPortedCodeHelperShims:
         assert "static inline void sdkCreateTimer" in fixed
 
     def test_no_shim_when_helper_symbols_absent(self, router):
-        code = "#include <hip/hip_runtime.h>\nint main() { return 0; }\n"
+        code = "#include <hip/hip_runtime.h>\n__global__ void kernel() { return; }\n"
         fixed = router._fix_ported_code(code)
         assert "StopWatchInterface" not in fixed
 

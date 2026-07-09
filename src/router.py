@@ -625,14 +625,12 @@ class ModelRouter:
         # vary (assigned to a variable, passed a pointer-to-pointer, etc.) —
         # define tiny compatible stand-ins instead of guessing every call
         # site. See docs/fix-plan-self-contained-programs.md, Bug 2.
-        _HELPER_SYMBOLS = ('findCudaDevice', 'sdkCreateTimer', 'sdkStartTimer',
-                            'sdkStopTimer', 'sdkGetTimerValue', 'sdkDeleteTimer',
-                            'StopWatchInterface', 'getLastCudaError')
-        if (any(re.search(r'\b' + sym + r'\b', code) for sym in _HELPER_SYMBOLS)
-                and '_verifier_helper_shims' not in code):
+        if ('_verifier_helper_shims' not in code
+                and ModelRouter._is_self_contained(code)):
             shim = (
                 '\n// _verifier_helper_shims — stand-ins for NVIDIA helper_cuda.h /\n'
                 '// helper_functions.h symbols (no HIP/ROCm equivalent ships).\n'
+                '#pragma once\n'
                 '#include <chrono>\n'
                 'struct StopWatchInterface { std::chrono::steady_clock::time_point start; double elapsed_ms = 0; };\n'
                 'static inline int findCudaDevice(int, const char **) { hipSetDevice(0); return 0; }\n'
@@ -648,7 +646,7 @@ class ModelRouter:
             )
             include_lines = list(re.finditer(r'#include\s+[<"].*?[>"]\n', code))
             if include_lines:
-                insert_pos = include_lines[-1].end()
+                insert_pos = include_lines[0].start()
                 code = code[:insert_pos] + shim + code[insert_pos:]
             else:
                 code = shim + code
@@ -1626,6 +1624,7 @@ class ModelRouter:
         error_history = []  # TRIZ #17: cap error context to last 2 iterations
         norm_error_history = []  # A5: track normalized error frozensets for cycle detection
         replan_count = 0  # Bug 7: how many stagnation re-plans we've already used
+        kimi_plateau_count = 0  # C1: count consecutive iterations with same error set after Kimi refine
         for iteration in range(1, max_iterations + 1):
             if not result["ported_code"]:
                 break
