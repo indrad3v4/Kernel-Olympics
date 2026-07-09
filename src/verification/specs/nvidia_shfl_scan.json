@@ -1,0 +1,47 @@
+{
+  "kernel_name": "nvidia_shfl_scan",
+  "kernel_function": "shfl_scan_test",
+  "description": "Auto-generated spec for nvidia_shfl_scan",
+  "params": [
+    {
+      "name": "data",
+      "type": "int*",
+      "direction": "in",
+      "size_expr": "count"
+    },
+    {
+      "name": "width",
+      "type": "int",
+      "direction": "scalar",
+      "size_expr": "count"
+    },
+    {
+      "name": "partial_sums",
+      "type": "int*",
+      "direction": "in",
+      "size_expr": "count"
+    }
+  ],
+  "launch": {
+    "grid": {
+      "x": 4,
+      "y": 1,
+      "z": 1
+    },
+    "block": {
+      "x": 64,
+      "y": 1,
+      "z": 1
+    }
+  },
+  "input_setup": {
+    "count": 512,
+    "default_value": 1.0
+  },
+  "output_readback": {
+    "count": 4,
+    "element_type": "float",
+    "format": "float_per_line"
+  },
+  "self_contained": true
+}

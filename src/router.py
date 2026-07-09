@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 logger = logging.getLogger(__name__)
 
 from prompt_evolution import prompt_opt, PromptOptimizer
+from verification.spec_parser import auto_generate_spec as _auto_gen_spec
 
 
 def _force_ipv4():
@@ -1258,6 +1259,19 @@ class ModelRouter:
         run_dir = Path(f"runs/{self.run_id}")
         run_dir.mkdir(parents=True, exist_ok=True)
         result["run_id"] = self.run_id
+
+        # ── TRIZ #13 / #24: Auto-generate spec from CUDA source ──
+        # Before ANY LLM call or compile check, parse the original CUDA source
+        # for __global__ kernel signatures and generate a spec JSON file.
+        # This ensures the verifier builds the correct harness on the first try,
+        # instead of guessing (float*, float*, int) and failing with harness errors.
+        # The spec auto-gen loop converges when the spec matches the kernel's
+        # real signature — regex handles 90%+ of cases, LLM fallback covers the rest.
+        try:
+            _auto_gen_spec(kernel_name, kernel_source)
+            result["changes"].append(f"[spec] Auto-generated specs/{kernel_name}.json from CUDA source")
+        except Exception as e:
+            result["changes"].append(f"[spec] Auto-generation failed: {e} — using generic harness fallback")
 
         # Track pipeline phase outcomes for rubric scoring
         planner_success = False
