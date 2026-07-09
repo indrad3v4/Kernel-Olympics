@@ -1165,7 +1165,9 @@ class ModelRouter:
                                   patterns: List[Dict],
                                   deepseek_plan: str = "",
                                   iteration: int = 1,
-                                  checklist_override: list[str] = None) -> str:
+                                  checklist_override: list[str] = None,
+                                  stagnation_count: int = 0,
+                                  regex_changelog: Optional[List[str]] = None) -> str:
         """Build the Kimi refinement prompt for orchestration loop iterations.
 
         Kimi receives the original kernel, its previous output, and
@@ -1173,6 +1175,10 @@ class ModelRouter:
 
         TRIZ #15 (Dynamics): checklist_override allows the PromptOptimizer to
         inject an evolved checklist instead of the static fallback.
+
+        A2A v2 Channels:
+          Channel 1 (regex_changelog): deterministic fixes already applied.
+          Channel 3 (stagnation): iteration memory — how many failures so far.
         """
         # TRIZ #15: Use evolved checklist if provided, else fallback to static
         checklist = checklist_override if checklist_override else [
@@ -1229,6 +1235,24 @@ class ModelRouter:
         prompt += (
             f"Original CUDA:\n```cuda\n{source_for_prompt}```\n\n"
             f"Your previous output:\n```hip\n{previous_for_prompt}```\n\n"
+        )
+        # ── A2A v2 Channel 3: Iteration memory ──
+        if stagnation_count >= 1:
+            prompt += (
+                f"\n⚠️ ITERATION MEMORY: This is iteration {iteration}. "
+                f"There have been {stagnation_count} consecutive iterations without "
+                f"compile improvement (stagnation threshold: 3).\n"
+                "Your previous output(s) produced the SAME compiler errors. "
+                "Do NOT output the same code again. Try a completely different "
+                "approach — different API calls, different structure, different headers.\n\n"
+            )
+        # ── A2A v2 Channel 1: Deterministic fixes already applied ──
+        if regex_changelog:
+            changelog_text = "\n".join(f"  ✅ {c}" for c in regex_changelog[:10])
+            prompt += (
+                f"\nAUTO-FIXED ITEMS (already applied — do NOT redo):\n{changelog_text}\n\n"
+            )
+        prompt += (
             "Respond with JSON: {\"ported_code\": str, \"confidence\": 0-100, "
             "\"changes\": [str], \"explanation\": str}."
         )
@@ -1374,7 +1398,11 @@ class ModelRouter:
             "Analyze each error and provide:\n"
             "1. Root cause for each error (not just the error message)\n"
             "2. The EXACT fix needed (specific API name, include, or type)\n"
-            "3. Priority order (fix headers first, then types, then logic)\n\n"
+            "3. Priority order (fix headers first, then types, then logic)\n"
+            "4. CONFIDENCE (0-10) in each fix — how sure are you this will compile?\n"
+            "   High confidence (8-10): certain the exact fix is correct\n"
+            "   Medium (4-7): likely correct but may need adjustment\n"
+            "   Low (1-3): speculative or unsure\n\n"
             "Common CUDA→HIP issues:\n"
             "- cuda_runtime.h → hip/hip_runtime.h (causes ALL cuda* functions to be undefined)\n"
             "- cudaMalloc → hipMalloc, cudaMemcpy → hipMemcpy, cudaFree → hipFree\n"
@@ -1389,7 +1417,7 @@ class ModelRouter:
             "\"NOT FOUND IN PROVIDED CODE\" and exact_fix to \"unknown\" instead of guessing.\n\n"
             f"{regression_hint}"
             'Respond with JSON: {"fixes": [{"error": str, "root_cause": str, '
-            '"exact_fix": str, "priority": int}], "summary": str, '
+            '"exact_fix": str, "priority": int, "confidence": int(0-10)}], "summary": str, '
             '"missing_includes": [str], "wrong_apis": [{"cuda": str, "hip": str}]}.'
         )
         return prompt
@@ -1745,6 +1773,76 @@ class ModelRouter:
                             f"(stagnation_count={stagnation_count})")
                         print(f"║  │  🔁 CYCLE: same errors recurred — stagnation escalated{'':<27}║")
                     norm_error_history.append(current_norm_frozen)
+
+                    # ── C1: Kimi plateau detection ──
+                    # Same normalized error set for 2+ consecutive iterations means
+                    # Kimi changed the code but produced identical errors. Switch
+                    # to shim-injection mode (extern int declarations).
+                    prev_norm_frozen = norm_error_history[-2] if len(norm_error_history) >= 2 else None
+                    if prev_norm_frozen is not None and current_norm_frozen == prev_norm_frozen:
+                        kimi_plateau_count += 1
+                        result["changes"].append(
+                            f"[kimi-plateau] Same error set persists after Kimi refine "
+                            f"(kimi_plateau_count={kimi_plateau_count})")
+                        print(f"║  │  🗻 KIMI PLATEAU: same errors after refine "
+                              f"(count={kimi_plateau_count}){'':<26}║")
+
+                        if kimi_plateau_count >= 2:
+                            # Extract undeclared identifier names from error messages
+                            undeclared_ids = set()
+                            for err in compile_errs:
+                                matches = re.findall(
+                                    r"error: use of undeclared identifier ['\"](\w+)['\"]",
+                                    err)
+                                undeclared_ids.update(matches)
+
+                            if undeclared_ids:
+                                # Inject extern int declarations at top of ported code
+                                shim_lines = "\n".join(
+                                    f"extern int {name};" for name in sorted(undeclared_ids))
+                                result["ported_code"] = shim_lines + "\n" + result["ported_code"]
+                                result["changes"].append(
+                                    f"[kimi-plateau] Injected extern int shims for "
+                                    f"{len(undeclared_ids)} undeclared identifiers: "
+                                    f"{', '.join(sorted(undeclared_ids))}")
+                                print(f"║  │  💉 SHIM INJECTION: extern int for "
+                                      f"{len(undeclared_ids)} undeclared IDs{'':<27}║")
+
+                                # Re-compile one more time (no more Kimi)
+                                if verifier and hasattr(verifier, 'quick_compile_check'):
+                                    cc_retry = verifier.quick_compile_check(
+                                        result["ported_code"], kernel_name=kernel_name)
+                                    if cc_retry.get("compile_success", False):
+                                        result["compile_errors"] = []
+                                        compile_passed = True
+                                        result["changes"].append(
+                                            f"[kimi-plateau] Shim injection fixed it "
+                                            f"— compile PASSED ✅")
+                                        print(f"║  │  ✅ SHIM FIX: compile passed after "
+                                              f"extern int injection{'':<16}║")
+                                        break
+                                    else:
+                                        result["changes"].append(
+                                            f"[kimi-plateau] Shim injection did NOT fix "
+                                            f"compile — aborting")
+                                        print(f"║  │  ❌ SHIM FAILED: extern int injection "
+                                              f"didn't fix — aborting{'':<10}║")
+                                        result["iterations_used"] = iteration
+                                        result["abort_reason"] = "kimi_plateau"
+                                        break
+                            else:
+                                # No undeclared identifiers found — just abort
+                                result["changes"].append(
+                                    f"[kimi-plateau] No undeclared identifiers "
+                                    f"to shim — aborting")
+                                print(f"║  │  ❌ KIMI PLATEAU: no undeclared IDs "
+                                      f"to shim — aborting{'':<13}║")
+                                result["iterations_used"] = iteration
+                                result["abort_reason"] = "kimi_plateau"
+                                break
+                    else:
+                        # Error set changed after Kimi refine — reset plateau counter
+                        kimi_plateau_count = 0
 
                     # ── Bug 5, trigger 2 / Bug 7: hard stagnation abort ──
                     # If we already spent our one re-plan attempt on a fresh strategy and
@@ -2138,6 +2236,8 @@ class ModelRouter:
                     deepseek_plan=deepseek_plan_output,
                     iteration=iteration + 1,
                     checklist_override=evolved.checklist,
+                    stagnation_count=stagnation_count,
+                    regex_changelog=result.get("regex_changelog"),
                 )
                 refine = self._call_model(
                     "kimi27", refine_prompt,
