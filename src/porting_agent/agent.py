@@ -531,6 +531,7 @@ CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explan
         ballot_re = re.compile(r'__ballot_sync\(0xffffffff')
         shfl_xor_re = re.compile(r'__shfl_xor_sync\s*\(')
         threadidx_32_re = re.compile(r'(threadIdx\.[xy]\s*\*\s*)32(\b)')
+        threadidx_mod32_re = re.compile(r'(threadIdx\.[xy]\s*%\s*)32(\b)')
         define_tile_re = re.compile(r'#define\s+TILE_SIZE\s+32\b')
         warp_mask_re = re.compile(r'(?:const\s+)?int\s+WARP_MASK\s*=\s*0x1[fF]\b')
         tid_warp_mask_re = re.compile(r'(tid\s*&\s*)0x1[fF](\s*\)?\s*==\s*0\b)')
