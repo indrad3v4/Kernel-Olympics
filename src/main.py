@@ -332,7 +332,15 @@ class KernelOlympics:
                         for ch in orch_changes[-5:]:
                             print(f"║  🧠 {dim(ch[:70]):<64}║")
                     compile_ok = port_result.get("compile_passed", False)
-                    tag = "✅ PASSED" if orch_passed else (f"✅ COMPILED" if compile_ok else f"🔁 {iters}/10 iterations")
+                    # T0.1: the porting phase runs an in-loop compile of the bare
+                    # kernel — it is NOT the authoritative verdict. The verifier
+                    # (next phase) compiles + runs + diffs and owns the real
+                    # PASSED/FAILED. So this line must never claim a bare
+                    # "COMPILED"; it reports in-loop progress only. One source of
+                    # truth for the verdict = the Verifying phase below.
+                    tag = ("⏳ orchestrator ok, verifying" if orch_passed
+                           else ("⏳ compiles in-loop, verifying" if compile_ok
+                                 else f"🔁 {iters}/{port_result.get('max_iterations', 10)} iterations"))
                     self.disp.file_done(Path(cr['file']).name, f"GLM-eval {tag} ({port_result.get('confidence', 0)}%, {llm_elapsed:.0f}s)", ok=orch_passed)
                     save_path = Path.cwd() / "ported_kernels" / (Path(cr["file"]).stem + ".hip.cpp")
                     print(f"║  📁 Ported kernel → {bold(str(save_path)):<47}║")
