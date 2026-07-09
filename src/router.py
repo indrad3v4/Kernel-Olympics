@@ -80,9 +80,10 @@ MODEL_CATALOG = {
         "temperature": 0.0,      # deterministic evaluation
     },
     "gemma4": {
-        "id": "accounts/fireworks/models/gemma-4-31b-it",  # Real Gemma on AMD GPU via vLLM
-        "role": "verifier",         # local AMD GPU verification (Gemma Prize)
-        "strength": "AMD-native verification via local vLLM on MI300X",
+        "id": "accounts/fireworks/models/gemma-4-31b-it",  # Fireworks hosted
+        "local_id": "gemma-4-31b-it",  # Model name when served via local vLLM
+        "role": "verifier",          # final verification
+        "strength": "Verification — local vLLM on MI300X if available, else Fireworks",
         "cost_per_1k": 0.0,
         "local_first": True,     # Try localhost:8000 first, then Fireworks
         "max_tokens": 1024,
@@ -907,9 +908,9 @@ class ModelRouter:
                     break
             # else: max iterations reached, accept current output
 
-        # ── Phase 4: Gemma 4 final verification (local AMD GPU via vLLM) ──
+        # ── Phase 4: Gemma 4 final verification ──
         if result["ported_code"]:
-            if on_phase: on_phase("verify", "Gemma 4", "final verification (local AMD GPU)")
+            if on_phase: on_phase("verify", "Gemma 4", "final verification")
             gemma_prompt = self._build_glm_evaluate_prompt(
                 result["ported_code"], patterns
             )
@@ -918,27 +919,31 @@ class ModelRouter:
             if verify.success:
                 verify_success = verify_success or True
                 result["model_used"] = "gemma4"
+                # Report which endpoint actually served the call
+                last_call = self.call_log[-1] if self.call_log else {}
+                verify_source = last_call.get("source", "fireworks")
+                source_label = "local vLLM (AMD GPU)" if "local" in verify_source else "Fireworks API"
                 try:
                     parsed = json.loads(verify.output)
                     if parsed.get("pass", False):
                         verify_passed = verify_passed or True
                         result["changes"].append(
-                            "[gemma4] Verified -- no issues found (local AMD GPU)")
+                            f"[gemma4] Verified — no issues found ({source_label})")
                     else:
                         issues = parsed.get("issues", [])
                         result["changes"].append(
-                            f"[gemma4] Issues found: {'; '.join(issues[:3])}")
+                            f"[gemma4] Issues found ({source_label}): {'; '.join(issues[:3])}")
                 except (json.JSONDecodeError, TypeError):
                     if "PASS" in verify.output.upper()[:10]:
                         verify_passed = verify_passed or True
                         result["changes"].append(
-                            "[gemma4] Verified -- no issues found (local AMD GPU)")
+                            f"[gemma4] Verified — no issues found ({source_label})")
                     else:
                         result["changes"].append(
-                            f"[gemma4] Issues found: {verify.output[:200]}")
+                            f"[gemma4] Issues found ({source_label}): {verify.output[:200]}")
             else:
                 result["changes"].append(
-                    "[gemma4] Local AMD GPU unavailable")
+                    "[gemma4] Verification unavailable (local vLLM + Fireworks both failed)")
 
         # Rubric-based scoring
         result["confidence"] = self._rubric_score_pipeline(
@@ -976,10 +981,11 @@ class ModelRouter:
                 messages.append({"role": "user", "content": prompt})
 
                 if endpoint == "local":
+                    local_model = model_info.get("local_id", model_id)
                     data_bytes = json.dumps({
-                        "model": model_id,
+                        "model": local_model,
                         "messages": messages,
-                        "max_tokens": 512,
+                        "max_tokens": model_info.get("max_tokens", 512),
                     }).encode()
                     req = urllib.request.Request(
                         "http://localhost:8000/v1/chat/completions",
