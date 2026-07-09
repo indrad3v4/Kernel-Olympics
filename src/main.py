@@ -289,7 +289,9 @@ class KernelOlympics:
                     orch_passed = port_result.get("orchestrator_passed", False)
                     orch_changes = [c for c in port_result.get("changes", []) if "[deepseek]" in c or "[glm]" in c or "[kimi27]" in c or "[hipcc]" in c or "orchestrator" in str(c).lower()]
                     if orch_changes:
-                        for ch in orch_changes[:5]:  # Show up to 5 orchestrator changes
+                        # Show the LAST 5 changes, not the first 5 — on a multi-iteration
+                        # run the final iteration's state is what matters, not iteration 1's.
+                        for ch in orch_changes[-5:]:
                             print(f"║  🧠 {dim(ch[:70]):<64}║")
                     compile_ok = port_result.get("compile_passed", False)
                     tag = "✅ PASSED" if orch_passed else (f"✅ COMPILED" if compile_ok else f"🔁 {iters}/10 iterations")
@@ -426,11 +428,20 @@ class KernelOlympics:
                 else:
                     reason = "Not compiled — saved for manual hipcc" if not ver_result.get("compile_success") else "Output mismatch"
                     self.disp.status("Verifying", f"{Path(cr['file']).name} {yellow(reason)}", ok=False)
-                    # Show compile errors or hipcc status
+                    # Show compile errors or hipcc status.
+                    # verifier._compile() already strips the temp build-dir prefix from
+                    # every line, so a naive line[:N] truncation no longer eats the
+                    # path instead of the message — but prioritize actual "error:"
+                    # lines over the first 3 raw lines (which used to be path/caret noise).
                     compile_output = ver_result.get("compile_output", "")
                     if compile_output and "hipcc not found" not in compile_output:
-                        for line in compile_output.strip().splitlines()[:3]:
+                        all_lines = compile_output.strip().splitlines()
+                        error_lines = [l for l in all_lines if "error:" in l] or all_lines
+                        for line in error_lines[:3]:
                             print(f"║  ⚠️  {red(line[:65]):<64}║")
+                        log_path = ver_result.get("compile_log_path", "")
+                        if log_path:
+                            print(f"║  ℹ️ Full compile log: {dim(log_path):<44}║")
                     if not ver_result.get("hipcc_available", True):
                         print(f"║  ⚠️  {'hipcc not found — export PATH=/opt/rocm-7.2.1/bin:$PATH':<64}║")
                     # TRIZ #23: Do NOT cache compile-failed code — it poisons future runs.
