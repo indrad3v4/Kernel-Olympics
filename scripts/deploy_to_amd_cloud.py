@@ -135,6 +135,64 @@ def run_pipeline():
     return True
 
 
+def detect_rocm_versions():
+    """Detect ROCm + HIP versions live; return parsed versions + raw transcripts.
+
+    Hardcoded version strings are a fabrication defect. This probe reads the real
+    values at runtime and attaches the raw command output to the proof record so
+    the claim cannot be falsified after the fact. If a command fails or its output
+    is unparseable, we record 'unknown' alongside the raw transcript — silence
+    about a failed probe is worse than admitting it failed.
+    """
+    import re
+
+    def capture(cmd):
+        try:
+            r = subprocess.run(
+                cmd, shell=True, capture_output=True, text=True, timeout=15
+            )
+            return r.returncode, r.stdout or "", r.stderr or ""
+        except subprocess.TimeoutExpired:
+            return -1, "", "<timeout after 15s>"
+        except Exception as e:
+            return -1, "", "<exception: {e}>"
+
+    # ROCm version probe
+    rc_smi, out_smi, err_smi = capture("rocm-smi")
+    smi_text = out_smi + "\n" + err_smi
+    rocm_version = "unknown"
+    m = re.search(r"ROCm\s+Version\s*[:=]?\s*([0-9]+(?:\.[0-9]+)*)", smi_text, re.IGNORECASE)
+    if m:
+        rocm_version = m.group(1)
+    else:
+        m = re.search(r"[Vv]ersion[:=\s]+([0-9]+\.[0-9]+(?:\.[0-9]+)?)", smi_text)
+        if m:
+            rocm_version = m.group(1)
+
+    # HIP version probe
+    rc_hip, out_hip, err_hip = capture("hipcc --version")
+    hip_text = out_hip + "\n" + err_hip
+    hipcc_version = "unknown"
+    m = re.search(r"HIP\s+Version\s*[:=]?\s*([0-9]+(?:\.[0-9]+)*)", hip_text, re.IGNORECASE)
+    if m:
+        hipcc_version = m.group(1)
+    else:
+        m = re.search(r"\b([0-9]+\.[0-9]+\.[0-9]+)\b", hip_text)
+        if m:
+            hipcc_version = m.group(1)
+
+    return {
+        "rocm_version": rocm_version,
+        "hipcc_version": hipcc_version,
+        "rocm_smi_returncode": rc_smi,
+        "rocm_smi_stdout": out_smi,
+        "rocm_smi_stderr": err_smi,
+        "hipcc_returncode": rc_hip,
+        "hipcc_stdout": out_hip,
+        "hipcc_stderr": err_hip,
+    }
+
+
 def verify_kernels():
     """Compile and run all ported kernels on AMD GPU hardware."""
     print("═" * 60)
@@ -191,10 +249,13 @@ def verify_kernels():
     print(f"\n{passed_count}/{len(results)} kernels verified on AMD GPU 🚀")
 
     # Save proof
+    environment = detect_rocm_versions()
     proof = {
         "verified_on": "AMD Developer Cloud (notebooks.amd.com)",
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "rocm_version": "7.2",
+        "rocm_version": environment["rocm_version"],
+        "hipcc_version": environment["hipcc_version"],
+        "environment": environment,
         "results": results,
         "summary": f"{passed_count}/{len(results)} passed"
     }
