@@ -433,15 +433,11 @@ class KernelOlympics:
                             print(f"║  ⚠️  {red(line[:65]):<64}║")
                     if not ver_result.get("hipcc_available", True):
                         print(f"║  ⚠️  {'hipcc not found — export PATH=/opt/rocm-7.2.1/bin:$PATH':<64}║")
-                    # Store pattern even on compile failure → enables cache hits
-                    self.memory.store(
-                        pattern_snippet=source[:500],
-                        verified_fix=port_result.get("ported_code", "")[:500],
-                        confidence=0.50,
-                        verification_run_id="compile_failed",
-                        llm_time_s=port_result.get("llm_time_s", 0.0),
-                        findings=cr.get("findings", [])
-                    )
+                    # TRIZ #23: Do NOT cache compile-failed code — it poisons future runs.
+                    # Old behavior stored broken code at confidence=0.50, which caused
+                    # cache hits to replay the same compile failure without LLM calls.
+                    # Now: only cache when compilation succeeds (verified code only).
+                    print(f"║  {'ℹ️ Cache skipped — compile failed, not caching broken fix':<64}║")
             else:
                 self.disp.file_done(Path(cr['file']).name, f"{cr.get('risk_level')} — no porting needed", ok=True)
 
