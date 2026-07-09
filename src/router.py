@@ -1889,10 +1889,55 @@ class ModelRouter:
                             # let hard-stagnation abort still fire if even the
                             # new strategy fails.
 
+                    # ── TRIZ #13 + #24: GLM → DeepSeek re-plan EVERY time GLM analyzes errors ──
+                    # Per user spec, the loop is:
+                    #   DeepSeek > Kimi > GLM > DeepSeek (refresh strategy) > Kimi
+                    # GLM's analysis is the corrective loop that closes the iterated
+                    # port. Without a fresh DeepSeek plan, Kimi keeps generating
+                    # code under the same broken strategy — the limit cycle we
+                    # saw in production runs.
+                    #
+                    # Trigger: compile failed AND GLM produced an analysis.
+                    #          (When compile passes, GLM does semantic eval which
+                    #          is NOT a "compile error analysis" — no re-plan needed;
+                    #          the working code is the goal.)
+                    # Cap:    replan_count budget = max_iterations//2 prevents
+                    #         infinite re-plan loops on improbable kernels.
+                    glm_analysis = None  # scope binding for this block
+                    if (compile_failed_this_iter
+                            and replan_count < max(max_iterations // 2, 1)
+                            and iteration < max_iterations
+                            and compile_errs):
+                        result["changes"].append(
+                            f"[orch] GLM→DeepSeek escalation: refresh strategy "
+                            f"with GLM error context (iter {iteration}, "
+                            f"replan {replan_count + 1}/{max(max_iterations // 2, 1)})."
+                        )
+                        print(f"║  │  🔄 GLM→DeepSeek: refresh strategy "
+                              f"({replan_count + 1}/{max(max_iterations // 2, 1)})"
+                              f"{'':<14}║")
+                        if on_phase: on_phase("plan", "DeepSeek-v4-pro",
+                            f"re-planning from GLM (iter {iteration})")
+                        replan_prompt = self._build_deepseek_replan_prompt(
+                            kernel_source, patterns, result["ported_code"],
+                            compile_errs, deepseek_plan_output,
+                        )
+                        re_plan = self._call_model(
+                            "deepseek", replan_prompt,
+                            system_prompt=SYSTEM_PROMPTS.get("deepseek", ""),
+                        )
+                        replan_count += 1
+                        if re_plan.success:
+                            deepseek_plan_output = re_plan.output
+                            result["changes"].append(
+                                f"[deepseek] Refreshed strategy from GLM "
+                                f"(iter {iteration}, replan_count={replan_count}, "
+                                f"plan chars={len(re_plan.output)})"
+                            )
+
                     # ── Bug 5, trigger 2 / Bug 7: hard stagnation abort ──
-                    # If we already spent our one re-plan attempt on a fresh strategy and
-                    # errors are STILL not decreasing, more iterations won't help.
-                    if stagnation_count >= 3 and replan_count >= 1:
+                    # After multiple re-plans failed to converge, more iterations won't help.
+                    if stagnation_count >= 3 and replan_count >= max(max_iterations // 2, 1):
                         result["changes"].append(
                             f"[hipcc] Hard stagnation: {stagnation_count} iterations with no "
                             f"improvement AFTER a fresh DeepSeek re-plan already failed to help. "
