@@ -679,13 +679,26 @@ class ModelRouter:
         if verify_success:
             score += 5
 
-        # ── Dimension 2: Code Quality (0-35) ──
+        # ── Dimension 2: Code Quality (0-35) — A9: outcome-based ──
         if has_ported_code and len(ported_code.strip()) > 50:
             score += 10
-            if "__global__" in ported_code or "__device__" in ported_code:
+            # A9: Score HIP API presence (not CUDA keywords)
+            hip_apis = ["hipMalloc", "hipFree", "hipMemcpy", "hipLaunchKernel",
+                        "hip/hip_runtime.h", "hipThreadIdx", "hipBlockIdx",
+                        "hipBlockDim", "hipStreamSynchronize"]
+            hip_count = sum(1 for api in hip_apis if api in ported_code)
+            if hip_count >= 3:
                 score += 15
-            if "threadIdx" in ported_code or "blockIdx" in ported_code or "blockDim" in ported_code:
+            elif hip_count >= 1:
+                score += 8
+            # A9: Penalize CUDA remnants (should be zero in a good port)
+            cuda_remnants = ["cudaMalloc", "cudaFree", "cudaMemcpy",
+                             "cuda_runtime.h", "cudaDeviceSynchronize"]
+            cuda_count = sum(1 for api in cuda_remnants if api in ported_code)
+            if cuda_count == 0:
                 score += 10
+            elif cuda_count <= 2:
+                score += 3  # partial — some remnants remaining
 
         # ── Dimension 3: Verification Outcome (0-30) ──
         if verify_passed:
@@ -700,7 +713,8 @@ class ModelRouter:
     def _rubric_score_response(output: str) -> float:
         """Rubric for individual model response quality (0.0-1.0).
 
-        Evaluates the structural quality of the response text.
+        A9: Scores HIP API presence and CUDA remnant absence instead of
+        rewarding CUDA keywords like __global__ and threadIdx.
         """
         if not output or len(output.strip()) == 0:
             return 0.0
@@ -708,13 +722,18 @@ class ModelRouter:
         import re
         if len(output) > 100:
             score += 0.1
-        if "__global__" in output or "void" in output:
+        # A9: Score HIP API presence (not CUDA keywords)
+        hip_apis = ["hipMalloc", "hipFree", "hipMemcpy", "hip/hip_runtime.h",
+                    "hipLaunchKernel", "__global__"]  # __global__ valid in HIP too
+        if any(api in output for api in hip_apis):
             score += 0.15
         if re.search(r'```(?:cuda|hip|cpp)?\n', output):
             score += 0.15
         if re.search(r'\{[^}]*\}', output, re.DOTALL):
             score += 0.15
-        if "threadIdx" in output or "blockIdx" in output:
+        # A9: Penalize CUDA remnants
+        cuda_remnants = ["cudaMalloc", "cudaFree", "cudaMemcpy", "cuda_runtime.h"]
+        if not any(api in output for api in cuda_remnants):
             score += 0.15
         return min(score, 1.0)
 

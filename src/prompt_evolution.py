@@ -244,9 +244,48 @@ class PromptOptimizer:
         self._error_history = []
         self._versions = {}
 
+    # ── A7: Cross-kernel persistence ──────────────────────────────────────────
+    def save(self, path: str = "data/prompt_optimizer.json") -> None:
+        """Persist scores + version state to disk for cross-kernel learning."""
+        import json, os
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            data = {
+                "version_counter": self._version_counter,
+                "current_version_id": self.current_version.version_id,
+                "current_checklist": self.current_version.checklist,
+                "item_scores": self._item_scores,
+                "error_history": self._error_history,
+                "versions": {
+                    vid: {"checklist": v.checklist}
+                    for vid, v in self._versions.items()
+                },
+            }
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2)
+        except OSError:
+            pass
+
+    def load(self, path: str = "data/prompt_optimizer.json") -> None:
+        """Load persisted scores from disk. Called at startup."""
+        import json, os
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            self._version_counter = data.get("version_counter", 1)
+            self._item_scores = data.get("item_scores", {})
+            self._error_history = data.get("error_history", [])
+            checklist = data.get("current_checklist", list(self.SEED_CHECKLIST))
+            self.current_version = PromptVersion(
+                data.get("current_version_id", "v1_seed"), checklist
+            )
+            for vid, vdata in data.get("versions", {}).items():
+                self._versions[vid] = PromptVersion(vid, vdata.get("checklist", []))
+        except (OSError, json.JSONDecodeError, KeyError):
+            pass
+
 
 # ── Module-level singleton ─────────────────────────────────────────────────────
-# Global optimizer instance — persists across loop iterations within a single
-# route() call.  Callers may also instantiate PromptOptimizer locally for
-# per-kernel isolation (as route() does).
+# Global optimizer instance — persists across kernels via save()/load().
 prompt_opt = PromptOptimizer()
+prompt_opt.load()  # A7: auto-load persisted scores at import time
