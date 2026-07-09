@@ -244,19 +244,24 @@ class KernelOlympics:
 
                     # Live progress: phase callback only (no spinner thread)
                     import threading
-                    _phase_state = {"phase": "starting", "model": "", "detail": "", "phase_t0": t0}
+                    _phase_state = {"phase": None, "model": "", "detail": "", "phase_t0": t0}
 
                     def _on_phase(phase, model, detail):
+                        # Close out previous phase with its duration
+                        if _phase_state["phase"] is not None:
+                            prev_dur = time.perf_counter() - _phase_state["phase_t0"]
+                            prev_icon = icons.get(_phase_state["phase"], "●")
+                            prev_model = _phase_state["model"]
+                            prev_detail = _phase_state["detail"]
+                            print(f"║  {prev_icon} {bold(prev_model):<16} {prev_detail:<38} {cyan(f'{prev_dur:.1f}s')}")
+                        # Record new phase start (no print yet — duration unknown)
                         _phase_state["phase_t0"] = time.perf_counter()
                         _phase_state["phase"] = phase
                         _phase_state["model"] = model
                         _phase_state["detail"] = detail
-                        elapsed = time.perf_counter() - t0
-                        icons = {"plan": "🧠", "code": "⚡", "evaluate": "🔬",
-                                 "refine": "🔁", "verify": "✅", "compile": "🔨"}
-                        icon = icons.get(phase, "●")
-                        # Print ONE clean line per phase change — no spinner thread
-                        print(f"║  {icon} {bold(model):<16} {detail:<38} {cyan(f'{elapsed:.1f}s')}")
+
+                    icons = {"plan": "🧠", "code": "⚡", "evaluate": "🔬",
+                             "refine": "🔁", "verify": "✅", "compile": "🔨"}
 
                     port_result = self.router.route(
                         source, cr.get("findings", []),
@@ -264,6 +269,14 @@ class KernelOlympics:
                         verifier=self.verifier,
                         kernel_name=Path(cr['file']).stem
                     )
+
+                    # Close out the LAST phase with its duration
+                    if _phase_state["phase"] is not None:
+                        last_dur = time.perf_counter() - _phase_state["phase_t0"]
+                        last_icon = icons.get(_phase_state["phase"], "●")
+                        last_model = _phase_state["model"]
+                        last_detail = _phase_state["detail"]
+                        print(f"║  {last_icon} {bold(last_model):<16} {last_detail:<38} {cyan(f'{last_dur:.1f}s')}")
 
                     llm_elapsed = time.perf_counter() - t0
                     pipeline_state["total_cost"] += port_result.get("cost", 0)
