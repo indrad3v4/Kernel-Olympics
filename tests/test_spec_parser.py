@@ -51,6 +51,18 @@ NO_GLOBAL = """
 int main() { printf("hello\\n"); return 0; }
 """
 
+INT_OUTPUT_KERNEL = """
+__global__ void copy_kernel(const int* in, int* out, int n) {
+    int idx = threadIdx.x;
+    if (idx < n) out[idx] = in[idx];
+}
+"""
+
+COMMENTED_MAIN = """
+__global__ void k(float* a) {}
+// TODO: port int main() from original file
+"""
+
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -127,6 +139,48 @@ class TestGenerateSpecFromSource:
     def test_returns_none_for_no_kernel(self):
         assert generate_spec_from_source("empty", NO_GLOBAL) is None
 
+    def test_omits_fabricated_fields_when_self_contained(self):
+        """Bug 4: launch/input_setup/output_readback are dead config once
+        _generate_harness() (verifier.py) sees self_contained=True — it
+        returns the ported source unwrapped and never consults them. Leaving
+        a hardcoded (float*,float*,int) guess on disk for a kernel whose real
+        params are (int*,int,int*) is misleading, not harmless."""
+        spec = generate_spec_from_source("shfl_scan", MULTI_KERNEL)
+        assert spec is not None
+        assert spec.get("self_contained") is True
+        assert "launch" not in spec
+        assert "input_setup" not in spec
+        assert "output_readback" not in spec
+
+    def test_infers_int_element_type_from_output_param(self):
+        """Bug 4: output_readback.element_type must come from the kernel's
+        own output-direction param, not a hardcoded 'float' — a spec
+        claiming float for an all-int* kernel contradicts its own params."""
+        spec = generate_spec_from_source("copy_kernel", INT_OUTPUT_KERNEL)
+        assert spec is not None
+        assert spec["output_readback"]["element_type"] == "int"
+        assert spec["output_readback"]["format"] == "int_per_line"
+
+    def test_float_kernel_still_gets_float_readback(self):
+        spec = generate_spec_from_source("vector_add", SIMPLE_KERNEL)
+        assert spec["output_readback"]["element_type"] == "float"
+        assert spec["output_readback"]["format"] == "float_per_line"
+
+    def test_self_contained_regex_is_anchored_not_a_comment_false_positive(self):
+        """Bug 4: the old unanchored re.search(r'int\\s+main\\s*\\(', source)
+        matched the literal substring 'int main(' anywhere, including inside
+        a comment. Anchoring with ^ + MULTILINE (matching the two call sites
+        in verifier.py that already anchor this check) fixes the false
+        positive."""
+        spec = generate_spec_from_source("k", COMMENTED_MAIN)
+        assert spec is not None
+        assert spec.get("self_contained") is not True
+        assert "launch" in spec  # fabricated-but-still-present since NOT self-contained
+
+    def test_generated_spec_is_marked_auto_generated(self):
+        spec = generate_spec_from_source("vector_add", SIMPLE_KERNEL)
+        assert spec["auto_generated"] is True
+
 
 class TestAutoGenerateSpec:
 
@@ -158,5 +212,70 @@ class TestAutoGenerateSpec:
             assert spec["params"][0]["type"] == "int*"
             assert spec["params"][1]["type"] == "int"
             assert spec["params"][2]["type"] == "int*"
+        finally:
+            spec_parser._SPEC_DIR = orig_dir
+
+
+class TestSaveSpecOverwriteGuard:
+    """Bug 5: _auto_gen_spec() ran unconditionally at the top of every
+    route() call with no existence check — silently destroying any
+    hand-tuned spec (conv2d.json, softmax.json, new_kernel.json carry real
+    reference_output paths that make the verifier's diff step meaningful)
+    on the kernel's very next run."""
+
+    def test_refuses_to_overwrite_hand_written_spec(self, tmp_path):
+        from verification import spec_parser
+        orig_dir = spec_parser._SPEC_DIR
+        try:
+            spec_parser._SPEC_DIR = tmp_path / "specs"
+            spec_parser._SPEC_DIR.mkdir(parents=True)
+            hand_written = {"kernel_name": "conv2d",
+                             "reference_output": "sample_kernels/reference/conv2d_output.txt"}
+            path = spec_parser._SPEC_DIR / "conv2d.json"
+            path.write_text(json.dumps(hand_written), encoding="utf-8")
+
+            fresh_spec = {"kernel_name": "conv2d", "auto_generated": True, "params": []}
+            saved_path, written = spec_parser.save_spec("conv2d", fresh_spec)
+
+            assert written is False
+            on_disk = json.loads(path.read_text(encoding="utf-8"))
+            assert on_disk == hand_written  # untouched
+        finally:
+            spec_parser._SPEC_DIR = orig_dir
+
+    def test_overwrites_previously_auto_generated_spec(self, tmp_path):
+        from verification import spec_parser
+        orig_dir = spec_parser._SPEC_DIR
+        try:
+            spec_parser._SPEC_DIR = tmp_path / "specs"
+            spec_parser._SPEC_DIR.mkdir(parents=True)
+            old_auto = {"kernel_name": "foo", "auto_generated": True, "params": []}
+            path = spec_parser._SPEC_DIR / "foo.json"
+            path.write_text(json.dumps(old_auto), encoding="utf-8")
+
+            new_spec = {"kernel_name": "foo", "auto_generated": True, "params": [{"name": "x"}]}
+            saved_path, written = spec_parser.save_spec("foo", new_spec)
+
+            assert written is True
+            on_disk = json.loads(path.read_text(encoding="utf-8"))
+            assert on_disk["params"] == [{"name": "x"}]
+        finally:
+            spec_parser._SPEC_DIR = orig_dir
+
+    def test_auto_generate_spec_marks_persisted_false_when_blocked(self, tmp_path):
+        from verification import spec_parser
+        orig_dir = spec_parser._SPEC_DIR
+        try:
+            spec_parser._SPEC_DIR = tmp_path / "specs"
+            spec_parser._SPEC_DIR.mkdir(parents=True)
+            hand_written = {"kernel_name": "vector_add", "reference_output": "x.txt"}
+            path = spec_parser._SPEC_DIR / "vector_add.json"
+            path.write_text(json.dumps(hand_written), encoding="utf-8")
+
+            spec = auto_generate_spec("vector_add", SIMPLE_KERNEL)
+            assert spec is not None
+            assert spec["_persisted"] is False
+            on_disk = json.loads(path.read_text(encoding="utf-8"))
+            assert on_disk == hand_written  # untouched
         finally:
             spec_parser._SPEC_DIR = orig_dir
