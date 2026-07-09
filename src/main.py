@@ -341,7 +341,10 @@ class KernelOlympics:
                     tag = ("⏳ orchestrator ok, verifying" if orch_passed
                            else ("⏳ compiles in-loop, verifying" if compile_ok
                                  else f"🔁 {iters}/{port_result.get('max_iterations', 10)} iterations"))
-                    self.disp.file_done(Path(cr['file']).name, f"GLM-eval {tag} ({port_result.get('confidence', 0)}%, {llm_elapsed:.0f}s)", ok=orch_passed)
+                    # T0.2: no confidence % here — it is a pre-verify porter score
+                    # and printing it reads as a final grade. The gated confidence
+                    # appears after verification (report + verify status).
+                    self.disp.file_done(Path(cr['file']).name, f"GLM-eval {tag} ({llm_elapsed:.0f}s)", ok=orch_passed)
                     save_path = Path.cwd() / "ported_kernels" / (Path(cr["file"]).stem + ".hip.cpp")
                     print(f"║  📁 Ported kernel → {bold(str(save_path)):<47}║")
                     self.memory.record_llm_time(llm_elapsed)
@@ -396,7 +399,11 @@ class KernelOlympics:
                 sys.stdout.write("\r" + " " * 80 + "\r")  # clear progress bar
                 sys.stdout.flush()
 
-                ver_result["confidence"] = port_result.get("confidence", 0)
+                # T0.2: confidence is a claim about a VERIFIED port. If verification
+                # did not pass — didn't compile, crashed, or output diffed — the
+                # porter's optimistic score is fiction. A real number only survives a
+                # real pass; otherwise it is 0. No more "47%" on code that never ran.
+                ver_result["confidence"] = port_result.get("confidence", 0) if ver_result.get("passed") else 0
                 # Attach in-loop compile errors to verification result
                 if port_result.get("compile_errors"):
                     ver_result["in_loop_compile_errors"] = port_result["compile_errors"]
