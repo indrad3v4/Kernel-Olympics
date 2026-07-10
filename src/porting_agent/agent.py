@@ -19,7 +19,9 @@ import os
 import json
 import socket
 import sys
-from typing import Dict, Optional
+import time
+import urllib.error
+from typing import Dict, List, Optional
 from pathlib import Path
 
 # The verification helpers live under src/verification.  When the agent is
@@ -32,6 +34,76 @@ if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 from verification.extraction import extract_code as _extract_code_v2
 from verification.lexical import validate_lexical as _validate_lexical
+# router.ModelRouter._fix_ported_code is the comprehensive CUDA→HIP header/API
+# rewriter (cuda_runtime.h→hip/hip_runtime.h, cudaMalloc→hipMalloc, etc.).
+# Reused here so the template fallback below can never emit CUDA headers —
+# it previously ran only the wavefront32→64 fixups and left includes alone.
+from router import ModelRouter as _ModelRouter
+
+
+class FailureType:
+    """Explicit classification of why a model call did not yield usable code.
+
+    Plain string constants (not an Enum) so they drop straight into JSON debug
+    artifacts and report dicts without a custom encoder. ``INFRASTRUCTURE``
+    covers everything that means "we never got a real translation attempt back
+    from the model" — the failures the mission calls out (timeout, malformed
+    response, reasoning-only). ``TRANSIENT`` is the subset worth retrying the
+    *same* model for before moving on or giving up.
+    """
+    API_TIMEOUT = "api_timeout"
+    NETWORK_ERROR = "network_error"
+    HTTP_ERROR = "http_error"
+    RATE_LIMIT = "rate_limit"
+    EMPTY_RESPONSE = "empty_response"
+    REASONING_ONLY = "reasoning_only"
+    PARTIAL_CODE = "partial_code"
+    INVALID_JSON = "invalid_json"
+    EXTRACTION_FAILURE = "extraction_failure"
+    VALIDATION_FAILURE = "validation_failure"
+
+    INFRASTRUCTURE = frozenset({
+        API_TIMEOUT, NETWORK_ERROR, HTTP_ERROR, RATE_LIMIT, EMPTY_RESPONSE,
+        REASONING_ONLY, PARTIAL_CODE, INVALID_JSON, EXTRACTION_FAILURE,
+        VALIDATION_FAILURE,
+    })
+    TRANSIENT = frozenset({API_TIMEOUT, NETWORK_ERROR, RATE_LIMIT, HTTP_ERROR})
+
+    @classmethod
+    def is_transient(cls, failure_type: Optional[str]) -> bool:
+        return failure_type in cls.TRANSIENT
+
+    @classmethod
+    def classify_exception(cls, exc: BaseException) -> str:
+        """Best-effort mapping of a caught exception to a FailureType.
+
+        Never raises — an exception raised while classifying an exception
+        would replace an observable failure with an unobservable one.
+        """
+        try:
+            if isinstance(exc, urllib.error.HTTPError):
+                if exc.code == 429:
+                    return cls.RATE_LIMIT
+                if exc.code >= 500:
+                    return cls.API_TIMEOUT  # 5xx is transient — retry-worthy
+                return cls.HTTP_ERROR
+            if isinstance(exc, socket.timeout):
+                return cls.API_TIMEOUT
+            if isinstance(exc, urllib.error.URLError):
+                reason = str(getattr(exc, "reason", exc))
+                if "timed out" in reason.lower():
+                    return cls.API_TIMEOUT
+                return cls.NETWORK_ERROR
+            if isinstance(exc, TimeoutError):
+                return cls.API_TIMEOUT
+            msg = str(exc).lower()
+            if "timed out" in msg or "timeout" in msg:
+                return cls.API_TIMEOUT
+            if "connection" in msg or "network" in msg or "resolve" in msg:
+                return cls.NETWORK_ERROR
+        except Exception:
+            pass
+        return cls.NETWORK_ERROR
 
 
 def _force_ipv4():
@@ -130,46 +202,280 @@ CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explan
         self.deepseek_model = deepseek_model
         self.api_base = "https://api.fireworks.ai/inference/v1"
         self.deepseek_base = "https://api.deepseek.com/v1"
+        # Phase: per-model health tracking for THIS agent instance/session.
+        # Repeated timeouts/malformed responses push a model to the back of
+        # the try-order on the next kernel, instead of paying its full
+        # timeout again on every single kernel in the batch.
+        self._model_health: Dict[str, Dict] = {}
 
-    def _fireworks_api_available(self) -> bool:
-        """Quick health check to see if Fireworks API is reachable.
+    def _health(self, model: str) -> Dict:
+        return self._model_health.setdefault(model, {
+            "attempts": 0, "timeouts": 0, "malformed": 0,
+            "extraction_ok": 0, "total_latency_ms": 0.0,
+        })
 
-        Uses a lightweight 1-token chat completion to verify the key works.
+    def _record_health(self, model: str, failure_type: Optional[str] = None,
+                       latency_ms: float = 0.0, extraction_ok: Optional[bool] = None) -> None:
+        h = self._health(model)
+        h["attempts"] += 1
+        h["total_latency_ms"] += latency_ms
+        if failure_type == FailureType.API_TIMEOUT:
+            h["timeouts"] += 1
+        elif failure_type in (FailureType.REASONING_ONLY, FailureType.EMPTY_RESPONSE,
+                              FailureType.INVALID_JSON, FailureType.EXTRACTION_FAILURE,
+                              FailureType.PARTIAL_CODE):
+            h["malformed"] += 1
+        if extraction_ok:
+            h["extraction_ok"] += 1
+
+    def _ordered_models(self) -> List[str]:
+        """FALLBACK_MODELS reordered by this session's observed reliability.
+
+        A model with a nonzero attempt count and a bad failure rate (timeouts
+        or malformed responses) is deprioritized — tried later, never
+        dropped entirely, since a single bad kernel should not permanently
+        blacklist a model that may work fine on the next one.
         """
-        try:
-            import urllib.request, json
-            data = json.dumps({
-                "model": "accounts/fireworks/models/deepseek-v4-pro",
-                "messages": [{"role": "user", "content": "ok"}],
-                "max_tokens": 1
-            }).encode()
-            req = urllib.request.Request(
-                f"{self.api_base}/chat/completions",
-                data=data,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json"
-                }
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read())
-                return "choices" in data
-        except Exception:
-            return False
+        def _failure_rate(model: str) -> float:
+            h = self._model_health.get(model)
+            if not h or h["attempts"] == 0:
+                return 0.0
+            return (h["timeouts"] + h["malformed"]) / h["attempts"]
+        return sorted(self.FALLBACK_MODELS, key=_failure_rate)
+
+    # ── Retry / recovery policy ──────────────────────────────────────────
+    # Two attempts per model: the initial call, then either (a) a same-model
+    # retry with backoff on a transient infra failure (timeout/network/5xx/
+    # rate-limit), or (b) a single "return ONLY code" recovery follow-up on a
+    # malformed/reasoning-only response. Either way, a model is never
+    # abandoned — and the fallback never invoked — after just one failure.
+    _MAX_ATTEMPTS_PER_MODEL = 2
+    _BACKOFF_BASE_SECONDS = 1.0
+
+    _REASONING_RECOVERY_PROMPT = (
+        "Your previous response contained analysis instead of code.\n\n"
+        "Return ONLY the complete HIP source file.\n\n"
+        "Do not include explanations.\n\n"
+        "Do not include Markdown.\n\n"
+        "Do not include reasoning.\n\n"
+        "Return a complete compilable translation unit."
+    )
+
+    _STATUS_ICONS = {
+        "ok": "✅", "retry": "🔁", "recovery": "🩹", "exhausted": "🛑",
+    }
+
+    def _log_event(self, model: str, status: str, note: str = "",
+                   attempt: int = 1, final: Optional[str] = None) -> None:
+        """One structured line per model event — actionable, not generic.
+
+        Replaces the old "No usable code or JSON found" catch-all: every
+        line names the model, the attempt, and the specific reason, so a
+        reader (or a saved log) can tell a Kimi reasoning-only response
+        apart from a GLM timeout apart from a DeepSeek HTTP error.
+        """
+        icon = self._STATUS_ICONS.get(status, "⚠")
+        line = f"║ {icon} [{model}] attempt {attempt}/{self._MAX_ATTEMPTS_PER_MODEL} — {status}"
+        if note:
+            line += f": {note[:140]}"
+        print(line)
+        if final:
+            print(f"║    └─ {final[:140]}")
+
+    def _post_chat(self, model: str, messages: list, timeout: float):
+        """One raw Fireworks chat-completion call.
+
+        Returns ``(content, call_cost, latency_ms)``. Raises on any
+        transport/HTTP failure — the caller classifies and decides whether
+        to retry.
+        """
+        import urllib.request
+        import json as _json
+        data = _json.dumps({
+            "model": model,
+            "messages": messages,
+            "temperature": 0.1,
+            "max_tokens": 2048,
+        }).encode()
+        req = urllib.request.Request(
+            f"{self.api_base}/chat/completions",
+            data=data,
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+        t0 = time.perf_counter()
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw_body = resp.read()
+        latency_ms = (time.perf_counter() - t0) * 1000.0
+        result = json.loads(raw_body)
+        content = result["choices"][0]["message"]["content"]
+        usage = result.get("usage", {})
+        tokens_used = (
+            usage.get("total_tokens", 0)
+            or usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+        )
+        cost_per_1k = self.MODEL_COST_MAP.get(model, 0.0012)
+        call_cost = round(tokens_used / 1000 * cost_per_1k, 4)
+        return content, call_cost, latency_ms
+
+    def _try_extract(self, content: str):
+        """Run the full extraction pipeline against one LLM response.
+
+        Strategy order: (1) JSON object with a ``ported_code`` field, (2)
+        markdown-fenced ```cpp/```c++/```hip/```cuda blocks and JSON-field
+        variants (via :func:`verification.extraction.extract_code`), (3) a
+        sliding raw-text window anchored on ``#include``/``__global__``/
+        ``namespace``/``template``, with conversational prose stripped by
+        the legacy stripper. Only after every strategy fails is this
+        classified as an extraction failure.
+
+        Returns ``(fixed_code, parsed_json_or_None, failure_type_or_None, note)``.
+        """
+        if not content or not content.strip():
+            return None, None, FailureType.EMPTY_RESPONSE, "empty response body"
+
+        # Strategy 1: JSON object with a ported_code field.
+        parsed = self._extract_json_from_text(content)
+        if parsed and "ported_code" in parsed:
+            fixed = self._fix_ported_code(parsed["ported_code"])
+            ok, reason = self._gate_code(fixed)
+            if ok:
+                return fixed, parsed, None, "json-field"
+            failure = (FailureType.REASONING_ONLY if "reasoning" in reason.lower()
+                      else FailureType.PARTIAL_CODE)
+            return None, None, failure, f"json-field rejected by lexical gate: {reason}"
+
+        # Strategy 2/3: fenced cpp/c++/hip blocks, raw #include/__global__/
+        # namespace/template window, conversational-text stripping.
+        extraction = _extract_code_v2(content)
+        code_text = (extraction.code or "").strip()
+        if not code_text:
+            code_text = self._extract_code_from_text(content)
+        if code_text:
+            fixed = self._fix_ported_code(code_text)
+            ok, reason = self._gate_code(fixed)
+            if ok:
+                return fixed, None, None, f"text-extract:{extraction.strategy}"
+            failure = (FailureType.REASONING_ONLY if "reasoning" in reason.lower()
+                      else FailureType.EXTRACTION_FAILURE)
+            return None, None, failure, f"text-extract rejected by lexical gate: {reason}"
+
+        if parsed is not None:
+            return None, None, FailureType.INVALID_JSON, "JSON parsed but had no ported_code field"
+        return None, None, FailureType.EXTRACTION_FAILURE, "no code-shaped block found (markdown/JSON/raw-window all failed)"
+
+    def _attempt_model(self, model: str, user_prompt: str, is_primary: bool,
+                       infra_failures: List[Dict]) -> Optional[Dict]:
+        """Try one model end-to-end, with retry and reasoning-recovery.
+
+        Returns a result dict on success, or ``None`` once every recovery
+        strategy for this model has been exhausted — the caller then moves
+        to the next model, never straight to the template fallback.
+        """
+        timeout = 60 if is_primary else 15
+        messages = [
+            {"role": "system", "content": self.SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ]
+        last_failure_type = None
+        last_note = ""
+
+        for attempt in range(1, self._MAX_ATTEMPTS_PER_MODEL + 1):
+            try:
+                content, call_cost, latency_ms = self._post_chat(model, messages, timeout)
+            except urllib.error.HTTPError as exc:
+                try:
+                    err_body = exc.read().decode(errors="replace")[:200]
+                except Exception:
+                    err_body = ""
+                failure_type = FailureType.classify_exception(exc)
+                self._record_health(model, failure_type=failure_type)
+                last_failure_type, last_note = failure_type, f"HTTP {exc.code}: {err_body}"
+                self._log_event(model, status=failure_type, note=last_note, attempt=attempt)
+                infra_failures.append({"model": model, "attempt": attempt,
+                                       "failure_type": failure_type, "detail": last_note})
+            except Exception as exc:
+                failure_type = FailureType.classify_exception(exc)
+                self._record_health(model, failure_type=failure_type)
+                last_failure_type, last_note = failure_type, str(exc)[:160]
+                self._log_event(model, status=failure_type, note=last_note, attempt=attempt)
+                infra_failures.append({"model": model, "attempt": attempt,
+                                       "failure_type": failure_type, "detail": last_note})
+            else:
+                fixed, parsed, failure_type, note = self._try_extract(content)
+                if fixed:
+                    self._record_health(model, latency_ms=latency_ms, extraction_ok=True)
+                    self._log_event(model, status="ok", note=note, attempt=attempt,
+                                    final="accepted — recovery/retry not needed" if attempt == 1
+                                          else "accepted after recovery")
+                    if parsed:
+                        parsed["ported_code"] = fixed
+                        parsed["cost"] = call_cost
+                        parsed.setdefault("confidence", self._rubric_score_extracted(fixed))
+                        parsed.setdefault("changes", [])
+                        parsed.setdefault("explanation", "")
+                        return parsed
+                    return {
+                        "ported_code": fixed,
+                        "confidence": self._rubric_score_extracted(fixed),
+                        "changes": ["LLM returned text without valid JSON — extracted code block"],
+                        "explanation": "Code extracted from LLM text output",
+                        "cost": call_cost,
+                    }
+
+                self._record_health(model, failure_type=failure_type, latency_ms=latency_ms)
+                last_failure_type, last_note = failure_type, note
+                self._log_event(model, status=failure_type, note=note, attempt=attempt)
+                infra_failures.append({"model": model, "attempt": attempt,
+                                       "failure_type": failure_type, "detail": note})
+
+                # Recovery: send exactly one "code only, no reasoning"
+                # follow-up before giving up on this model.
+                recoverable = failure_type in (
+                    FailureType.REASONING_ONLY, FailureType.PARTIAL_CODE,
+                    FailureType.EXTRACTION_FAILURE, FailureType.INVALID_JSON,
+                )
+                if recoverable and attempt < self._MAX_ATTEMPTS_PER_MODEL:
+                    self._log_event(model, status="recovery",
+                                    note="sending code-only follow-up prompt", attempt=attempt)
+                    messages = messages + [
+                        {"role": "assistant", "content": content[:4000]},
+                        {"role": "user", "content": self._REASONING_RECOVERY_PROMPT},
+                    ]
+                    continue
+                break
+
+            # Transient infra failure (timeout/network/5xx/rate-limit) — retry
+            # the SAME model with a short backoff before moving on.
+            if FailureType.is_transient(last_failure_type) and attempt < self._MAX_ATTEMPTS_PER_MODEL:
+                backoff = self._BACKOFF_BASE_SECONDS * attempt
+                self._log_event(model, status="retry",
+                                note=f"transient {last_failure_type} — backing off {backoff:.1f}s",
+                                attempt=attempt)
+                time.sleep(backoff)
+                continue
+            break
+
+        self._log_event(model, status="exhausted", note=last_note,
+                        attempt=self._MAX_ATTEMPTS_PER_MODEL,
+                        final=f"moving to next model (last: {last_failure_type})")
+        return None
 
     def port_kernel(self, source_code: str, context: str = "",
                     cached_pattern: Optional[Dict] = None) -> Dict:
         """Port a CUDA kernel to ROCm/HIP using LLM."""
-        
+
         # TRIZ: Fix source code BEFORE any LLM/template processing
         fixed_source = self._fix_ported_code(source_code)
-        
+
         # Build prompt with context
         user_prompt = f"Port this CUDA kernel to AMD ROCm/HIP:\n\n```cuda\n{fixed_source}\n```\n"
-        
+
         if context:
             user_prompt += f"\nAdditional context:\n{context}\n"
-        
+
         if cached_pattern:
             user_prompt += (
                 f"\nA similar pattern was found in memory (confidence: {cached_pattern.get('confidence', 0)}):\n"
@@ -177,104 +483,42 @@ CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explan
                 f"Verified fix: {cached_pattern.get('verified_fix', '')}\n"
                 f"Apply similar approach if applicable.\n"
             )
-        
+
         user_prompt += "\nOutput the result as a JSON object inside a ```json markdown block, with fields: ported_code (the full kernel code), confidence (0-100), changes (list), explanation (string)."
-        
+
         # For hackathon: if no API key, use template-based porting
         if not self.api_key or self.api_key == "test":
             return self._template_port(fixed_source, cached_pattern)
 
-        # ⏱️ Early health check — skip to template if Fireworks is unreachable
-        if not self._fireworks_api_available():
-            print("║ ⏱️ Fireworks API unreachable — using template fallback")
-            result = self._template_port(source_code, cached_pattern)
-            if "ported_code" in result:
-                result["ported_code"] = self._fix_ported_code(result["ported_code"])
-            return result
+        # Health-ordered fallback list: self.model always goes first (it is
+        # the configured preference), the rest are tried in order of THIS
+        # session's observed reliability rather than a fixed static list —
+        # a model that just timed out on kernel N is tried last on kernel
+        # N+1, not blocked outright.
+        primary = self.model
+        models_to_try = [primary] + [m for m in self._ordered_models() if m != primary]
 
-        models_to_try = [self.model] + [m for m in self.FALLBACK_MODELS if m != self.model]
-
+        infra_failures: List[Dict] = []
         for model in models_to_try:
-            try:
-                import urllib.request
-                import json as _json
-                data = _json.dumps({
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": self.SYSTEM_PROMPT},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    "temperature": 0.1,
-                    "max_tokens": 2048
-                }).encode()
-                req = urllib.request.Request(
-                    f"{self.api_base}/chat/completions",
-                    data=data,
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json"
-                    }
-                )
-                timeout = 60 if model == models_to_try[0] else 15
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
-                    raw_body = resp.read()
-                    result = _json.loads(raw_body)
-                content = result["choices"][0]["message"]["content"]
-                # Extract token usage for cost tracking
-                usage = result.get("usage", {})
-                tokens_used = (
-                    usage.get("total_tokens", 0)
-                    or usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
-                )
-                cost_per_1k = self.MODEL_COST_MAP.get(model, 0.0012)
-                call_cost = tokens_used / 1000 * cost_per_1k
-                # Try JSON extraction first (handles prose-wrapped JSON)
-                parsed = self._extract_json_from_text(content)
-                if parsed and "ported_code" in parsed:
-                    fixed = self._fix_ported_code(parsed["ported_code"])
-                    ok, reason = self._gate_code(fixed)
-                    if not ok:
-                        # A JSON reply where the code field itself is prose is the
-                        # exact class of failure the bug report flagged.  Do not
-                        # return it as ported_code; fall through to the next
-                        # extraction attempt or the next model.
-                        print(f"║ ⚠ gate rejected {model} JSON payload: {reason[:80]}")
-                    else:
-                        parsed["ported_code"] = fixed
-                        parsed["cost"] = round(call_cost, 4)
-                        return parsed
-                # Fallback: extract HIP code from text output using both the
-                # provider-agnostic extractor and the legacy prose stripper.
-                extraction = _extract_code_v2(content)
-                code_text = (extraction.code or "").strip()
-                if not code_text:
-                    code_text = self._extract_code_from_text(content)
-                if code_text:
-                    fixed = self._fix_ported_code(code_text)
-                    ok, reason = self._gate_code(fixed)
-                    if ok:
-                        return {
-                            "ported_code": fixed,
-                            "confidence": self._rubric_score_extracted(code_text),
-                            "changes": ["LLM returned text without valid JSON — extracted code block"],
-                            "explanation": "Code extracted from LLM text output",
-                            "cost": round(call_cost, 4),
-                        }
-                    print(f"║ ⚠ gate rejected {model} text payload: {reason[:80]}")
-                raise ValueError(f"No usable code or JSON found in LLM response: {content[:200]}")
-            except urllib.request.HTTPError as e:
-                err_body = e.read().decode(errors='replace')[:200]
-                print(f"║ ⏱️ Model {model} returned HTTP {e.code}: {err_body}")
-                continue
-            except Exception as e:
-                print(f"║ ⏱️ Model {model} failed: {str(e)[:120]}")
-                continue  # Try next model
+            result = self._attempt_model(model, user_prompt, is_primary=(model == primary),
+                                         infra_failures=infra_failures)
+            if result is not None:
+                result["failure_classification"] = None
+                result["used_fallback"] = False
+                return result
 
-        # All Fireworks models timed out → skip DeepSeek, go straight to template
-        print("║ ⏱️ All Fireworks models timed out — using template fallback")
+        # Every model — with retries and reasoning-recovery follow-ups —
+        # failed to produce usable code. This is the ONLY point at which the
+        # template fallback is justified; it never fires on a single
+        # timeout or a single malformed response.
+        print(f"║ 🛑 All {len(models_to_try)} model(s) exhausted after retries/recovery "
+              f"— using HIP-safe template fallback")
         result = self._template_port(source_code, cached_pattern)
         if "ported_code" in result:
             result["ported_code"] = self._fix_ported_code(result["ported_code"])
+        result["used_fallback"] = True
+        result["failure_classification"] = "infrastructure"
+        result["infra_failures"] = infra_failures
         return result
 
     @staticmethod
@@ -795,6 +1039,22 @@ CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explan
             unique_changes.append(f"Applied cached pattern from verified fix (id: {cached_pattern.get('id', 'unknown')})")
             if cached_pattern.get("verified_fix"):
                 code = cached_pattern["verified_fix"]
+
+        # Mission requirement: the template fallback must NEVER emit CUDA
+        # headers or APIs — this line-by-line pass above only ever touched
+        # warp32→wavefront64 patterns and left #include <cuda_runtime.h> (and
+        # cudaMalloc/cudaMemcpy/... calls) untouched, which is a guaranteed
+        # hipcc failure. Route through the same comprehensive CUDA→HIP header
+        # rewriter every router.py translation already runs through, so the
+        # fallback compiles under hipcc even when the LLM path never ran.
+        code, header_changes = _ModelRouter._fix_ported_code(code, return_changelog=True)
+        unique_changes.extend(c for c in header_changes if c not in unique_changes)
+        if "hip/hip_runtime.h" not in code:
+            code = "#include <hip/hip_runtime.h>\n" + code
+            unique_changes.append("Added #include <hip/hip_runtime.h> (missing from fallback output)")
+        if not code.lstrip().startswith("//"):
+            code = ("// FALLBACK-GENERATED CODE — mechanical template port, "
+                    "not produced or reviewed by an LLM. Verify before trusting.\n" + code)
 
         # Rubric-based confidence scoring
         has_wavefront_header = "#define WAVEFRONT_SIZE 64" in code
