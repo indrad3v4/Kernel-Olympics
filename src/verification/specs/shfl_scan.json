@@ -1,0 +1,27 @@
+{
+  "kernel_name": "shfl_scan",
+  "kernel_function": "shfl_scan_test",
+  "description": "Auto-generated spec for shfl_scan",
+  "params": [
+    {
+      "name": "data",
+      "type": "int*",
+      "direction": "in",
+      "size_expr": "count"
+    },
+    {
+      "name": "width",
+      "type": "int",
+      "direction": "scalar",
+      "size_expr": "count"
+    },
+    {
+      "name": "partial_sums",
+      "type": "int*",
+      "direction": "in",
+      "size_expr": "count"
+    }
+  ],
+  "auto_generated": true,
+  "self_contained": true
+}

@@ -1535,6 +1535,16 @@ class ModelRouter:
                 logger.debug("structural validation errored: %s", _sv_exc)
                 structural = _StructuralResult(ok=True, warnings=["structural check errored"])
 
+        # Semantic gate — catches the pathologies the structural checker misses:
+        # prose at file scope, ghost kernel launches, and executable statements
+        # outside function bodies.
+        with self.debug.stage("semantic_validation"):
+            try:
+                semantic = self._reject_structurally_invalid(code, kernel_source)
+            except Exception as _sv_exc:  # never let the gate itself take down the loop
+                logger.debug("semantic validation errored: %s", _sv_exc)
+                semantic = _StructuralResult(ok=True, warnings=["semantic check errored"])
+
         # Debug Mode: record BOTH verdicts as they were computed, before the
         # merge below folds the lexical failure into the structural result. A
         # reader must be able to tell "the braces were fine, the text was prose"
@@ -1552,6 +1562,11 @@ class ModelRouter:
                 "STRUCTURAL_VALIDATION", reason=structural.reason(),
                 validation_result=structural.ok, iteration=iteration, generation=gen)
             self.debug.log_symbols(kernel_source, code, generation=gen, iteration=iteration)
+            self.debug.log_structural(semantic, generation=gen, iteration=iteration,
+                                      cuda_source=kernel_source, hip_source=code)
+            self.debug.transition(
+                "SEMANTIC_VALIDATION", reason=semantic.reason(),
+                validation_result=semantic.ok, iteration=iteration, generation=gen)
             # Static analysis runs on the exact text hipcc is about to see, and
             # is persisted whether or not a compile follows. When the compile is
             # skipped by a gate, these findings are the only pre-compile
@@ -1561,6 +1576,8 @@ class ModelRouter:
                 self.debug.count("lexical_rejects")
             if not structural.ok:
                 self.debug.count("structural_rejects")
+            if not semantic.ok:
+                self.debug.count("semantic_rejects")
 
         if lexical is not None and not lexical.ok:
             merged_errors = ["[lexical] " + e for e in lexical.errors]
@@ -1576,7 +1593,158 @@ class ModelRouter:
             changelog.append(
                 "[lexical] rejected: " + "; ".join(lexical.errors)[:120])
 
+        if not semantic.ok:
+            merged_errors = list(structural.errors) + [
+                "[semantic] " + e for e in semantic.errors[:10]
+            ]
+            structural = _StructuralResult(
+                ok=False,
+                errors=merged_errors,
+                warnings=list(structural.warnings) + list(semantic.warnings),
+                missing_symbols=list(structural.missing_symbols),
+            )
+            changelog.append(
+                "[semantic] rejected: " + "; ".join(semantic.errors)[:120])
+
         return code, changelog, restored, structural
+
+    @staticmethod
+    def _reject_structurally_invalid(ported_code: str, original_source: str) -> "_StructuralResult":
+        """Semantic gate against three pathologies the structural checker misses.
+
+        1. **Prose at file scope** — evaluator-feedback notes leaked into code,
+           detected by signal phrases (The, This, We, Note, But, So, However, ...)
+           or ``[A-Z][a-z]+.*` `` patterns at brace depth 0.
+
+        2. **Ghost kernel launches** — ``identifier<<<`` without a matching
+           ``__global__ void identifier(`` definition anywhere in the file.
+
+        3. **Executable statements outside function bodies** — lines with ``=``,
+           ``;``, ``<<<``, ``->``, ``::`` at file scope that are not includes,
+           defines, namespace, template declarations, function signatures,
+           forward declarations, comments, or blank lines.
+        """
+        warnings: List[str] = []
+        lines = ported_code.splitlines()
+
+        # ── Pass 1: collect all __global__ kernel definitions ──
+        kernel_defs = set()
+        for m in re.finditer(r'__global__\s+\w+\s+(\w+)\s*\(', ported_code):
+            kernel_defs.add(m.group(1))
+
+        # ── Pass 2: find all kernel launches (identifier<<<) and verify they
+        #            have a matching definition (Check #2: ghost kernels) ──
+        for m in re.finditer(r'(\w+)\s*<<<', ported_code):
+            name = m.group(1)
+            # Skip common keywords / types that look like a kernel launch
+            if name in ('if', 'for', 'while', 'switch', 'template', 'sizeof',
+                        'const', 'constexpr', 'static', 'extern', 'void',
+                        'int', 'float', 'double', 'char', 'bool', 'class',
+                        'struct', 'enum', 'union', 'auto', 'return',
+                        'namespace', 'using', 'typedef', 'typename',
+                        'public', 'private', 'protected', 'virtual',
+                        'override', 'final', 'export', 'import', 'include',
+                        'alignas', 'alignof', 'decltype', 'noexcept',
+                        'static_cast', 'dynamic_cast', 'const_cast',
+                        'reinterpret_cast', 'hipLaunchKernelGGL',
+                        'hipLaunchCooperativeKernel'):
+                continue
+            if name not in kernel_defs:
+                warnings.append(
+                    f"ghost kernel launch '{name}': called via <<<>>> "
+                    f"but no __global__ definition found")
+
+        # ── Pass 3: check each line at file scope ──
+        brace_depth = 0
+        in_block_comment = False
+
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            lineno = i + 1
+
+            if not stripped:
+                continue
+
+            # Handle block comments spanning multiple lines
+            if '/*' in stripped and '*/' not in stripped:
+                in_block_comment = True
+                continue
+            if in_block_comment:
+                if '*/' in stripped:
+                    in_block_comment = False
+                continue
+
+            # Strip comments from the line for analysis
+            code_part = re.sub(r'//.*$', '', stripped).strip()
+            code_part = re.sub(r'/\*.*?\*/', '', code_part).strip()
+            if not code_part:
+                continue
+
+            # Only check lines at file scope (brace depth == 0)
+            if brace_depth == 0:
+                # ── Check #1: Prose at file scope ──
+                if re.match(
+                    r'^(?:[A-Z][a-z]+.*`|(?:The|This|We|Note|But|So|However|'
+                    r'Also|Therefore|Thus|Hence)\b)', code_part
+                ):
+                    warnings.append(
+                        f"line {lineno}: natural-language prose leaked at "
+                        f"file scope: {code_part[:100]!r}")
+                    continue
+
+                # When the line opens a brace at depth 0 (e.g. single-line
+                # kernel body), only check the portion before the first {.
+                # Content inside the function body will be at depth >= 1.
+                before_brace = code_part.split('{', 1)[0].strip()
+                check_part = before_brace if before_brace else code_part
+
+                # ── Check #3: Executable statements outside function bodies ──
+                # Allow: preprocessor directives, comments, valid file-scope C++
+                # declarations, braces, and blank lines.
+                if re.match(r'^\s*(?:#|//|\*|/\*)', stripped):
+                    pass  # preprocessor / comment
+                elif re.match(
+                    r'^(?:__global__|__device__|template|namespace|using'
+                    r'|typedef|struct|class|enum|union'
+                    r'|constexpr|const|static|extern|inline|virtual|friend'
+                    r'|typename|public|private|protected)\b', code_part
+                ):
+                    pass  # valid file-scope declaration keyword
+                elif re.match(r'^[A-Za-z_]\w*\s*\(', check_part):
+                    pass  # function declaration / signature
+                elif stripped in ('{', '}', '};'):
+                    pass  # bare braces
+                elif re.match(r'^\}', stripped):
+                    pass  # closing brace with optional label
+                elif re.match(r'^[A-Za-z_]\w*\s*::\s*~?\w+\s*\(', check_part):
+                    pass  # method definition outside class (e.g. MyClass::foo())
+                elif re.match(
+                    r'^(?:#\s*define|#\s*include|#\s*if|#\s*ifdef|#\s*ifndef'
+                    r'|#\s*else|#\s*elif|#\s*endif|#\s*pragma|#\s*error'
+                    r'|#\s*warning|#\s*line)', stripped
+                ):
+                    pass  # preprocessor (already caught above but be explicit)
+                else:
+                    # Reject if it contains executable-statement markers
+                    has_semicolon = ';' in check_part
+                    has_kernel_launch = '<<<' in check_part
+                    # '=' not preceded by <, >, !, or = (avoid ==, !=, <=, >=)
+                    has_assign = bool(re.search(r'(?<![-<>=!])=(?!=)', check_part))
+                    has_arrow = '->' in check_part
+                    has_scope = ('::' in check_part
+                                 and '::' not in code_part.split('(')[0].strip().rstrip('*&'))
+
+                    if has_semicolon and (has_kernel_launch or has_assign or has_arrow or has_scope):
+                        warnings.append(
+                            f"line {lineno}: executable statement outside "
+                            f"function body: {check_part[:100]!r}")
+
+            # Update brace depth for the next line
+            brace_depth += stripped.count('{') - stripped.count('}')
+
+        ok = len(warnings) == 0
+        return _StructuralResult(
+            ok=ok, errors=list(warnings), warnings=[], missing_symbols=[])
 
     @staticmethod
     def _is_self_contained(source: str) -> bool:
@@ -2087,37 +2255,51 @@ class ModelRouter:
         # in FULL — truncating a fixed-length embed cut off main() itself for
         # any source past ~6000 chars, so Kimi ported only the kernels and
         # never saw (let alone could reproduce) the driver that runs them.
-        # TRIZ #10/#22: For DEVICE_SUBSET, strip to kernel-only so the coder
-        # cannot see (and therefore cannot reproduce) host code. What the
-        # coder never sees, it cannot reproduce.
+        # V2: TRIZ #10/#22 initially tried _strip_to_kernel_only to prevent
+        # host-code reproduction, but this broke plan/pattern line-reference
+        # alignment (DeepSeek says "fix line 253" but stripped source has
+        # only 60 lines). Now we show the FULL source so plans stay valid
+        # and use an explicit instruction to restrict output to kernel-only.
         self_contained = self._is_self_contained(kernel_source)
-        if self_contained and port_mode == PortMode.DEVICE_SUBSET.value:
-            source_for_prompt = self._strip_to_kernel_only(kernel_source)
-        else:
-            source_for_prompt = kernel_source if self_contained else kernel_source[:6000]
-        if preprocessed_source:
-            # The DRAFT is what Kimi edits, so it is the thing that must be shown in
-            # full (Bug 1: a self-contained program truncated below its own main()
-            # can never be reproduced). The CUDA original becomes a bounded excerpt:
-            # the draft is a faithful mechanical translation of it, so re-sending it
-            # whole doubles the prompt to restate what the draft already says.
-            # TRIZ #10/#22: strip draft to kernel-only for DEVICE_SUBSET
-            if self_contained and port_mode == PortMode.DEVICE_SUBSET.value:
-                draft = self._strip_to_kernel_only(preprocessed_source)
-            else:
+        source_for_prompt = kernel_source if self_contained else kernel_source[:6000]
+        # DEVICE_SUBSET mode: output kernel functions only — explicit instruction.
+        if port_mode == PortMode.DEVICE_SUBSET.value:
+            if preprocessed_source:
                 draft = (preprocessed_source if self_contained
                          else preprocessed_source[:6000])
-            excerpt = kernel_source[:2000]
-            elided = "\n... (original elided — the draft below is its translation)" \
-                if len(kernel_source) > len(excerpt) else ""
+                excerpt = kernel_source[:2000]
+                elided = "\n... (original elided — the draft below is its translation)" \
+                    if len(kernel_source) > len(excerpt) else ""
+                prompt += (
+                    f"ORIGINAL CUDA (reference only — do not port this again):\n"
+                    f"```cuda\n{excerpt}{elided}\n```\n\n"
+                    f"HIP DRAFT TO EDIT (mechanically translated; return this file with "
+                    f"the checklist applied):\n```hip\n{draft}\n```\n\n"
+                )
+            else:
+                prompt += f"```cuda\n{source_for_prompt}\n```\n\n"
             prompt += (
-                f"ORIGINAL CUDA (reference only — do not port this again):\n"
-                f"```cuda\n{excerpt}{elided}\n```\n\n"
-                f"HIP DRAFT TO EDIT (mechanically translated; return this file with "
-                f"the checklist applied):\n```hip\n{draft}\n```\n\n"
+                "\u26a0\ufe0f DEVICE-SUBSET MODE: Output ONLY the __global__ "
+                "and/or __device__ kernel function(s). Do NOT include host code, "
+                "helper functions, main(), or a test harness. "
+                "The system automatically wraps your kernel in a proper "
+                "HIP compilation unit.\n\n"
             )
         else:
-            prompt += f"```cuda\n{source_for_prompt}\n```\n\n"
+            if preprocessed_source:
+                draft = (preprocessed_source if self_contained
+                         else preprocessed_source[:6000])
+                excerpt = kernel_source[:2000]
+                elided = "\n... (original elided — the draft below is its translation)" \
+                    if len(kernel_source) > len(excerpt) else ""
+                prompt += (
+                    f"ORIGINAL CUDA (reference only — do not port this again):\n"
+                    f"```cuda\n{excerpt}{elided}\n```\n\n"
+                    f"HIP DRAFT TO EDIT (mechanically translated; return this file with "
+                    f"the checklist applied):\n```hip\n{draft}\n```\n\n"
+                )
+            else:
+                prompt += f"```cuda\n{source_for_prompt}\n```\n\n"
 
         # Bug 3: a full sample may depend on a project-specific local header
         # this repo never vendored (e.g. shfl_integral_image.cuh). Kimi can't
@@ -2264,18 +2446,23 @@ class ModelRouter:
         # self-containment from the original kernel_source (ground truth),
         # not previous_code, since previous_code may itself be missing
         # main() precisely because of the bug this fix addresses.
-        # TRIZ #10/#22: For DEVICE_SUBSET, strip the original CUDA reference
-        # to kernel-only so the coder sees only what it should port.
+        # V2: _strip_to_kernel_only broke plan/pattern line-reference alignment.
+        # Show full source and use explicit instruction instead.
         self_contained = self._is_self_contained(kernel_source)
-        if self_contained and port_mode == PortMode.DEVICE_SUBSET.value:
-            source_for_prompt = self._strip_to_kernel_only(kernel_source)
-        else:
-            source_for_prompt = kernel_source if self_contained else kernel_source[:4000]
+        source_for_prompt = kernel_source if self_contained else kernel_source[:4000]
         previous_for_prompt = previous_code if self_contained else previous_code[:4000]
         prompt += (
             f"Original CUDA:\n```cuda\n{source_for_prompt}```\n\n"
             f"Your previous output:\n```hip\n{previous_for_prompt}```\n\n"
         )
+        if port_mode == PortMode.DEVICE_SUBSET.value:
+            prompt += (
+                "\u26a0\ufe0f DEVICE-SUBSET MODE: Output ONLY the __global__ "
+                "and/or __device__ kernel function(s). Do NOT include host code, "
+                "helper functions, main(), or a test harness. "
+                "The system automatically wraps your kernel in a proper "
+                "HIP compilation unit.\n\n"
+            )
         # ── A2A v2 Channel 3: Iteration memory ──
         if stagnation_count >= 1:
             prompt += (
