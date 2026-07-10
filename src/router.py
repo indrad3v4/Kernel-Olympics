@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 logger = logging.getLogger(__name__)
 
 from prompt_evolution import prompt_opt, PromptOptimizer
+from debug_session import DebugSession
 from verification.spec_parser import auto_generate_spec as _auto_gen_spec
 from verification.structural import (
     validate_structure as _validate_structure,
@@ -632,7 +633,7 @@ class ModelRouter:
       5. DeepSeek verifies the output
     """
 
-    def __init__(self, api_key: str = ""):
+    def __init__(self, api_key: str = "", debug: Optional[bool] = None):
         self.api_key = api_key or os.environ.get("FIREWORKS_API_KEY", "")
         self.base_url = "https://api.fireworks.ai/inference/v1"
         self.total_cost = 0.0
@@ -641,6 +642,28 @@ class ModelRouter:
         # Replaced by route() with a real budget. Unlimited by default so a
         # bare _call_model() outside the pipeline keeps its per-model timeout.
         self._deadline: Deadline = Deadline(0)
+        # Phase 11: Debug Mode. `self.debug` is ALWAYS a session object — a null
+        # one when Debug Mode is off — so no call site branches on it. route()
+        # replaces it with a live session when enabled.
+        self._debug_requested = debug
+        self.debug = DebugSession.disabled()
+        # Names the stage that the next _call_model() belongs to, so a raw model
+        # response lands in 02_planning/ vs 03_translation/ vs 10_evaluation/
+        # without _call_model needing to know the pipeline's shape.
+        self._debug_stage: str = ""
+        # True when route() created the session and must therefore finalize it.
+        self._owns_debug_session: bool = True
+
+    def _finalize_debug(self, result: Dict):
+        """Write the summary — but only for a session route() itself created.
+
+        A caller that supplied the session (main.py, which still has an
+        authoritative verify() compile to record) finalizes it themselves. This
+        method is the single place that rule is enforced.
+        """
+        if not self._owns_debug_session:
+            return None
+        return self.debug.finalize(result)
 
     # Definition-shaped markers for the injected NVIDIA helper shims. Any one of
     # them present means the block is already in the file. Checked instead of the
@@ -1347,10 +1370,20 @@ class ModelRouter:
 
     # ── Phase prompt builders ────────────────────────────────────
 
-    def _postprocess_port(self, model_output: str, kernel_source: str):
+    def _postprocess_port(self, model_output: str, kernel_source: str,
+                          iteration: int = 0, generation: Optional[int] = None,
+                          model: str = "kimi27", tokens: int = 0,
+                          latency_ms: float = 0.0):
         """Turn a raw coder response into the code the compiler will actually see.
 
         Returns ``(code, regex_changelog, main_restored, structural)``.
+
+        Phase 11: every generation the loop consumes passes through here, so this
+        is where Debug Mode captures the full decision chain for one generation —
+        raw response, extraction report, lexical verdict, structural verdict,
+        symbol diff, and static-analysis findings. Logging happens after each
+        decision is made, so an artifact always reflects the value the pipeline
+        actually acted on rather than a re-derivation.
 
         Every path that accepts model output — the initial port, a refine, and the
         refine's retry — must apply the same steps in the same order, or the
@@ -1386,11 +1419,37 @@ class ModelRouter:
         # try the legacy fallback so a partially-recognized response is not
         # silently discarded — the lexical gate below decides whether either
         # candidate is actually source code.
-        extraction = _extract_code_v2(model_output)
-        if extraction.ok:
-            code = extraction.code
-        else:
-            code = self._extract_code(model_output)
+        #
+        # The stage timer wraps the parse itself, not the logging of it — that is
+        # what makes "parser latency" in metrics.json a measurement rather than
+        # an aspiration.
+        with self.debug.stage("extraction"):
+            extraction = _extract_code_v2(model_output)
+            if extraction.ok:
+                code = extraction.code
+            else:
+                code = self._extract_code(model_output)
+
+        # Debug Mode: persist the generation and the extraction decision before
+        # any repair regex mutates the text. `gen` ties every later artifact for
+        # this generation together.
+        gen = generation
+        if self.debug.enabled:
+            from debug_session import discarded_text as _discarded
+            gen = self.debug.log_generation(
+                raw_response=model_output,
+                extracted_code=code or "",
+                discarded=_discarded(model_output, code or ""),
+                iteration=iteration, generation=generation, model=model,
+                tokens=tokens, latency_ms=latency_ms,
+                success=bool(code and code.strip()),
+                fallback_extractor_used=not extraction.ok,
+            )
+            self.debug.log_extraction(extraction, generation=gen, iteration=iteration)
+            self.debug.transition(
+                "CODE_EXTRACTED",
+                reason=f"strategy={extraction.strategy}",
+                validation_result=extraction.ok, iteration=iteration, generation=gen)
 
         # Why a restore was declined matters as much as when one happened: a silent
         # no-op here looks identical to "the coder kept its main()".
@@ -1420,21 +1479,50 @@ class ModelRouter:
         # Lexical gate FIRST — pure reasoning, markdown, and role tags never
         # reach hipcc.  A failure here is folded into the structural result so
         # the existing structural-reject → refine path fires unchanged.
-        try:
-            lexical = _validate_lexical(code)
-        except Exception as _lx_exc:  # a bug in the gate must not kill the loop
-            logger.debug("lexical validation errored: %s", _lx_exc)
-            lexical = None
+        with self.debug.stage("lexical_validation"):
+            try:
+                lexical = _validate_lexical(code)
+            except Exception as _lx_exc:  # a bug in the gate must not kill the loop
+                logger.debug("lexical validation errored: %s", _lx_exc)
+                lexical = None
 
         # Structural gate against the post-fix code, not the raw extract: hipcc will
         # see the fixed version, so that is what must stand up. A failure here is a
         # hard reject upstream (see the loop's pre-compile check), so keep this
         # scoped strictly to defects that cannot occur in valid C++.
-        try:
-            structural = _validate_structure(kernel_source, code)
-        except Exception as _sv_exc:  # never let the gate itself take down the loop
-            logger.debug("structural validation errored: %s", _sv_exc)
-            structural = _StructuralResult(ok=True, warnings=["structural check errored"])
+        with self.debug.stage("structural_validation"):
+            try:
+                structural = _validate_structure(kernel_source, code)
+            except Exception as _sv_exc:  # never let the gate itself take down the loop
+                logger.debug("structural validation errored: %s", _sv_exc)
+                structural = _StructuralResult(ok=True, warnings=["structural check errored"])
+
+        # Debug Mode: record BOTH verdicts as they were computed, before the
+        # merge below folds the lexical failure into the structural result. A
+        # reader must be able to tell "the braces were fine, the text was prose"
+        # from "the braces were broken" — the merged object cannot say that.
+        if self.debug.enabled:
+            self.debug.log_lexical(lexical, generation=gen, iteration=iteration, code=code)
+            self.debug.transition(
+                "LEXICAL_VALIDATION",
+                reason=(lexical.reason() if lexical is not None else "validator errored"),
+                validation_result=(lexical.ok if lexical is not None else None),
+                iteration=iteration, generation=gen)
+            self.debug.log_structural(structural, generation=gen, iteration=iteration,
+                                      cuda_source=kernel_source, hip_source=code)
+            self.debug.transition(
+                "STRUCTURAL_VALIDATION", reason=structural.reason(),
+                validation_result=structural.ok, iteration=iteration, generation=gen)
+            self.debug.log_symbols(kernel_source, code, generation=gen, iteration=iteration)
+            # Static analysis runs on the exact text hipcc is about to see, and
+            # is persisted whether or not a compile follows. When the compile is
+            # skipped by a gate, these findings are the only pre-compile
+            # evidence that survives.
+            self.debug.log_static_analysis(code, generation=gen, iteration=iteration)
+            if lexical is not None and not lexical.ok:
+                self.debug.count("lexical_rejects")
+            if not structural.ok:
+                self.debug.count("structural_rejects")
 
         if lexical is not None and not lexical.ok:
             merged_errors = ["[lexical] " + e for e in lexical.errors]
@@ -2329,7 +2417,9 @@ class ModelRouter:
               verifier=None,
               kernel_name: str = "test_kernel",
               max_seconds: Optional[float] = None,
-              fast_path: bool = True) -> Dict:
+              fast_path: bool = True,
+              debug: Optional[bool] = None,
+              debug_session=None) -> Dict:
         """Route kernel through the loop engineering pipeline.
 
         Loop: DeepSeek (plan) → Kimi (code) → [hipcc compile FIRST] → GLM (evaluate only if compile passes) → feedback → Kimi refines
@@ -2355,22 +2445,85 @@ class ModelRouter:
                 Pass 0 (or a negative value) to disable the budget entirely.
             fast_path: Try the mechanical hipify → compile → run shortcut before
                 any LLM call. Set False to exercise the model loop directly.
+            debug: Enable Phase 11 Debug Mode for this call. None (default)
+                defers to the KERNEL_OLYMPICS_DEBUG / KERNEL_DEBUG_MODE
+                environment variables, or to the value passed to __init__.
+            debug_session: An existing DebugSession to record into. Pass one when
+                the caller's unit of work is larger than a route() — main.py's
+                pipeline also runs an authoritative verify() compile after this
+                returns, and that compile belongs in the same session directory.
+                Ownership follows creation: a session passed in here is NOT
+                finalized by route(), because the caller has more to record.
 
         Returns:
             {"ported_code": ..., "confidence": ..., "changes": [...],
              "model_used": ..., "cost": ..., "orchestrator_passed": ...,
              "iterations_used": ..., "compile_errors": [...]}
         """
+        # Ownership rule: whoever creates the session finalizes it. route()
+        # creates one only when the caller did not supply it, and finalizes only
+        # what it created — otherwise a summary is written before the caller has
+        # finished recording, and every later artifact is missing from it.
+        if debug_session is not None:
+            self.debug = debug_session
+            self._owns_debug_session = False
+        else:
+            want_debug = debug if debug is not None else self._debug_requested
+            self.debug = DebugSession.create(kernel_name, enabled=want_debug)
+            self._owns_debug_session = True
+
+        if self.debug.enabled:
+            if self._owns_debug_session:
+                print(f"║  │  🐞 DEBUG MODE: session → {str(self.debug.dir)[:38]:<38}║")
+            # Give the verifier the same session so the compiler stage records
+            # its argv, environment and untruncated output into this directory.
+            if verifier is not None and hasattr(verifier, "attach_debug_session"):
+                verifier.attach_debug_session(self.debug)
+
+        try:
+            return self._route_impl(kernel_source, patterns, max_iterations,
+                                    on_phase, verifier, kernel_name, max_seconds,
+                                    fast_path)
+        except BaseException as exc:
+            # "Whenever execution terminates unexpectedly, automatically generate
+            # a failure package." A KeyboardInterrupt is exactly such a
+            # termination — and the one most likely to strand a long run — so we
+            # catch BaseException, snapshot, and re-raise untouched. The snapshot
+            # is written even for a borrowed session: the caller may never get
+            # the chance to finalize it.
+            self.debug.snapshot_failure(exc, reason=f"route() raised {type(exc).__name__}")
+            if self._owns_debug_session:
+                self.debug.finalize({"abort_reason": "exception"})
+            raise
+        finally:
+            # A borrowed session stays attached to the verifier — the caller is
+            # about to use it. One we created is done the moment route() returns.
+            if (self._owns_debug_session and verifier is not None
+                    and hasattr(verifier, "detach_debug_session")):
+                verifier.detach_debug_session()
+
+    def _route_impl(self, kernel_source: str, patterns: List[Dict],
+                    max_iterations: int = 10,
+                    on_phase=None,
+                    verifier=None,
+                    kernel_name: str = "test_kernel",
+                    max_seconds: Optional[float] = None,
+                    fast_path: bool = True) -> Dict:
+        """The pipeline proper. See :meth:`route` for the contract."""
         if not self.api_key:
-            return {"ported_code": "", "confidence": 0,
-                    "changes": ["No API key -- use template fallback"],
-                    "model_used": "none", "cost": 0,
-                    "orchestrator_passed": False, "iterations_used": 0,
-                    "compile_errors": [], "compile_passed": False,
-                    "best_attempt_code": "", "best_attempt_iteration": 0,
-                    "best_attempt_confidence": 0.0,
-                    "prompt_version": PROMPT_VERSION, "timed_out": False,
-                    "fast_path_used": False, "hipify_transforms": 0}
+            no_key = {"ported_code": "", "confidence": 0,
+                      "changes": ["No API key -- use template fallback"],
+                      "model_used": "none", "cost": 0,
+                      "orchestrator_passed": False, "iterations_used": 0,
+                      "compile_errors": [], "compile_passed": False,
+                      "best_attempt_code": "", "best_attempt_iteration": 0,
+                      "best_attempt_confidence": 0.0,
+                      "prompt_version": PROMPT_VERSION, "timed_out": False,
+                      "fast_path_used": False, "hipify_transforms": 0}
+            self.debug.transition("ABORTED", reason="no API key configured",
+                                  validation_result=False)
+            self._finalize_debug(no_key)
+            return no_key
 
         # P0: start the wall-clock budget before the first LLM call. _call_model
         # reads self._deadline and clamps every request timeout to what is left.
@@ -2437,6 +2590,25 @@ class ModelRouter:
         result["changes"].append(
             f"[hipify] {len(hipify_changelog)} mechanical transforms applied before any LLM call")
 
+        # Debug Mode: the input stage is complete only now — "preprocessing
+        # results" means the hipified draft, not the raw file, so it is logged
+        # after hipify rather than at the top of route().
+        self.debug.log_input(
+            kernel_source,
+            classifier_results={"patterns": patterns, "pattern_count": len(patterns or [])},
+            patterns=patterns,
+            preprocessed_source=hipified_source,
+            preprocessing_changelog=hipify_changelog,
+            run_id=self.run_id,
+            max_iterations=max_iterations,
+            budget_seconds=budget,
+            prompt_version=PROMPT_VERSION,
+            fast_path_requested=fast_path,
+        )
+        self.debug.transition("INPUT_RECEIVED",
+                              reason=f"{len(hipify_changelog)} hipify transforms",
+                              validation_result=True)
+
         residual = self._residual_cuda_symbols(hipified_source)
         if residual:
             result["changes"].append(
@@ -2481,6 +2653,12 @@ class ModelRouter:
                         f"[fast-path] hipify output compiled AND ran clean — "
                         f"skipped DeepSeek, Kimi and GLM entirely (0 LLM calls)")
                     print(f"║  │  ⚡ FAST PATH: mechanical port compiled and ran — no LLM needed{'':<3}║")
+                    if self.debug.enabled:
+                        self.debug.log_static_analysis(hipified_source, generation=0)
+                        self.debug.log_symbols(kernel_source, hipified_source, generation=0)
+                        self.debug.transition("SUCCESS", reason="fast path: hipify compiled and ran",
+                                              validation_result=True)
+                        self._finalize_debug(result)
                     return result
 
                 sig = (rc.get("signal") or f"exit {rc.get('run_exit_code')}"
@@ -2520,7 +2698,11 @@ class ModelRouter:
             result["changes"].append(
                 f"[deepseek] Planning SKIPPED — a {budget:.0f}s budget leaves no slice for "
                 f"a plan once the coder's share is reserved; porting without one")
+            self.debug.transition("PLAN_SKIPPED",
+                                  reason=f"budget {budget:.0f}s leaves no plan slice",
+                                  validation_result=None)
         else:
+            self._debug_stage = "02_planning"
             if on_phase: on_phase("plan", "DeepSeek-v4-pro", "planning CUDA→HIP strategy")
             # Hand the planner the mechanical draft so it plans the wavefront delta
             # rather than re-deriving the translation. Only when hipify actually did
@@ -2537,6 +2719,7 @@ class ModelRouter:
                                     max_seconds=plan_cap,
                                     max_tokens_override=(PLAN_DELTA_MAX_TOKENS
                                                          if delta_plan else None))
+            self._debug_stage = ""
             # I3: Log model I/O for reproducibility
             try:
                 (run_dir / "phase1_plan_input.json").write_text(
@@ -2546,6 +2729,29 @@ class ModelRouter:
                                 "output": plan.output[:5000]}, indent=2), encoding="utf-8")
             except (OSError, TypeError, ValueError) as _log_exc:
                 logger.debug("run-dir logging skipped: %s", _log_exc)
+
+            # Debug Mode: the plan is prose by design, so "parsed plan" here is
+            # the checklist we can recover from it, and the validation report
+            # states plainly that a plan is advisory — it never gates the port.
+            if self.debug.enabled:
+                self.debug.log_planning(
+                    raw_response=plan.output,
+                    extracted_plan=plan.output,
+                    parsed_plan={"lines": [l for l in plan.output.splitlines() if l.strip()][:40]},
+                    validation={
+                        "advisory_only": True,
+                        "non_empty": bool(plan.output.strip()),
+                        "gate": "none — a failed plan never blocks the coder",
+                    },
+                    discarded="",
+                    tokens=plan.tokens_used, latency_ms=plan.elapsed_ms,
+                    model="deepseek", success=plan.success,
+                    delta_plan=delta_plan, cap_seconds=plan_cap,
+                )
+                self.debug.transition(
+                    "PLAN_GENERATED" if plan.success else "PLAN_FAILED",
+                    reason=("plan produced" if plan.success else "planner call failed"),
+                    validation_result=plan.success)
 
         if plan.success:
             planner_success = True
@@ -2579,10 +2785,16 @@ class ModelRouter:
                     else max(deadline.remaining() - COMPILE_RESERVE_SECONDS, 0.0))
         # Output tokens are the coder's latency. Size the budget to the kernel.
         adaptive_tokens = self._compute_adaptive_max_tokens(hipified_source or kernel_source)
+        self._debug_stage = "03_translation"
         code = self._call_model("kimi27", kimi_prompt,
                                 system_prompt=SYSTEM_PROMPTS.get("kimi27", ""),
                                 max_seconds=code_cap,
                                 max_tokens_override=adaptive_tokens)
+        self._debug_stage = ""
+        self.debug.transition(
+            "CODE_GENERATED" if code.success else "CODE_GENERATION_FAILED",
+            reason=f"kimi27 initial port ({len(code.output)} chars)",
+            validation_result=code.success, iteration=0)
         # I3: Log Kimi code generation
         try:
             (run_dir / "phase2_kimi_output.json").write_text(
@@ -2605,7 +2817,8 @@ class ModelRouter:
             # 2026-07-09 run its whole budget. Restore it here, before the first
             # compile, so no LLM phase ever sees the resulting link error.
             extracted, regex_changelog, main_restored, structural = self._postprocess_port(
-                code.output, kernel_source)
+                code.output, kernel_source, iteration=0, model="kimi27",
+                tokens=code.tokens_used, latency_ms=code.elapsed_ms)
             if main_restored:
                 result["changes"].append(
                     "[main] Coder dropped main() from a self-contained program — "
@@ -2638,6 +2851,8 @@ class ModelRouter:
                 for _err in structural.errors:
                     result["changes"].append(f"[structural] REJECT: {_err}")
                 print(f"║  │  🧱 STRUCTURAL REJECT: {structural.reason()[:38]:<38}║")
+                self.debug.event("structural_reject", reason=structural.reason(),
+                                 iteration=0, hipcc_skipped=True)
                 evaluator_feedback = (
                     "STRUCTURAL VALIDATION FAILED — your last output cannot be "
                     "compiled because it is not valid C++ at the text level.\n"
@@ -2662,7 +2877,13 @@ class ModelRouter:
                 # the two unconditional lines below still fire.
             elif verifier and hasattr(verifier, 'quick_compile_check'):
                 if on_phase: on_phase("compile", "hipcc", "in-loop compilation check")
-                cc = verifier.quick_compile_check(extracted, kernel_name=kernel_name)
+                with self.debug.stage("hipcc"):
+                    cc = verifier.quick_compile_check(extracted, kernel_name=kernel_name)
+                self.debug.transition(
+                    "HIPCC_COMPILE",
+                    reason=("compile passed" if cc["compile_success"]
+                            else f"{len(cc.get('errors', []))} compile errors"),
+                    validation_result=cc["compile_success"], iteration=0)
                 if cc["compile_success"]:
                     result["changes"].append("[hipcc] In-loop compile: PASSED ✅")
                     compile_passed = True
@@ -2670,6 +2891,7 @@ class ModelRouter:
                     best_attempt_code = extracted
                     best_attempt_iteration = 0
                 else:
+                    self.debug.count("compile_failures")
                     compile_errs = cc.get("errors", [])
                     # Bug 4: assign (not extend) — compile_errors always reflects the
                     # LATEST check's state, not an ever-growing accumulation of every
@@ -2733,6 +2955,12 @@ class ModelRouter:
                 result["changes"].append("[kimi27] Code generation FAILED")
             # Can't proceed without initial code
             result["cost"] = round(self.total_cost, 4)
+            # No kernel was produced — that is an unexpected termination, and
+            # the raw (failed) coder response is already on disk. Package it.
+            self.debug.snapshot_failure(
+                reason=result.get("abort_reason", "initial code generation failed"),
+                context={"starved": starved, "code_cap": code_cap})
+            self._finalize_debug(result)
             return result
 
         # ── Phase 3: hipcc COMPILE FIRST → (GLM eval only if compile passes) → Kimi refines ──
@@ -2764,6 +2992,10 @@ class ModelRouter:
         for iteration in range(1, max_iterations + 1):
             if not result["ported_code"]:
                 break
+            self.debug.event("iteration_start", reason=f"iteration {iteration}",
+                             iteration=iteration,
+                             remaining_seconds=(None if deadline.unlimited
+                                                else round(deadline.remaining(), 1)))
 
             # ── P0: wall-clock budget check at the iteration boundary ──
             # Checked here (not mid-call) because an iteration is the unit of work
@@ -2872,6 +3104,12 @@ class ModelRouter:
                     + "; ".join(iter_structural.get("errors", [])[:2])[:120])
                 print(f"║  │  🧱 STRUCTURAL GATE (iter {iteration}): hipcc skipped "
                       f"— see structural feedback{'':<3}║")
+                self.debug.transition(
+                    "STRUCTURAL_REJECT",
+                    reason="; ".join(iter_structural.get("errors", []))[:160],
+                    validation_result=False, iteration=iteration, hipcc_skipped=True)
+                self.debug.event("structural_reject", iteration=iteration,
+                                 reason="hipcc skipped — text-level defect")
                 evaluator_feedback = (
                     "STRUCTURAL VALIDATION FAILED (iter {}). hipcc was NOT run — "
                     "the code has defects that would only produce parser noise.\n"
@@ -2889,7 +3127,13 @@ class ModelRouter:
                 state.gate = "compile"
                 state.compile_ran = True
                 if on_phase: on_phase("compile", "hipcc", f"compile-first check (attempt {iteration}/{max_iterations})")
-                cc = verifier.quick_compile_check(result["ported_code"], kernel_name=kernel_name)
+                with self.debug.stage("hipcc"):
+                    cc = verifier.quick_compile_check(result["ported_code"], kernel_name=kernel_name)
+                self.debug.transition(
+                    "HIPCC_COMPILE",
+                    reason=("compile passed" if cc["compile_success"]
+                            else f"{len(cc.get('errors', []))} compile errors"),
+                    validation_result=cc["compile_success"], iteration=iteration)
                 # I3: Log iteration compile result for reproducibility.
                 # Now includes the structural score and dropped symbols so a failing
                 # iteration is diagnosable from its JSON alone.
@@ -2931,7 +3175,17 @@ class ModelRouter:
                     # isinstance guard: mocked verifiers in tests return MagicMock,
                     # which must read as "no run info" (pass), not crash.
                     if verifier and hasattr(verifier, 'quick_run_check'):
-                        rc = verifier.quick_run_check(kernel_name)
+                        with self.debug.stage("run"):
+                            rc = verifier.quick_run_check(kernel_name)
+                        if isinstance(rc, dict):
+                            self.debug.write_json(
+                                "09_compiler", f"run_iter{iteration}", rc)
+                            self.debug.transition(
+                                "BINARY_RUN",
+                                reason=("ran clean" if rc.get("run_success")
+                                        else f"crashed: {rc.get('signal') or rc.get('run_exit_code')}"),
+                                validation_result=rc.get("run_success"),
+                                iteration=iteration)
                         if isinstance(rc, dict) and rc.get("run_success") is True:
                             runtime_crash_count = 0  # consecutive-crash counter
                             result["changes"].append(
@@ -2941,6 +3195,7 @@ class ModelRouter:
                             state.run_crashed = True
                             run_crashed_this_iter = True
                             runtime_crash_count += 1
+                            self.debug.count("runtime_crashes")
                             sig = rc.get("signal") or f"exit {rc.get('run_exit_code')}"
                             crash_output = (rc.get("run_output") or "").strip()
                             result["changes"].append(
@@ -2979,6 +3234,7 @@ class ModelRouter:
                     error_origins = cc.get("error_origins", [])
                     state.compile_errs = list(compile_errs)
                     state.error_origins = list(error_origins)
+                    self.debug.count("compile_failures")
                     # P0: a link failure carries no information any model can act on.
                     # The missing-main case is already gone by here — _postprocess_port
                     # reattaches the driver before the first compile — so what remains
@@ -3078,6 +3334,12 @@ class ModelRouter:
                         f"[hipcc] Iter {iteration}: {current_err_count} errors "
                         f"(delta: {error_delta:+d}, new: {len(new_errors_norm)}, "
                         f"resolved: {len(resolved_errors)})")
+                    self.debug.event(
+                        "compile_errors", iteration=iteration,
+                        reason=f"{current_err_count} errors (delta {error_delta:+d})",
+                        error_count=current_err_count, error_delta=error_delta,
+                        new_errors=sorted(new_errors_norm),
+                        resolved_errors=sorted(resolved_errors))
 
                     # LIVE VISIBILITY: Print error details during loop, not after.
                     # verifier._compile() already strips the temp build-dir path prefix
@@ -3140,7 +3402,17 @@ class ModelRouter:
                                 # Inject extern int declarations at top of ported code
                                 shim_lines = "\n".join(
                                     f"extern int {name};" for name in sorted(undeclared_ids))
+                                _code_before_shim = result["ported_code"]
                                 result["ported_code"] = shim_lines + "\n" + result["ported_code"]
+                                # A shim injection is a patch the pipeline authored
+                                # itself, not one a model proposed. It is recorded
+                                # the same way so the patch history is complete.
+                                self.debug.log_patch(
+                                    before=_code_before_shim, after=result["ported_code"],
+                                    iteration=iteration, source_label="shim_injection",
+                                    rationale=f"extern int shims for undeclared: "
+                                              f"{', '.join(sorted(undeclared_ids))}",
+                                    confidence=None)
                                 result["changes"].append(
                                     f"[kimi-plateau] Injected extern int shims for "
                                     f"{len(undeclared_ids)} undeclared identifiers: "
@@ -3150,8 +3422,14 @@ class ModelRouter:
 
                                 # Re-compile one more time (no more Kimi)
                                 if verifier and hasattr(verifier, 'quick_compile_check'):
-                                    cc_retry = verifier.quick_compile_check(
-                                        result["ported_code"], kernel_name=kernel_name)
+                                    with self.debug.stage("hipcc"):
+                                        cc_retry = verifier.quick_compile_check(
+                                            result["ported_code"], kernel_name=kernel_name)
+                                    self.debug.transition(
+                                        "HIPCC_COMPILE",
+                                        reason="recompile after shim injection",
+                                        validation_result=cc_retry.get("compile_success", False),
+                                        iteration=iteration)
                                     if cc_retry.get("compile_success", False):
                                         result["compile_errors"] = []
                                         compile_passed = True
@@ -3217,12 +3495,19 @@ class ModelRouter:
                             kernel_source, patterns, result["ported_code"],
                             compile_errs, deepseek_plan_output,
                         )
+                        self._debug_stage = "02_planning"
                         re_plan = self._call_model(
                             "deepseek", replan_prompt,
                             system_prompt=SYSTEM_PROMPTS.get("deepseek", ""),
                         )
+                        self._debug_stage = ""
                         replan_count += 1
                         replanned_this_iter = True
+                        self.debug.count("replans")
+                        self.debug.transition(
+                            "REPLAN", reason=f"escalation ({trigger})",
+                            validation_result=re_plan.success, iteration=iteration,
+                            replan_count=replan_count)
                         if re_plan.success:
                             deepseek_plan_output = re_plan.output
                             result["changes"].append(
@@ -3271,12 +3556,19 @@ class ModelRouter:
                             kernel_source, patterns, result["ported_code"],
                             compile_errs, deepseek_plan_output,
                         )
+                        self._debug_stage = "02_planning"
                         re_plan = self._call_model(
                             "deepseek", replan_prompt,
                             system_prompt=SYSTEM_PROMPTS.get("deepseek", ""),
                         )
+                        self._debug_stage = ""
                         replan_count += 1
                         replanned_this_iter = True
+                        self.debug.count("replans")
+                        self.debug.transition(
+                            "REPLAN", reason=f"stagnation={stagnation_count}",
+                            validation_result=re_plan.success, iteration=iteration,
+                            replan_count=replan_count)
                         if re_plan.success:
                             deepseek_plan_output = re_plan.output
                             result["changes"].append(
@@ -3388,11 +3680,13 @@ class ModelRouter:
                             error_delta=error_delta, stagnation_count=stagnation_count,
                             error_context=cc.get("error_context"),
                             self_contained=self._is_self_contained(kernel_source))
+                        self._debug_stage = "10_evaluation"
                         glm_err = self._call_model(
                             "glm", glm_err_prompt,
                             system_prompt=SYSTEM_PROMPTS.get("glm_error_analyst", ""),
                             prefill='{"fixes":'  # TRIZ #9: force JSON
                         )
+                        self._debug_stage = ""
                         if glm_err.success:
                             # Parse GLM error analysis
                             raw_glm = glm_err.output.strip()
@@ -3425,6 +3719,24 @@ class ModelRouter:
                                 last_brace = raw_glm.rfind("}")
                                 if first_brace >= 0 and last_brace > first_brace:
                                     glm_analysis = {"fixes": [], "_raw": raw_glm[first_brace:last_brace+1]}
+
+                            # Debug Mode: the raw response is already on disk via
+                            # _call_model; this records what the four parse
+                            # strategies made of it — the step where a confident
+                            # analysis silently becomes an empty one.
+                            if self.debug.enabled:
+                                self.debug.log_evaluation(
+                                    raw_response="",  # already persisted by _call_model
+                                    parsed=glm_analysis, model="glm",
+                                    iteration=iteration, mode="error_analysis",
+                                    root_cause=[f.get("root_cause") for f in
+                                                (glm_analysis or {}).get("fixes", [])],
+                                    recommended_fixes=(glm_analysis or {}).get("fixes", []),
+                                    confidence=(glm_analysis or {}).get("confidence"),
+                                    parse_strategy=("failed" if glm_analysis is None
+                                                    else "one of 4 JSON strategies"),
+                                    compile_error_count=len(compile_errs),
+                                )
 
                             # ── Build feedback from parsed analysis ──
                             fixes = glm_analysis.get("fixes", []) if glm_analysis else []
@@ -3545,11 +3857,18 @@ class ModelRouter:
                       f"({replan_count + 1}/{MAX_REPLANS}){'':<14}║")
                 if on_phase: on_phase("replan", "DeepSeek-v4-pro",
                     f"informed re-plan after GLM (iter {iteration})")
+                self._debug_stage = "02_planning"
                 re_plan = self._call_model(
                     "deepseek", replan_prompt,
                     system_prompt=SYSTEM_PROMPTS.get("deepseek", ""),
                 )
+                self._debug_stage = ""
                 replan_count += 1
+                self.debug.count("replans")
+                self.debug.transition(
+                    "REPLAN", reason=f"GLM-informed re-plan {replan_count}/{MAX_REPLANS}",
+                    validation_result=re_plan.success, iteration=iteration,
+                    replan_count=replan_count)
                 if re_plan.success:
                     deepseek_plan_output = re_plan.output
                     result["changes"].append(
@@ -3597,15 +3916,20 @@ class ModelRouter:
                 if on_phase: on_phase("evaluate", "GLM-5.2", f"semantic eval (attempt {iteration}/{max_iterations}, compile passed)")
                 result["changes"].append(
                     f"[glm] Evaluating code (attempt {iteration}/{max_iterations}, compile passed)")
+                self._debug_stage = "10_evaluation"
                 evaluator = self._call_model(
                     "glm", eval_prompt,
                     system_prompt=SYSTEM_PROMPTS.get("glm", ""),
                     prefill='{"pass":'  # TRIZ #9: force JSON start, prevent prose
                 )
+                self._debug_stage = ""
 
                 if not evaluator.success:
                     result["changes"].append(
                         f"[glm] Call failed (iteration {iteration})")
+                    self.debug.transition("EVALUATION_FAILED",
+                                          reason="GLM call failed",
+                                          validation_result=False, iteration=iteration)
                     break
 
                 # Parse GLM evaluator JSON response
@@ -3679,10 +4003,29 @@ class ModelRouter:
                             "verdict": verdict_match.group(1) if verdict_match else "",
                         }
 
+                if self.debug.enabled:
+                    self.debug.log_evaluation(
+                        raw_response="",  # already persisted by _call_model
+                        parsed=parsed, model="glm", iteration=iteration,
+                        mode="semantic_eval",
+                        root_cause=(parsed or {}).get("verdict"),
+                        recommended_fixes=(parsed or {}).get("issues", []),
+                        confidence=(parsed or {}).get("confidence"),
+                        parse_strategy=("failed — all 4 strategies" if parsed is None
+                                        else "one of 4 JSON strategies"),
+                    )
+                    self.debug.transition(
+                        "SEMANTIC_EVALUATION",
+                        reason=("unparseable response" if parsed is None
+                                else ("pass" if parsed.get("pass") else "issues found")),
+                        validation_result=(None if parsed is None else parsed.get("pass")),
+                        iteration=iteration)
+
                 if parsed is None:
                     # ── TRIZ #20: Continuation of useful action ──
                     # Don't break the loop on parse failure. Extract whatever
                     # feedback we can from the raw response and continue refining.
+                    self.debug.count("evaluator_parse_failures")
                     prose_feedback = raw[:600] if raw else "No feedback extracted"
                     result["changes"].append(
                         f'[glm] JSON parse error (iter {iteration}), '
@@ -3710,6 +4053,9 @@ class ModelRouter:
                 # Compile already passed (we only ran GLM because it did),
                 # or there's no verifier (GLM pass is sufficient in that case).
                 result["orchestrator_passed"] = True
+                self.debug.transition(
+                    "SUCCESS", reason="compile + run + semantic evaluation all passed",
+                    validation_result=True, iteration=iteration)
                 break  # Truly converged — compile + run + GLM all passed
 
             # ── Step 4: Kimi refines with whatever feedback we have ──────────
@@ -3813,15 +4159,38 @@ class ModelRouter:
                     preprocessed_source=hipified_source,
                     structural_report=result.get("structural"),
                 )
+                self.debug.transition("PATCH_GENERATION",
+                                      reason=f"refine on {feedback_label}",
+                                      iteration=iteration)
+                self._debug_stage = "03_translation"
                 refine = self._call_model(
                     "kimi27", refine_prompt,
                     system_prompt=SYSTEM_PROMPTS.get("kimi27", ""),
                     max_seconds=refine_cap,
                     max_tokens_override=adaptive_tokens,
                 )
+                self._debug_stage = ""
                 if refine.success:
+                    code_before_refine = result["ported_code"]
                     extracted, regex_changelog, main_restored, structural = self._postprocess_port(
-                        refine.output, kernel_source)
+                        refine.output, kernel_source, iteration=iteration,
+                        model="kimi27", tokens=refine.tokens_used,
+                        latency_ms=refine.elapsed_ms)
+                    # Every repair iteration is stored separately: the diff between
+                    # what the loop had and what the coder returned, computed from
+                    # the two texts rather than taken from the model's word for it.
+                    self.debug.log_patch(
+                        before=code_before_refine, after=extracted,
+                        iteration=iteration, source_label="refine",
+                        rationale=f"refined against {feedback_label}",
+                        confidence=refine.confidence,
+                        structural_ok_after=structural.ok)
+                    self.debug.transition(
+                        "PATCH_APPLICATION",
+                        reason=(f"refine applied (iter {iteration})" if structural.ok else
+                                f"refine applied but failed validation (iter {iteration}) "
+                                f"— the next iteration's gate will reject it"),
+                        validation_result=structural.ok, iteration=iteration)
                     if main_restored:
                         result["changes"].append(
                             f"[main] Refine at iter {iteration} dropped main() — "
@@ -3867,19 +4236,33 @@ class ModelRouter:
                         break
                     result["changes"].append(
                         f"[kimi27] Refinement failed (iteration {iteration}), retrying with 1.5x timeout...")
+                    self.debug.count("refine_retries")
+                    self.debug.event("refine_retry", iteration=iteration,
+                                     reason="refine call failed — 1.5x timeout retry")
                     # S4: Retry once with increased timeout — API failures are transient
                     original_timeout = MODEL_CATALOG["kimi27"]["timeout"]
                     MODEL_CATALOG["kimi27"]["timeout"] = int(original_timeout * 1.5)
+                    self._debug_stage = "03_translation"
                     retry_refine = self._call_model(
                         "kimi27", refine_prompt,
                         system_prompt=SYSTEM_PROMPTS.get("kimi27", ""),
                         max_seconds=retry_cap,
                         max_tokens_override=adaptive_tokens,
                     )
+                    self._debug_stage = ""
                     MODEL_CATALOG["kimi27"]["timeout"] = original_timeout
                     if retry_refine.success:
+                        code_before_retry = result["ported_code"]
                         extracted, regex_changelog, main_restored, structural = self._postprocess_port(
-                            retry_refine.output, kernel_source)
+                            retry_refine.output, kernel_source, iteration=iteration,
+                            model="kimi27", tokens=retry_refine.tokens_used,
+                            latency_ms=retry_refine.elapsed_ms)
+                        self.debug.log_patch(
+                            before=code_before_retry, after=extracted,
+                            iteration=iteration, source_label="refine_retry",
+                            rationale=f"retry after failed refine ({feedback_label})",
+                            confidence=retry_refine.confidence,
+                            structural_ok_after=structural.ok)
                         if main_restored:
                             result["changes"].append(
                                 f"[main] Retry at iter {iteration} dropped main() — "
@@ -3944,8 +4327,10 @@ class ModelRouter:
                 result["ported_code"], patterns,
                 regex_changelog=result.get("regex_changelog"),
             )
+            self._debug_stage = "10_evaluation"
             verify = self._call_model("gemma4", gemma_prompt,
                                       system_prompt=SYSTEM_PROMPTS.get("glm", ""))
+            self._debug_stage = ""
             if verify.success:
                 verify_success = verify_success or True
                 result["model_used"] = "gemma4"
@@ -4018,6 +4403,31 @@ class ModelRouter:
             result["best_attempt_iteration"] = result.get("iterations_used", 0)
             result["best_attempt_confidence"] = 0.10
         result["cost"] = round(self.total_cost, 4)
+
+        # ── Phase 11: close the debug session ──
+        # The terminal transition names the outcome, so `state_trace.jsonl` ends
+        # with a verdict rather than trailing off after the last compile.
+        if self.debug.enabled:
+            abort = result.get("abort_reason", "")
+            converged = result.get("orchestrator_passed") or result.get("compile_passed")
+            self.debug.transition(
+                "SUCCESS" if converged and not abort else "FAILURE",
+                reason=abort or ("converged" if converged else "did not converge"),
+                validation_result=bool(converged))
+            # A run that did not reach a compiling kernel is a failure worth
+            # packaging, even though route() returned normally rather than
+            # raising: "terminates unexpectedly" is about the outcome, not the
+            # control flow.
+            if not converged:
+                self.debug.snapshot_failure(
+                    reason=abort or "pipeline finished without a compiling kernel",
+                    context={"iterations_used": result.get("iterations_used"),
+                             "timed_out": result.get("timed_out"),
+                             "compile_errors": result.get("compile_errors", [])})
+            summary_path = self._finalize_debug(result)
+            result["debug_session_dir"] = str(self.debug.dir)
+            if summary_path:
+                print(f"║  │  🐞 Debug summary → {str(summary_path)[:42]:<42}║")
         return result
 
     def _call_model(self, model_key: str, prompt: str,
@@ -4025,6 +4435,59 @@ class ModelRouter:
                     prefill: str = "",
                     max_seconds: Optional[float] = None,
                     max_tokens_override: Optional[int] = None) -> AgentResult:
+        """Call a model and record the complete exchange under Debug Mode.
+
+        Phase 11: this wrapper is the single choke point through which every
+        provider response passes, so "no intermediate response is ever lost"
+        holds by construction rather than by remembering to log at each call
+        site. The raw text is on disk BEFORE any parser, extractor or validator
+        touches it — which is precisely the text a post-mortem needs when a
+        parse is what went wrong.
+
+        A failed call is recorded too: an empty output with an error string is
+        as diagnostic as a successful one, and it is what a timeout looks like.
+        """
+        if not self.debug.enabled:
+            return self._call_model_impl(model_key, prompt, system_prompt,
+                                         prefill, max_seconds, max_tokens_override)
+
+        calls_before = len(self.call_log)
+        cost_before = self.total_cost
+        stage = self._debug_stage or ""
+        with self.debug.stage(f"llm:{model_key}"):
+            result = self._call_model_impl(model_key, prompt, system_prompt,
+                                           prefill, max_seconds, max_tokens_override)
+
+        # The endpoint and any error text live in the call_log entries this call
+        # appended; read them back rather than threading a return channel
+        # through _call_model_impl's many exit points.
+        new_entries = self.call_log[calls_before:]
+        endpoint = next((e.get("source", "") for e in reversed(new_entries)
+                         if e.get("source")), "")
+        error = next((e.get("error", "") for e in reversed(new_entries)
+                      if e.get("error")), "")
+
+        self.debug.record_llm_call(
+            model=model_key,
+            tokens=result.tokens_used,
+            cost=self.total_cost - cost_before,
+            latency_ms=result.elapsed_ms,
+            success=result.success,
+            stage=stage,
+            raw_response=result.output,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            endpoint=endpoint,
+            error=error,
+            finish_reason="length" if "TRUNCATED" in (result.output or "") else "",
+        )
+        return result
+
+    def _call_model_impl(self, model_key: str, prompt: str,
+                         system_prompt: str = "",
+                         prefill: str = "",
+                         max_seconds: Optional[float] = None,
+                         max_tokens_override: Optional[int] = None) -> AgentResult:
         model_info = MODEL_CATALOG[model_key]
         model_id = model_info["id"]
         local_first = model_info.get("local_first", False)
