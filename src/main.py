@@ -530,6 +530,24 @@ class KernelOlympics:
                 # Attach in-loop compile errors to verification result
                 if port_result.get("compile_errors"):
                     ver_result["in_loop_compile_errors"] = port_result["compile_errors"]
+                # Attach ported code and gate results to verification result
+                # so web_app can read them from the JSON report instead of
+                # relying on the ported_kernels/ file on disk (which the
+                # lexical gate may refuse to write).
+                ver_result["ported_code"] = port_result.get("ported_code", "")
+                structural = port_result.get("structural", {})
+                ver_result["gate_results"] = [
+                    {
+                        "name": "Lexical Gate",
+                        "passed": not structural.get("lexical_rejected", False),
+                        "message": "No lexical issues" if structural.get("lexical_ok", True) else "Lexical validation failed",
+                    },
+                    {
+                        "name": "Structural Gate",
+                        "passed": structural.get("ok", True),
+                        "message": structural.get("reason", "No structural issues"),
+                    },
+                ]
                 verification_results.append(ver_result)
 
                 # Always save ported kernel to ported_kernels/ — gated by

@@ -254,12 +254,23 @@ async def port_file(file: UploadFile = File(...)):
             except (json.JSONDecodeError, OSError) as e:
                 report = {"error": f"Failed to parse report: {e}"}
 
-        # Find the ported kernel
+        # Find the ported kernel — try report first, then fall back to disk
         hip_code = ""
         kernel_name = Path(file.filename).stem
-        ported_file = PORTED_DIR / f"{kernel_name}.hip.cpp"
-        if ported_file.exists():
-            hip_code = ported_file.read_text(encoding="utf-8")
+
+        # Read ported_code from report's verification results
+        sections = report.get("sections", {})
+        verifications = sections.get("verification", [])
+        for vr in verifications:
+            if vr.get("kernel") == kernel_name:
+                hip_code = vr.get("ported_code", "")
+                break
+
+        # Fallback: read from ported_kernels/ on disk
+        if not hip_code:
+            ported_file = PORTED_DIR / f"{kernel_name}.hip.cpp"
+            if ported_file.exists():
+                hip_code = ported_file.read_text(encoding="utf-8")
 
         # Extract pipeline state
         ps = report.get("pipeline_state", {})
@@ -279,7 +290,7 @@ async def port_file(file: UploadFile = File(...)):
                 "cache_hits": cache_hits,
                 "llm_calls": llm_calls,
             },
-            "gate_results": [],
+            "gate_results": verifications[0].get("gate_results", []) if verifications else [],
             "pipeline_output": result.stdout[-2000:] if result.stdout else "",
         }
 
