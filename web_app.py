@@ -261,10 +261,12 @@ async def port_file(file: UploadFile = File(...)):
         # Read ported_code from report's verification results
         sections = report.get("sections", {})
         verifications = sections.get("verification", [])
-        for vr in verifications:
-            if vr.get("kernel") == kernel_name:
-                hip_code = vr.get("ported_code", "")
-                break
+        # Take first verification result's ported_code (single-file pipeline).
+        # Kernel-name matching would fail because the pipeline receives a
+        # tempfile path (e.g. /tmp/tmpXXXX.cu) whose stem doesn't match the
+        # original upload filename.
+        if verifications:
+            hip_code = verifications[0].get("ported_code", "")
 
         # Fallback: read from ported_kernels/ on disk
         if not hip_code:
