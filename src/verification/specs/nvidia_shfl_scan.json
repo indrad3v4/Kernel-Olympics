@@ -36,12 +36,13 @@
   },
   "input_setup": {
     "count": 512,
-    "default_value": 1.0
+    "default_value": 1
   },
   "output_readback": {
     "count": 4,
-    "element_type": "float",
-    "format": "float_per_line"
+    "element_type": "int",
+    "format": "int_per_line"
   },
-  "self_contained": true
+  "self_contained": true,
+  "port_mode": "DEVICE_SUBSET"
 }

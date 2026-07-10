@@ -233,7 +233,7 @@ class VerificationAgent:
         # kernel. Kimi may strip int main() during porting, making the regex
         # check below unreliable. The spec is the authoritative source.
         spec = self.load_spec(kernel_name)
-        if spec is not None and spec.get("self_contained", False):
+        if spec is not None and spec.get("port_mode") == "WHOLE_PROGRAM":
             return ported_kernel_source, 1, len(ported_kernel_source.splitlines())
 
         if re.search(r'^\s*int\s+main\s*\(', ported_kernel_source, re.MULTILINE):

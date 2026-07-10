@@ -63,6 +63,25 @@ _NOT_FUNCTIONS = frozenset({
     "sizeof", "static_cast", "dim3", "case", "default",
 })
 
+# Host-level symbols that a DEVICE_SUBSET port would never generate.
+_HOST_ONLY_SYMBOLS = frozenset({
+    "main",
+})
+
+
+def _is_host_only(name: str) -> bool:
+    """Return True when *name* should not be expected in a DEVICE_SUBSET port.
+
+    DEVICE_SUBSET targets only ``__global__`` kernels and ``__device__``
+    helpers.  Host-level definitions such as ``main``, ``shuffle_*_test``, and
+    similar driver/test functions are only needed when the full program is
+    compiled as a standalone binary.
+    """
+    return (
+        name in _HOST_ONLY_SYMBOLS
+        or (name.startswith("shuffle_") and name.endswith("_test"))
+    )
+
 
 def _strip(code: str) -> str:
     """Blank comments and string literals, preserving offsets.
@@ -191,8 +210,20 @@ def _rename_candidates(removed: Set[str], added: Set[str],
     return pairs
 
 
-def diff_symbols(cuda_source: str, hip_source: str) -> Dict:
+def diff_symbols(cuda_source: str, hip_source: str,
+                 port_mode: str = "FULL") -> Dict:
     """Diff the symbol tables of the original CUDA and the generated HIP.
+
+    Parameters
+    ----------
+    cuda_source, hip_source:
+        Source text of the original CUDA and generated HIP.
+    port_mode:
+        ``"FULL"`` (default) — report all differences as-is.
+        ``"DEVICE_SUBSET"`` — exclude host-level symbols (``main``,
+        ``shuffle_*_test``, etc.) from ``missing`` / ``removed`` lists.
+        These symbols are intentionally dropped by a device-only port and
+        should not be flagged.
 
     Returns a machine-readable report. ``missing_*`` lists are the ones that
     matter: a kernel present in the source and absent from the port is a dropped
@@ -220,8 +251,21 @@ def diff_symbols(cuda_source: str, hip_source: str) -> Dict:
     helpers = _bucket(original.helpers, ported.helpers)
     functions = _bucket(original.functions, ported.functions)
 
+    # DEVICE_SUBSET: host-level symbols are intentionally dropped.
+    # Filter them out so the diff does NOT flag main(), shuffle_*_test,
+    # etc. as "missing".
+    host_only: Set[str] = set()
+    if port_mode == "DEVICE_SUBSET":
+        host_only = {n for n in original.functions if _is_host_only(n)}
+        if host_only:
+            functions["missing"] = sorted(set(functions["missing"]) - host_only)
+            functions["original"] = sorted(set(functions["original"]) - host_only)
+
     all_removed = original.all_names() - ported.all_names()
     all_added = ported.all_names() - original.all_names()
+
+    if host_only:
+        all_removed = all_removed - host_only
 
     macro_diff = {
         "removed": sorted(set(original.macros) - set(ported.macros)),

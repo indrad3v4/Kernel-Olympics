@@ -20,6 +20,7 @@ import logging
 import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Callable
+from enum import Enum
 from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
@@ -90,6 +91,9 @@ class IterationState:
     # LLM analyses attached to this iteration
     glm_analysis: Optional[dict] = None
     replanned: bool = False
+    # Stage contract: records which repair mode was active when entering
+    # the refine/repair phase.  None = no repair needed this iteration.
+    repair_mode: Optional[str] = None  # None | "lexical" | "structural" | "compiler"
 
     @property
     def compile_failed(self) -> bool:
@@ -382,6 +386,21 @@ PLAN_BUDGET_FRACTION = 0.20      # planner may use at most 20% of the pipeline b
 CODE_RESERVE_FRACTION = 0.55     # of the budget, held back for the coder
 COMPILE_RESERVE_SECONDS = 25     # clock kept for hipcc; a compile cannot be interrupted
 
+# ── P0: per-stage budget caps (max, not target) ──
+# Each phase gets a hard ceiling so no single stage can exhaust the pipeline
+# before later phases have had their fair shot. These are floors for remaining
+# budget, not allocations — a phase receives min(CAP, what is left after
+# protected reserves). The sum of strict-phase caps (PLAN + CODEGEN = 100)
+# plus COMPILE_RESERVE (25) plus REPAIR_RESERVE (60) is 185, which is 5s over
+# the 180s pipeline budget — but these are MAXES, not targets, so the actual
+# pipeline fits as long as the planner and coder together run in ≤ 90s, which
+# the observed 22s + 90s trace already satisfies.
+PLAN_CAP = 30              # planner: at most 30s
+CODEGEN_CAP = 70           # coder: at most 70s for the initial HIP port
+COMPILE_RESERVE = 25       # same as COMPILE_RESERVE_SECONDS — always protected
+REPAIR_RESERVE = 60        # protected until first compile failure, then released for repair cycles
+VERIFY_CAP = 15            # final verification: at most 15s per call
+
 # Output-token ceiling for a planner that was handed a hipified draft. It is asked
 # for a delta checklist — "__shfl_up_sync width 32→64 at L78", not a porting essay —
 # and tokens emitted are what the phase's wall time is actually made of. The 2048
@@ -401,6 +420,22 @@ MAX_REPLANS = 2                  # total DeepSeek re-plans allowed per route() c
 
 class PipelineTimeoutError(RuntimeError):
     """Raised when route() exceeds its wall-clock budget."""
+
+
+class PortMode(str, Enum):
+    """Describes how a CUDA source should be ported.
+
+    WHOLE_PROGRAM — the source is a complete, self-contained program with its
+    own ``main()`` AND all of ``main()``'s dependencies survive in the port.
+    The coder must reproduce everything, including the host driver.
+
+    DEVICE_SUBSET — the source self-contains ``main()`` but one or more
+    user-defined helpers called by ``main()`` cannot be resolved (missing
+    local headers, undefined symbols). The coder should port only the
+    ``__global__`` / ``__device__`` functions and drop the host driver.
+    """
+    WHOLE_PROGRAM = "WHOLE_PROGRAM"
+    DEVICE_SUBSET = "DEVICE_SUBSET"
 
 
 class Deadline:
@@ -646,6 +681,15 @@ class ModelRouter:
         self._debug_stage: str = ""
         # True when route() created the session and must therefore finalize it.
         self._owns_debug_session: bool = True
+        # ── P0: stage-budget tracking ──
+        # _repair_released is set True after the first compile failure, freeing
+        # REPAIR_RESERVE seconds for refine/retry cycles in the iteration loop.
+        self._repair_released: bool = False
+        # Adaptive-stop tracking: consecutive iterations producing the same
+        # normalized first-error signature trigger an early abort instead of
+        # burning budget on an unstuck loop.
+        self._last_error_sig: str = ""
+        self._same_error_count: int = 0
 
     def _finalize_debug(self, result: Dict):
         """Write the summary — but only for a session route() itself created.
@@ -1366,7 +1410,8 @@ class ModelRouter:
     def _postprocess_port(self, model_output: str, kernel_source: str,
                           iteration: int = 0, generation: Optional[int] = None,
                           model: str = "kimi27", tokens: int = 0,
-                          latency_ms: float = 0.0):
+                          latency_ms: float = 0.0,
+                          port_mode: Optional[str] = None):
         """Turn a raw coder response into the code the compiler will actually see.
 
         Returns ``(code, regex_changelog, main_restored, structural)``.
@@ -1454,7 +1499,7 @@ class ModelRouter:
                 blockers = self._unsatisfied_main_calls(
                     original_main, code, kernel_source)
 
-        code, restored = self._ensure_main_preserved(code, kernel_source)
+        code, restored = self._ensure_main_preserved(code, kernel_source, port_mode=port_mode)
         fixed = self._fix_ported_code(code, return_changelog=True)
         if isinstance(fixed, tuple):
             code, changelog = fixed
@@ -1539,16 +1584,44 @@ class ModelRouter:
         runnable program, not a bare kernel snippet.
 
         Mirrors the check verifier.py's ``_generate_harness`` uses to decide
-        whether to wrap a driver around the ported code. Used here to decide
-        whether a fixed character-count truncation is safe to apply to a
-        prompt's source embed: a bare kernel snippet is always well under
-        any of these budgets, but a full NVIDIA sample program can run to
-        15k+ characters with its own ``main()`` near the end — truncating
-        that at a few thousand characters shows Kimi a kernel with no driver
-        and asks it to reproduce a ``main()`` it was never shown (see
-        docs/fix-plan-self-contained-programs.md, Bug 1).
+        whether to wrap a driver around the ported code — however, the spec's
+        ``port_mode`` key is the authoritative source for that decision now.
+        This function is retained for prompt-truncation decisions (whether to
+        show the full source to the coder/planner so ``main()`` is not silently
+        truncated out of their context window) and for *incremental* compile-time
+        fallbacks (e.g. the regex check at line 239 of verifier.py).
+
+        A self-contained program's own ``main()`` can sit past a 5000-character
+        truncation boundary — truncating that out from under the coder means it
+        never saw (let alone could reproduce) the driver that runs the kernels.
+        See docs/fix-plan-self-contained-programs.md, Bug 1.
         """
         return bool(re.search(r'^\s*int\s+main\s*\(', source, re.MULTILINE))
+
+    @staticmethod
+    def _compute_port_mode(kernel_source: str) -> PortMode:
+        """Determine whether the coder should port the whole program or just the device subset.
+
+        Returns ``DEVICE_SUBSET`` when the source is self-contained (has its own
+        ``int main(``) but one or more user-defined helpers that ``main()`` calls
+        are not satisfiable (missing local headers, unresolved symbols). In that
+        case the coder is told to port only the ``__global__`` / ``__device__``
+        functions and to drop the host driver (which will be replaced by a
+        synthesized harness).
+
+        Returns ``WHOLE_PROGRAM`` otherwise — the coder must reproduce everything,
+        including the driver, or the existing harness path handles it.
+        """
+        if not ModelRouter._is_self_contained(kernel_source):
+            return PortMode.WHOLE_PROGRAM
+        main_text = ModelRouter._extract_main(kernel_source)
+        if not main_text:
+            return PortMode.WHOLE_PROGRAM
+        unsatisfied = ModelRouter._unsatisfied_main_calls(
+            main_text, kernel_source, kernel_source)
+        if unsatisfied:
+            return PortMode.DEVICE_SUBSET
+        return PortMode.WHOLE_PROGRAM
 
     @staticmethod
     def _extract_main(source: str) -> str:
@@ -1616,7 +1689,8 @@ class ModelRouter:
         return ""  # unbalanced — refuse to hand back a truncated driver
 
     @classmethod
-    def _ensure_main_preserved(cls, ported_code: str, original_source: str):
+    def _ensure_main_preserved(cls, ported_code: str, original_source: str,
+                               port_mode: Optional[str] = None):
         """Re-append the driver when the coder dropped a self-contained program's main().
 
         Returns ``(code, restored: bool)``.
@@ -1641,8 +1715,17 @@ class ModelRouter:
         Only fires when the original was self-contained and the port is not: a port
         that kept its main() is left untouched, and a bare kernel snippet has no
         driver to restore.
+
+        When ``port_mode`` is ``\"DEVICE_SUBSET\"`` the restore is skipped — the
+        coder was instructed to drop the host driver intentionally (its dependencies
+        cannot be resolved), and a synthesized harness replaces it.
         """
         if not ported_code or not original_source:
+            return ported_code, False
+        # DEVICE_SUBSET: the coder was told to drop the driver intentionally.
+        # Reattaching it would re-introduce the very unresolved symbols that
+        # triggered DEVICE_SUBSET mode in the first place.
+        if port_mode == PortMode.DEVICE_SUBSET.value:
             return ported_code, False
         if not cls._is_self_contained(original_source):
             return ported_code, False
@@ -1908,7 +1991,8 @@ class ModelRouter:
     def _build_kimi_code_prompt(self, kernel_source: str,
                                 patterns: List[Dict],
                                 deepseek_plan: str = "",
-                                preprocessed_source: str = "") -> str:
+                                preprocessed_source: str = "",
+                                port_mode: Optional[str] = None) -> str:
         """Build the Kimi K2.7 code generator phase prompt.
 
         Role: Kimi-Coder — generates the actual ported HIP kernel code.
@@ -2022,6 +2106,22 @@ class ModelRouter:
                     "only its result, and simplify any expression that used them. "
                     "Everything else in main() stays. Do not stub the dropped "
                     "function, and do not delete main()."
+                )
+        elif port_mode == PortMode.DEVICE_SUBSET.value:
+            prompt += (
+                "\nDEVICE-SUBSET MODE: The CUDA source above has its own main() "
+                "but one or more host dependencies cannot be resolved (missing "
+                "local headers, undefined host symbols). Port ONLY the "
+                "__global__ / __device__ functions — drop the host driver "
+                "(main() and all host helper functions called from main()). "
+                "The harness authoring system will synthesize a test harness "
+                "on its own. Do NOT include main() or any host-only code."
+            )
+            if missing_headers:
+                prompt += (
+                    "\nNOTE: The missing headers listed above are known and "
+                    "expected — they are exactly why device-subset mode was "
+                    "selected. Drop any code path that depends on them."
                 )
         return prompt
 
@@ -2551,6 +2651,13 @@ class ModelRouter:
         run_dir.mkdir(parents=True, exist_ok=True)
         result["run_id"] = self.run_id
 
+        # ── Determine port mode (WHOLE_PROGRAM vs DEVICE_SUBSET) ──
+        # The spec's port_mode is the authoritative source for the harness
+        # decision. If a hand-written spec already exists with port_mode set,
+        # trust it; otherwise compute one from the CUDA source.
+        port_mode = ModelRouter._compute_port_mode(kernel_source)
+        result["port_mode"] = port_mode.value
+
         # ── TRIZ #13 / #24: Auto-generate spec from CUDA source ──
         # Before ANY LLM call or compile check, parse the original CUDA source
         # for __global__ kernel signatures and generate a spec JSON file.
@@ -2678,10 +2785,12 @@ class ModelRouter:
         # P0: the planner runs on a slice, not on the whole clock. Its own timeout
         # is 120s of a 180s budget; unclamped it starves the coder and every
         # refinement behind it. The plan is advisory — the port is not.
-        plan_cap = deadline.phase_cap(
-            PLAN_BUDGET_FRACTION,
-            reserve_s=(budget * CODE_RESERVE_FRACTION + COMPILE_RESERVE_SECONDS),
-        ) if not deadline.unlimited else None
+        plan_cap = (None if deadline.unlimited
+                    else max(min(PLAN_CAP,
+                                 deadline.remaining()
+                                 - COMPILE_RESERVE_SECONDS
+                                 - REPAIR_RESERVE,
+                                 ), 0.0))
 
         plan_skipped = plan_cap is not None and plan_cap < MIN_LLM_TIMEOUT_SECONDS
         if plan_skipped:
@@ -2770,12 +2879,17 @@ class ModelRouter:
         # main() — see docs/fix-plan-self-contained-programs.md).
         kimi_prompt = self._build_kimi_code_prompt(kernel_source, patterns,
                                                    deepseek_plan=deepseek_plan_output,
-                                                   preprocessed_source=hipified_source)
-        # P0: the coder may use everything left except the clock hipcc needs. A
-        # compile cannot be interrupted, so the reserve is subtracted up front
-        # rather than discovered afterwards.
+                                                   preprocessed_source=hipified_source,
+                                                   port_mode=result.get("port_mode"))
+        # P0: the coder may use at most CODEGEN_CAP seconds, less the compile
+        # reserve (always protected). The REPAIR_RESERVE is not subtracted here
+        # because no compile has happened yet — it's only needed once the repair
+        # cycle begins after a failed compile.
         code_cap = (None if deadline.unlimited
-                    else max(deadline.remaining() - COMPILE_RESERVE_SECONDS, 0.0))
+                    else max(min(CODEGEN_CAP,
+                                 deadline.remaining()
+                                 - COMPILE_RESERVE_SECONDS,
+                                 ), 0.0))
         # Output tokens are the coder's latency. Size the budget to the kernel.
         adaptive_tokens = self._compute_adaptive_max_tokens(hipified_source or kernel_source)
         self._debug_stage = "03_translation"
@@ -2811,7 +2925,8 @@ class ModelRouter:
             # compile, so no LLM phase ever sees the resulting link error.
             extracted, regex_changelog, main_restored, structural = self._postprocess_port(
                 code.output, kernel_source, iteration=0, model="kimi27",
-                tokens=code.tokens_used, latency_ms=code.elapsed_ms)
+                tokens=code.tokens_used, latency_ms=code.elapsed_ms,
+                port_mode=result.get("port_mode"))
             if main_restored:
                 result["changes"].append(
                     "[main] Coder dropped main() from a self-contained program — "
@@ -3142,6 +3257,9 @@ class ModelRouter:
                     logger.debug("run-dir logging skipped: %s", _log_exc)
                 if cc["compile_success"]:
                     state.compile_success = True
+                    # Compile passed — release the repair reserve so the
+                    # verification phase can draw on it.
+                    self._repair_released = True
                     result["changes"].append(
                         f"[hipcc] Compile-first check {iteration}: PASSED ✅")
                     result["compile_errors"] = []
@@ -3889,6 +4007,7 @@ class ModelRouter:
                 "linker_only": state.linker_only,
                 "run_crashed": state.run_crashed,
                 "replanned": state.replanned,
+                "repair_mode": state.repair_mode,
             }
 
             # ── Step 2: If compile passed → run GLM for semantic evaluation ──
@@ -4102,12 +4221,39 @@ class ModelRouter:
 
             if iteration < max_iterations:
                 # Loop back: Kimi refines with feedback
-                if compile_failed_this_iter:
-                    feedback_label = "compile errors"
+                # ── Honest logging: gate on whether hipcc actually ran ──
+                # compile_failed_this_iter can be True even when hipcc never
+                # ran (structural/lexical gate).  The local variable name is
+                # the historical artifact; state.gate / state.structural_reject
+                # are the authoritative source.  Check the structural errors
+                # for "[lexical]" prefix to distinguish structural from lexical
+                # reject (lexical failures are folded into the structural result
+                # by _postprocess_port).
+                iter_s = result.get("structural", {}) or {}
+                iter_errs = iter_s.get("errors", []) if isinstance(iter_s, dict) else []
+                has_lexical = any(
+                    e.startswith("[lexical]") for e in iter_errs
+                )
+                if state.structural_reject:
+                    feedback_label = (
+                        "lexical feedback" if has_lexical else "structural feedback"
+                    )
+                elif state.compile_ran and compile_failed_this_iter:
+                    feedback_label = "compiler diagnostics"
                 elif run_crashed_this_iter:
                     feedback_label = "runtime crash + GLM findings"
                 else:
                     feedback_label = "GLM feedback"
+
+                # Set repair_mode for stage-contract tracking
+                if state.structural_reject:
+                    state.repair_mode = "lexical" if has_lexical else "structural"
+                elif state.compile_ran and compile_failed_this_iter:
+                    state.repair_mode = "compiler"
+                elif run_crashed_this_iter:
+                    state.repair_mode = "compiler"  # same pipeline as compile
+                else:
+                    state.repair_mode = None
 
                 # ── P2: budget-aware dispatch ──
                 # The iteration-boundary check above ran BEFORE this iteration's
@@ -4130,7 +4276,7 @@ class ModelRouter:
                     print(f"║  │  ⏱ BUDGET: too little left to refine — stopping cleanly{'':<8}║")
                     break
 
-                if on_phase: on_phase("refine", "GLM-5.2", f"refining with {feedback_label} (iter {iteration}→{iteration+1})")
+                if on_phase: on_phase("refine", "GLM-5.2", f"refining with {feedback_label} [mode={state.repair_mode}] (iter {iteration}→{iteration+1})")
                 # TRIZ #15: Evolve prompt based on compile error patterns
                 evolved = opt.evolve_prompt(result.get("compile_errors", []))
                 # version_id already carries its own "v" ("v2"), and this is the
@@ -4153,7 +4299,7 @@ class ModelRouter:
                     structural_report=result.get("structural"),
                 )
                 self.debug.transition("PATCH_GENERATION",
-                                      reason=f"refine on {feedback_label}",
+                                      reason=f"refine on {feedback_label} (mode={state.repair_mode})",
                                       iteration=iteration)
                 self._debug_stage = "03_translation"
                 refine = self._call_model(
@@ -4168,7 +4314,8 @@ class ModelRouter:
                     extracted, regex_changelog, main_restored, structural = self._postprocess_port(
                         refine.output, kernel_source, iteration=iteration,
                         model="kimi27", tokens=refine.tokens_used,
-                        latency_ms=refine.elapsed_ms)
+                        latency_ms=refine.elapsed_ms,
+                        port_mode=result.get("port_mode"))
                     # Every repair iteration is stored separately: the diff between
                     # what the loop had and what the coder returned, computed from
                     # the two texts rather than taken from the model's word for it.
@@ -4249,7 +4396,8 @@ class ModelRouter:
                         extracted, regex_changelog, main_restored, structural = self._postprocess_port(
                             retry_refine.output, kernel_source, iteration=iteration,
                             model="kimi27", tokens=retry_refine.tokens_used,
-                            latency_ms=retry_refine.elapsed_ms)
+                            latency_ms=retry_refine.elapsed_ms,
+                            port_mode=result.get("port_mode"))
                         self.debug.log_patch(
                             before=code_before_retry, after=extracted,
                             iteration=iteration, source_label="refine_retry",
