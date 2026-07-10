@@ -32,6 +32,75 @@ from verification.structural import (
 )
 
 
+# ── Per-iteration state ─────────────────────────────────────────────────────
+#
+# Before the structural gate was added, an iteration had exactly two outcomes:
+# hipcc-passed or hipcc-failed. Every reader downstream assumed the compile
+# branch had run, so `compile_errs`, `cc`, `error_origins`, `linker_only` and
+# friends were only ever bound inside the compile-fail path.
+#
+# The structural gate introduced a THIRD outcome — rejected before hipcc — that
+# raises `compile_failed_this_iter` without ever entering the compile branch.
+# Any downstream reader outside the compile-fail sub-block (e.g. the informed
+# re-plan at ~router.py:3347) then crashed with UnboundLocalError on the very
+# variables it had previously relied on.
+#
+# This dataclass is the single source of truth for an iteration's outcome.
+# Every field has a safe default, so no reader can hit an unbound name again.
+# The old local names (compile_errs, linker_only, ...) are still mirrored in
+# the loop body for backward compatibility with the ~200 existing references —
+# but the *authoritative* value is on `IterationState`, and every branch is now
+# required to fill it before any reader downstream.
+@dataclass
+class IterationState:
+    """Outcome of one refinement iteration.
+
+    ``gate`` records which stage produced this iteration's verdict:
+
+        "structural" — code was rejected before hipcc ran (text-level defect)
+        "compile"    — hipcc ran; ``compile_success`` says whether it passed
+        "run"        — hipcc passed; binary ran; ``run_crashed`` says whether
+        "skipped"    — no verifier attached; iteration is a no-op refine
+
+    The unified ``compile_failed`` property is what the loop's control flow
+    keys on: it is True whenever the iteration did NOT reach green, regardless
+    of which gate stopped it. This preserves the pre-existing semantics of
+    ``compile_failed_this_iter`` without requiring any reader to know about the
+    new structural gate.
+    """
+    iteration: int
+    gate: str = "skipped"
+    # Structural gate
+    structural_ok: bool = True
+    structural_reject: bool = False
+    structural_errors: List[str] = field(default_factory=list)
+    structural_missing: List[str] = field(default_factory=list)
+    # Compile gate
+    compile_ran: bool = False
+    compile_success: bool = False
+    compile_errs: List[str] = field(default_factory=list)
+    error_origins: List = field(default_factory=list)
+    linker_only: bool = False
+    all_harness_origin: bool = False
+    # Run gate
+    run_crashed: bool = False
+    # LLM analyses attached to this iteration
+    glm_analysis: Optional[dict] = None
+    replanned: bool = False
+
+    @property
+    def compile_failed(self) -> bool:
+        """True whenever this iteration did not reach a green compile+run.
+
+        Structural reject is treated as a failure equivalent to a compile
+        error — the code is not ready and the loop must refine — but it is
+        **not** a compile error, so compile-specific recovery paths (DeepSeek
+        informed re-plan, GLM error-analyst) must gate on
+        ``compile_ran and not compile_success`` instead of on this property.
+        """
+        return self.structural_reject or (self.compile_ran and not self.compile_success)
+
+
 def _force_ipv4():
     """Monkey-patch socket to prefer IPv4 for HTTP connections.
 
@@ -2682,20 +2751,31 @@ class ModelRouter:
             # ── Step 1: hipcc compile check FIRST ──────────────────────────
             # TRIZ #13: Reverse the order — compile before evaluate.
             # If compile fails, compile errors ARE the feedback. Skip GLM entirely.
+            #
+            # State object holds this iteration's authoritative outcome. Legacy
+            # local names below are kept as mirrors so the ~200 existing readers
+            # keep working unchanged, but every branch is required to populate
+            # `state` so downstream code has a single, defaulted source of truth
+            # (see IterationState docstring for the structural-reject bug this
+            # was introduced to fix).
+            state = IterationState(iteration=iteration)
             compile_failed_this_iter = False
             run_crashed_this_iter = False  # RUN-FIRST: set by the in-loop run check below
-            # P0: a stagnant iteration used to fire TWO DeepSeek re-plans — the
-            # escalation below and the GLM-informed re-plan after it — costing ~160s
-            # for two strategies where only the second one is ever used.
             replanned_this_iter = False
-            # Bound here, not inside `if glm_err.success:`. The informed re-plan below
-            # reads glm_analysis unconditionally, so a failed GLM analyst call — the
-            # exact case its own "falling back to raw errors" branch handles — used to
-            # crash route() with UnboundLocalError instead of falling back.
             glm_analysis = None
-            # Same reason: the informed re-plan reads linker_only, which is otherwise
-            # only bound on the compile-failure path.
             linker_only = False
+            # Compile-branch locals. Previously bound ONLY inside the compile-fail
+            # `else` (~line 2828). After the structural gate landed, the informed
+            # re-plan below could reach `compile_errs` on a structural reject —
+            # where it was unbound — and crash route() with UnboundLocalError.
+            # Defaulting them here is not a bandaid: the structural branch below
+            # now fills `compile_errs` with the structural errors so the re-plan
+            # gate degrades to a truthful "no compile errors to re-plan against"
+            # rather than exploding.
+            compile_errs: List[str] = []
+            error_origins: List = []
+            all_harness_origin = False
+            cc: Optional[dict] = None
             # ── Pre-compile structural gate for THIS iteration's code ──
             # The refine that produced result["ported_code"] set result["structural"];
             # if it flagged a hard defect, hipcc will only reproduce parser noise the
@@ -2703,6 +2783,15 @@ class ModelRouter:
             # compile errors and skip hipcc so the next refine iteration hits.
             iter_structural = result.get("structural")
             if iter_structural and not iter_structural.get("ok", True):
+                # Structural gate → first-class failure path. hipcc is NOT run;
+                # compile-error consumers (informed re-plan wording, GLM error
+                # analyst) will gate on `state.compile_ran` below rather than
+                # infer their state from the presence of `compile_errs`.
+                state.gate = "structural"
+                state.structural_ok = False
+                state.structural_reject = True
+                state.structural_errors = list(iter_structural.get("errors", []))
+                state.structural_missing = list(iter_structural.get("missing_symbols", []))
                 compile_failed_this_iter = True
                 struct_errs = [f"[structural] {e}"
                                for e in iter_structural.get("errors", [])]
@@ -2710,6 +2799,14 @@ class ModelRouter:
                     struct_errs.append(
                         "[structural] symbols dropped: "
                         + ", ".join(iter_structural["missing_symbols"][:8]))
+                # Mirror the structural errors onto the compile-error slot so
+                # readers that key on it (result["compile_error_history"], the
+                # PromptOptimizer's evolve_prompt loop, the Kimi refine
+                # feedback) see meaningful content, and truthiness reads like
+                # `if compile_errs:` remain honest — the iteration DID produce
+                # a list of things to fix, just not from hipcc.
+                state.compile_errs = list(struct_errs)
+                compile_errs = list(struct_errs)
                 result["compile_errors"] = struct_errs
                 result["compile_error_history"].append(
                     {"iteration": iteration, "errors": list(struct_errs)})
@@ -2717,7 +2814,9 @@ class ModelRouter:
                     (run_dir / f"iteration_{iteration}_structural.json").write_text(
                         json.dumps({
                             "iteration": iteration,
-                            "gate": "structural",
+                            "gate": state.gate,
+                            "structural_reject": state.structural_reject,
+                            "compile_ran": state.compile_ran,
                             "compile_success": False,
                             "structural": iter_structural,
                             "ported_code_preview": (result["ported_code"] or "")[:2000],
@@ -2743,6 +2842,8 @@ class ModelRouter:
                 )
                 # Fall through past the hipcc block into the refine step.
             elif verifier and hasattr(verifier, 'quick_compile_check'):
+                state.gate = "compile"
+                state.compile_ran = True
                 if on_phase: on_phase("compile", "hipcc", f"compile-first check (attempt {iteration}/{max_iterations})")
                 cc = verifier.quick_compile_check(result["ported_code"], kernel_name=kernel_name)
                 # I3: Log iteration compile result for reproducibility.
@@ -2759,6 +2860,7 @@ class ModelRouter:
                 except (OSError, TypeError, ValueError) as _log_exc:
                     logger.debug("run-dir logging skipped: %s", _log_exc)
                 if cc["compile_success"]:
+                    state.compile_success = True
                     result["changes"].append(
                         f"[hipcc] Compile-first check {iteration}: PASSED ✅")
                     result["compile_errors"] = []
@@ -2791,6 +2893,8 @@ class ModelRouter:
                             result["changes"].append(
                                 f"[run] Iter {iteration}: binary ran clean (exit 0)")
                         if isinstance(rc, dict) and rc.get("run_success") is False:
+                            state.gate = "run"
+                            state.run_crashed = True
                             run_crashed_this_iter = True
                             runtime_crash_count += 1
                             sig = rc.get("signal") or f"exit {rc.get('run_exit_code')}"
@@ -2825,9 +2929,12 @@ class ModelRouter:
                         result["abort_reason"] = "runtime_stagnation"
                         break
                 else:
+                    state.compile_success = False
                     compile_failed_this_iter = True
                     compile_errs = cc.get("errors", [])
                     error_origins = cc.get("error_origins", [])
+                    state.compile_errs = list(compile_errs)
+                    state.error_origins = list(error_origins)
                     # P0: a link failure carries no information any model can act on.
                     # The missing-main case is already gone by here — _postprocess_port
                     # reattaches the driver before the first compile — so what remains
@@ -2835,6 +2942,7 @@ class ModelRouter:
                     # analyst are skipped for it (see the guards below); on 2026-07-09
                     # they cost 38.2s + 12.9s + 38.1s to say nothing.
                     linker_only = self._is_linker_only(compile_errs, error_origins)
+                    state.linker_only = linker_only
 
                     # ── P1 (two-layer SIGSEGV): reject a regressing Layer 2 ──
                     # We had code that compiled (Layer 1), asked Kimi to fix a runtime
@@ -2874,6 +2982,7 @@ class ModelRouter:
                     # falls outside the ported kernel's spliced range in the harness is one
                     # Kimi cannot fix, because it's not in code Kimi ever wrote or saw.
                     all_harness_origin = cc.get("all_harness_origin", False)
+                    state.all_harness_origin = all_harness_origin
                     # Bug 6: a missing main() at link time is the single most
                     # actionable signal available here — the spec says this
                     # program is self-contained, and the linker is saying the
@@ -3344,7 +3453,21 @@ class ModelRouter:
             # a *second* time right after the escalation above — two plans, one used.
             # Capping at MAX_REPLANS and skipping when replanned_this_iter is what
             # takes a stagnating run from ~3min/iteration to roughly one Kimi call.
+            # `not state.structural_reject`: DeepSeek's job is to re-plan a
+            # CUDA→HIP porting strategy against the compiler's semantic errors.
+            # A structural reject means the model dropped a brace, truncated the
+            # file, or left a "// ... rest of code" marker — a text-level defect
+            # that no re-plan can address. Kimi already has the structural
+            # feedback via evaluator_feedback; re-planning here spends ~80s of
+            # DeepSeek time for a prompt whose "RECURRING COMPILE ERRORS"
+            # section would just re-echo "[structural] unbalanced braces".
+            #
+            # Historical crash: before this guard, `compile_errs` was unbound
+            # on structural reject (see IterationState docstring) and the
+            # `and compile_errs` truthiness check on the next line raised
+            # UnboundLocalError at router.py:3352.
             if (compile_failed_this_iter
+                    and not state.structural_reject
                     and not replanned_this_iter
                     and not linker_only
                     and replan_count < MAX_REPLANS
@@ -3393,6 +3516,24 @@ class ModelRouter:
                           f"({len(re_plan.output)} chars){'':<14}║")
 
             result["iterations_used"] = iteration
+            # Snapshot the iteration's authoritative outcome so tests and any
+            # post-mortem inspection can see which gate produced the final
+            # verdict without having to re-derive it from side effects.
+            state.glm_analysis = glm_analysis
+            state.replanned = replanned_this_iter
+            result["last_iteration_state"] = {
+                "iteration": state.iteration,
+                "gate": state.gate,
+                "structural_reject": state.structural_reject,
+                "structural_errors": list(state.structural_errors),
+                "structural_missing": list(state.structural_missing),
+                "compile_ran": state.compile_ran,
+                "compile_success": state.compile_success,
+                "compile_errs_count": len(state.compile_errs),
+                "linker_only": state.linker_only,
+                "run_crashed": state.run_crashed,
+                "replanned": state.replanned,
+            }
 
             # ── Step 2: If compile passed → run GLM for semantic evaluation ──
             # TRIZ #28: GLM is now ONLY used when code actually compiles —
