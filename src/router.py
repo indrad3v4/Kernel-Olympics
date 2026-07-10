@@ -2,7 +2,7 @@
 Model Router — Lightweight agent orchestration for CUDA→ROCm porting.
 
 Architecture:
-  Risk Classifier → Model Router → GLM (planner) OR Kimi K2.7 (coder) OR DeepSeek (verifier)
+  Risk Classifier → Model Router → DeepSeek (planner) OR GLM-5.2 (coder) OR Kimi K2.7 (evaluator)
                     ↓                    ↓                          ↓
                 Pattern Memory ←─── verified fix ←───────────── real AMD GPU
 
@@ -588,7 +588,7 @@ def _format_patterns_summary(patterns: List[Dict]) -> str:
 
 
 # NOTE: ROUTING_TABLE was removed — it was dead code. route() always runs
-# the full DeepSeek→Kimi→GLM pipeline regardless of detected patterns.
+# the full DeepSeek→GLM→Kimi pipeline regardless of detected patterns.
 # If per-pattern model selection is needed in the future, add it to route().
 
 
@@ -656,9 +656,10 @@ class ModelRouter:
     Flow:
       1. Classifier detects patterns in kernel
       2. Router picks best model per pattern
-      3. GLM plans the fix structure (if complex)
-      4. Kimi K2.7 generates the code
-      5. DeepSeek verifies the output
+      3. DeepSeek plans the fix structure (if complex)
+      4. GLM-5.2 generates the code
+      5. Kimi K2.7 evaluates the output
+      6. DeepSeek verifies the output
     """
 
     def __init__(self, api_key: str = "", debug: Optional[bool] = None):
@@ -2831,7 +2832,7 @@ class ModelRouter:
               debug_session=None) -> Dict:
         """Route kernel through the loop engineering pipeline.
 
-        Loop: DeepSeek (plan) → Kimi (code) → [hipcc compile FIRST] → GLM (evaluate only if compile passes) → feedback → Kimi refines
+        Loop: DeepSeek (plan) → GLM-5.2 (code) → [hipcc compile FIRST] → Kimi K2.7 (evaluate only if compile passes) → feedback → GLM refines
 
         TRIZ #13 (Do It In Reverse) / #28 (Mechanical Substitution):
         The verification loop now compiles FIRST, then evaluates. If hipcc fails,
@@ -3187,7 +3188,7 @@ class ModelRouter:
             else:
                 result["changes"].append("[deepseek] Planning FAILED — proceeding without plan")
 
-        # ── Phase 2: Kimi CODES the initial port ──
+        # ── Phase 2: GLM codes the initial port ──
         if on_phase: on_phase("code", "GLM-5.2", "generating HIP port from plan")
         # TRIZ #24 / Bug 1: self-contained-program detection and the "preserve
         # main()" instruction now both live inside _build_kimi_code_prompt
@@ -3216,9 +3217,9 @@ class ModelRouter:
         self._debug_stage = ""
         self.debug.transition(
             "CODE_GENERATED" if code.success else "CODE_GENERATION_FAILED",
-            reason=f"kimi27 initial port ({len(code.output)} chars)",
+            reason=f"glm initial port ({len(code.output)} chars)",
             validation_result=code.success, iteration=0)
-        # I3: Log Kimi code generation
+        # I3: Log GLM code generation
         try:
             (run_dir / "phase2_kimi_output.json").write_text(
                 json.dumps({"model": "kimi27", "success": code.success,
@@ -3240,7 +3241,7 @@ class ModelRouter:
             # 2026-07-09 run its whole budget. Restore it here, before the first
             # compile, so no LLM phase ever sees the resulting link error.
             extracted, regex_changelog, main_restored, structural = self._postprocess_port(
-                code.output, kernel_source, iteration=0, model="kimi27",
+                code.output, kernel_source, iteration=0, model="glm",
                 tokens=code.tokens_used, latency_ms=code.elapsed_ms,
                 port_mode=result.get("port_mode"))
             if main_restored:

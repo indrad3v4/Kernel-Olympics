@@ -366,7 +366,7 @@ class KernelOlympics:
                     except Exception:
                         pass
                     verifier_name = "Gemma 4(AMD)" if gemma_online else "DeepSeek V4 Pro(Gemma fallback)"
-                    self.disp.status("Porting", "DeepSeek-v4-pro (plan) → Kimi K2.7 (code) → GLM-5.2 (evaluate) ⟲ loop till compile")
+                    self.disp.status("Porting", "DeepSeek-v4-pro (plan) → GLM-5.2 (code) → Kimi K2.7 (evaluate) ⟲ loop till compile")
                     t0 = time.perf_counter()
 
                     # Live progress: phase callback only (no spinner thread)
@@ -458,7 +458,7 @@ class KernelOlympics:
                     # T0.2: no confidence % here — it is a pre-verify porter score
                     # and printing it reads as a final grade. The gated confidence
                     # appears after verification (report + verify status).
-                    self.disp.file_done(Path(cr['file']).name, f"GLM-eval {tag} ({llm_elapsed:.0f}s)", ok=orch_passed)
+                    self.disp.file_done(Path(cr['file']).name, f"Port result {tag} ({llm_elapsed:.0f}s)", ok=orch_passed)
                     save_path = Path.cwd() / "ported_kernels" / (Path(cr["file"]).stem + ".hip.cpp")
                     print(f"║  📁 Ported kernel → {bold(str(save_path)):<47}║")
                     self.memory.record_llm_time(llm_elapsed)
