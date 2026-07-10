@@ -282,27 +282,89 @@ def _slide_code_window(response: str) -> Optional[str]:
     tail = response[line_start:]
     tail = _strip_trailing_fence(tail)
 
-    # Trim the trailing run of prose lines by identifying the last plausibly
-    # code-shaped line.
     lines = tail.splitlines()
+
+    # ── Trim leading prose ──────────────────────────────────────────────
+    # The code anchor (e.g. __global__, #include) may have been found
+    # inside a prose sentence: "Potential optimization: kernel uses
+    # __global__ void scan(...)".  Walk forward past lines that have NO
+    # strong C++ markers — the anchor itself uniquely identifies the first
+    # code-carrying line, but anything before the first genuinely code-like
+    # line is prose that slipped in.
+    #
+    # For leading trim we use a STRICTER check than for trailing trim:
+    # the code marker must be at/near the start of the line, or the line
+    # must have a sentence-ending C++ delimiter.  This prevents prose
+    # sentences that merely *mention* "__global__" from being mistaken for
+    # code.
+    def _is_leading_code(s: str) -> bool:
+        """Strict — is the line genuinely C++ code, not prose mentioning code?"""
+        if not s:
+            return True  # blank lines are neutral (preserve blank > #include)
+        # Strong starts: C++ directives, comments, standard prefixes
+        if (s.startswith("#") or s.startswith("//") or s.startswith("/*")
+                or s.startswith("*")):
+            return True
+        # __global__ / __device__ at or near start of line (first 20 chars)
+        stripped_left = s.lstrip()
+        head = stripped_left[:20]
+        if ("__global__" in head or "__device__" in head
+                or "__host__" in head or "__shared__" in head
+                or "__constant__" in head):
+            return True
+        # template / namespace at line start
+        if stripped_left.startswith("template") or stripped_left.startswith("namespace"):
+            return True
+        # Line-ending delimiters that signal a statement/block
+        if s.endswith(";") or s.endswith("{") or s.endswith("}"):
+            return True
+        return False
+
+    first_code = -1
+    for i, ln in enumerate(lines):
+        if _is_leading_code(ln.strip()):
+            first_code = i
+            break
+    if first_code < 0:
+        return None
+    if first_code > 0:
+        lines = lines[first_code:]
+
+    # ── Trim trailing prose ────────────────────────────────────────────
+    # Walk forward identifying the last plausibly code-shaped line; a run
+    # of 3+ consecutive non-code lines ends the window.  Trailing trim
+    # uses the original lenient heuristic so we don't accidentally cut the
+    # middle of a real function body.
+    def _is_code_like(s: str) -> bool:
+        """Lenient — does the line look plausibly like C/C++/HIP code?"""
+        if not s:
+            return True
+        if (s.startswith("#") or s.startswith("//") or s.startswith("/*")
+                or s.startswith("*")):
+            return True
+        if ("__global__" in s or "__device__" in s or "__host__" in s
+                or "__shared__" in s or "__constant__" in s
+                or "template" in s or "namespace " in s):
+            return True
+        if s.endswith(";") or s.endswith("{") or s.endswith("}"):
+            return True
+        if s in ("{", "}", "};"):
+            return True
+        if any(c in s for c in ("{", "}", ";", "->", "::")):
+            return True
+        return False
+
     last_code = -1
     consecutive_prose = 0
     for i, ln in enumerate(lines):
         s = ln.strip()
         if not s:
             continue
-        if (s.startswith("#") or s.startswith("//") or s.startswith("/*")
-                or s.startswith("*") or "__global__" in s or "__device__" in s
-                or "__host__" in s or "__shared__" in s or "__constant__" in s
-                or s.endswith(";") or s.endswith("{") or s.endswith("}")
-                or s in {"{", "}", "};"}
-                or any(c in s for c in ("{", "}", ";", "->", "::"))):
+        if _is_code_like(s):
             last_code = i
             consecutive_prose = 0
             continue
         consecutive_prose += 1
-        # A short trailing paragraph is fine (it may be a stray blank
-        # heuristic), but three consecutive non-code lines end the window.
         if consecutive_prose >= 3 and last_code >= 0:
             break
     if last_code < 0:
