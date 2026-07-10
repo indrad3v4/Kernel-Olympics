@@ -13,7 +13,7 @@
 | GitHub Repo | https://github.com/indrad3v4/Kernel-Olympics | ✅ |
 | Live Demo | https://endearing-rebirth.up.railway.app | 🚧 Building |
 | Demo Video | *Not required by scoring bot* | — |
-| Slide Deck | `SUBMISSION_SLIDES.pdf` *(create below)* | 📝 |
+| Slide Deck | `slides/KernelOlympics_Deck.pdf` | ✅ Built & Pushed |
 
 ---
 
@@ -158,13 +158,14 @@ A 4-LLM agentic loop (DeepSeek → GLM-5.2 → Kimi-K2.7 → Gemma) that:
 
 The scoring bot evaluates the slide deck PDF. Cover:
 
-- [ ] Problem: The $10B AMD adoption gap (20% of CUDA won't port)
-- [ ] Solution: 4-LLM agentic loop diagram
-- [ ] Architecture: DeepSeek→GLM→Kimi→Gemma flow
-- [ ] Three-gate validation (lexical→structural→semantic)
-- [ ] Demo flow: Upload .cu → Get HIP code
-- [ ] Team slide
-- [ ] Live link + QR code
+- [x] Problem: The $10B AMD adoption gap (20% of CUDA won't port)
+- [x] Solution: 4-LLM agentic loop diagram
+- [x] Architecture: DeepSeek→GLM→Kimi→Gemma flow
+- [x] Smart porting: `_strip_to_kernel_only` before/after
+- [x] Three-gate validation (lexical→structural→semantic)
+- [x] Performance: ~105s/kernel comparison table
+- [x] Team slide (all 6 members)
+- [x] Thank you / Live link
 
 ---
 
