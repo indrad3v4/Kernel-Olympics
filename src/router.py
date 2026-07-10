@@ -410,7 +410,7 @@ class Deadline:
 #   MAJOR — behavioral change (new instructions, removed constraints)
 #   MINOR — context additions (new examples, expanded edge cases)
 #   PATCH — wording, typo, formatting fixes
-PROMPT_VERSION = "v3.0.0"
+PROMPT_VERSION = "v4.0.0"
 
 # ── Role-specific system prompts ──
 # Each model gets its OWN role definition. No shared prompts.
@@ -567,8 +567,46 @@ class ModelRouter:
         # bare _call_model() outside the pipeline keeps its per-model timeout.
         self._deadline: Deadline = Deadline(0)
 
-    @staticmethod
-    def _extract_code(text: str) -> str:
+    # Definition-shaped markers for the injected NVIDIA helper shims. Any one of
+    # them present means the block is already in the file. Checked instead of the
+    # `// _verifier_helper_shims` comment alone, which _extract_code can strip.
+    _HELPER_SHIM_SENTINELS = (
+        "_verifier_helper_shims",
+        "struct StopWatchInterface {",
+        "static inline int findCudaDevice",
+    )
+
+    # A markdown fence line, with or without a language tag (```cpp, ``` c++, ```HIP).
+    _FENCE_LINE = re.compile(r'^[ \t]*```[^\n]*$', re.MULTILINE)
+
+    # The truncation marker in either spelling — the legacy HTML form is a parse
+    # bomb at C++ file scope and must never reach hipcc.
+    _TRUNCATION_MARKER = re.compile(
+        r'^[ \t]*(?:<!--[ \t]*TRUNCATED[^\n]*?-->|//[ \t]*TRUNCATED[^\n]*)$', re.MULTILINE)
+
+    @classmethod
+    def _sanitize_extracted(cls, code: str) -> str:
+        """Strip artifacts that are text, not C++, from an extracted port.
+
+        _extract_code's fallbacks capture from a code-like anchor to the END of the
+        model's response, so a closing ``` fence, trailing prose, or an appended
+        truncation marker ride along into the file hipcc compiles. None of those are
+        defects a model can fix — it never wrote them — so every refinement iteration
+        reproduces the same errors and the budget drains (Δ+0, new:0).
+
+        Everything from the first stray fence onward is dropped: a fence at file
+        scope means the code ended there and prose began.
+        """
+        if not code:
+            return code
+        code = cls._TRUNCATION_MARKER.sub("", code)
+        m = cls._FENCE_LINE.search(code)
+        if m:
+            code = code[:m.start()]
+        return code.strip()
+
+    @classmethod
+    def _extract_code(cls, text: str) -> str:
         """Extract HIP/C++ code from LLM output.
 
         Priority:
@@ -576,6 +614,10 @@ class ModelRouter:
           2. Markdown code blocks ```hip/cpp/cuda ... ```
           3. Raw code starting from #include or __global__
           4. Fallback: return as-is
+
+        Every return runs through _sanitize_extracted: strategies 3 and 3b anchor on
+        a code token and then take everything to the end of the response, so a
+        closing fence and the model's trailing explanation come with it.
         """
         import re as _re
 
@@ -631,21 +673,24 @@ class ModelRouter:
                     i += 1
             extracted = ''.join(result_chars).strip()
             if len(extracted) > 20:  # sanity check
-                return extracted
+                return cls._sanitize_extracted(extracted)
 
         # ── Strategy 2: Markdown code blocks ──
-        blocks = _re.findall(r'```(?:cuda|hip|cpp|python)?\n(.*?)```', text, _re.DOTALL)
+        # The language tag is whatever the model felt like typing: cpp, c++, C++,
+        # hip, HIP, cu. Pinning an allow-list meant `” ```c++ ”` fell through to
+        # Strategy 3, which swallowed the closing fence and the prose after it.
+        blocks = _re.findall(r'```[ \t]*[A-Za-z0-9_+#+-]*[ \t]*\r?\n(.*?)```', text, _re.DOTALL)
         if blocks:
             # Return the largest block (most likely the full kernel)
-            return max(blocks, key=len).strip()
+            return cls._sanitize_extracted(max(blocks, key=len))
 
         # ── Strategy 3: Raw code from #include or __global__ ──
         match = _re.search(r'#include.*', text, _re.DOTALL)
         if match:
-            return match.group(0).strip()
+            return cls._sanitize_extracted(match.group(0))
         match = _re.search(r'__global__\s+void.*', text, _re.DOTALL)
         if match:
-            return match.group(0).strip()
+            return cls._sanitize_extracted(match.group(0))
 
         # ── Strategy 3b: TRIZ #22 — Salvage code from truncated responses ──
         # When JSON is truncated mid-generation, the above strategies may fail.
@@ -670,10 +715,10 @@ class ModelRouter:
                 # Remove trailing incomplete JSON artifacts
                 salvaged = _re.sub(r'["\}]\s*$', '', salvaged).strip()
                 if len(salvaged) > 20:  # sanity check
-                    return salvaged
+                    return cls._sanitize_extracted(salvaged)
 
         # ── Strategy 4: Fallback ──
-        return text.strip()
+        return cls._sanitize_extracted(text)
 
     @staticmethod
     def _hipify_source(cuda_source: str):
@@ -855,7 +900,15 @@ class ModelRouter:
         # vary (assigned to a variable, passed a pointer-to-pointer, etc.) —
         # define tiny compatible stand-ins instead of guessing every call
         # site. See docs/fix-plan-self-contained-programs.md, Bug 2.
-        if ('_verifier_helper_shims' not in code
+        # The guard must key on the shim's DEFINITIONS, not on its marker comment.
+        # _extract_code's raw-code fallback starts at the first `#include`, which
+        # discards every line above it — including `// _verifier_helper_shims`. The
+        # struct and functions below it survive, so a marker-only guard re-injected
+        # the whole block on the next pass and hipcc reported a redefinition of
+        # StopWatchInterface and findCudaDevice. These two sentinels are
+        # definition-shaped: the original NVIDIA sample CALLS both symbols but
+        # defines neither, so they cannot be confused with legitimate use.
+        if (not any(s in code for s in ModelRouter._HELPER_SHIM_SENTINELS)
                 and ModelRouter._is_self_contained(code)):
             # The shim is injected BEFORE the code's first #include (so its
             # symbols are declared before any use), which means it CANNOT
@@ -871,6 +924,13 @@ class ModelRouter:
                 '// helper_functions.h symbols (no HIP/ROCm equivalent ships).\n'
                 '#include <hip/hip_runtime.h>\n'
                 '#include <chrono>\n'
+                '#include <cstdlib>\n'
+                # EXIT_WAIVED is a helper_string.h macro, not a std one. The NVIDIA
+                # samples exit with it when hardware lacks a required feature, and
+                # stripping helper_*.h left it undeclared in every restored driver.
+                '#ifndef EXIT_WAIVED\n'
+                '#define EXIT_WAIVED 2\n'
+                '#endif\n'
                 'struct StopWatchInterface { std::chrono::steady_clock::time_point start; double elapsed_ms = 0; };\n'
                 'static inline int findCudaDevice(int, const char **) { (void)hipSetDevice(0); return 0; }\n'
                 'static inline void sdkCreateTimer(StopWatchInterface **t) { *t = new StopWatchInterface(); }\n'
@@ -1218,18 +1278,44 @@ class ModelRouter:
         Returns ``(code, regex_changelog, main_restored)``.
 
         Every path that accepts model output — the initial port, a refine, and the
-        refine's retry — must apply the same three steps in the same order, or the
+        refine's retry — must apply the same steps in the same order, or the
         pipeline compiles something different from what it reasoned about.
+
+        ORDER IS LOAD-BEARING: restore main() BEFORE the mechanical pass, not after.
+        _fix_ported_code injects the NVIDIA helper shims (findCudaDevice, sdk*Timer,
+        StopWatchInterface) only when it sees a self-contained program. If main() is
+        restored afterwards, the file is not self-contained at fix time, the shims
+        are never injected, and the driver we just reattached calls findCudaDevice
+        into a void. Restoring first also means the driver is hipified by that same
+        pass — it is never hipified in isolation, which is what used to duplicate
+        the shim block and #define WAVEFRONT_SIZE.
         """
         code = self._extract_code(model_output)
+
+        # Why a restore was declined matters as much as when one happened: a silent
+        # no-op here looks identical to "the coder kept its main()".
+        blockers: List[str] = []
+        if (self._is_self_contained(kernel_source)
+                and not self._is_self_contained(code)):
+            original_main = self._extract_main(kernel_source)
+            if original_main:
+                blockers = self._unsatisfied_main_calls(
+                    original_main, code, kernel_source)
+
+        code, restored = self._ensure_main_preserved(code, kernel_source)
         fixed = self._fix_ported_code(code, return_changelog=True)
         if isinstance(fixed, tuple):
             code, changelog = fixed
         else:
             code, changelog = fixed, []
-        code, restored = self._ensure_main_preserved(code, kernel_source)
         if restored:
             changelog.append("main() restored from the original CUDA source")
+        elif blockers:
+            changelog.append(
+                "main() NOT restored — the original driver calls "
+                + ", ".join(blockers)
+                + ", which this port does not define; reattaching it would create an "
+                  "undefined symbol instead of fixing one")
         return code, changelog, restored
 
     @staticmethod
@@ -1327,9 +1413,15 @@ class ModelRouter:
         three LLM phases (plan, analyse, re-plan) could not fix what none of them
         had been told.
 
-        The driver is not regenerated — it is lifted from the original source and put
-        through the same mechanical CUDA→HIP pass the rest of the file already went
-        through, so no model is in the loop and the cost is a regex.
+        The driver is not regenerated — it is lifted verbatim from the original CUDA
+        source, so no model is in the loop and the cost is a regex.
+
+        It is appended RAW, still speaking CUDA. The caller (_postprocess_port) runs
+        _fix_ported_code over the combined file immediately afterwards, which both
+        hipifies the driver and — because the file now has a main() — injects the
+        NVIDIA helper shims the driver needs. Hipifying the driver here instead would
+        either duplicate that shim preamble or, if stripped, leave findCudaDevice and
+        the sdk*Timer family undefined.
 
         Only fires when the original was self-contained and the port is not: a port
         that kept its main() is left untouched, and a bare kernel snippet has no
@@ -1342,26 +1434,70 @@ class ModelRouter:
         if cls._is_self_contained(ported_code):
             return ported_code, False
 
-        # Hipify the WHOLE source, then cut main() out of the result — never hipify
-        # the isolated main(). _fix_ported_code prepends the helper shims and
-        # `#define WAVEFRONT_SIZE 64` to anything that looks self-contained, and an
-        # extracted main() does. Appending that preamble to a file that already
-        # carries it redefines StopWatchInterface and findCudaDevice, trading one
-        # link error for a dozen compile errors. Cutting from the hipified whole
-        # yields the driver alone, already translated, preamble left behind.
-        hipified_source = cls._fix_ported_code(original_source)
-        if isinstance(hipified_source, tuple):
-            hipified_source = hipified_source[0]
+        original_main = cls._extract_main(original_source)
+        if not original_main:
+            # Unbalanced or undetectable — refuse to append a truncated driver.
+            return ported_code, False
 
-        hipified_main = cls._extract_main(hipified_source)
-        if not hipified_main or not cls._extract_main(original_source):
+        # Never trade a compile problem for a link problem. If the driver calls a
+        # helper the port does not define, reattaching it invents an undefined
+        # symbol that no refinement can resolve without deleting the driver again.
+        if cls._unsatisfied_main_calls(original_main, ported_code, original_source):
             return ported_code, False
 
         return (ported_code.rstrip() + "\n\n"
                 "// ── main() restored from the original CUDA source ──\n"
                 "// The port dropped the driver of a self-contained program. This is the\n"
-                "// original main(), mechanically hipified — no model rewrote it.\n"
-                + hipified_main + "\n"), True
+                "// original main(), verbatim — no model rewrote it. The caller's\n"
+                "// mechanical CUDA→HIP pass translates it and injects the helper shims\n"
+                "// it needs, now that this file has a main() again.\n"
+                + original_main + "\n"), True
+
+    # A function DEFINITION at file scope: `... name(args) {`. Deliberately not a
+    # declaration (`...;`) — a prototype defines no symbol for the linker.
+    _FUNC_DEF = re.compile(
+        r'^[ \t]*(?:(?:static|inline|extern|__global__|__device__|__host__|'
+        r'template\s*<[^>]*>)\s+)*'
+        r'[A-Za-z_][A-Za-z0-9_:<>,\t \*&]*?\b(\w+)\s*\([^;{)]*\)\s*(?:const\s*)?\{',
+        re.MULTILINE)
+
+    # An identifier immediately followed by `(` — a call, a definition, or a cast.
+    _CALL_SITE = re.compile(r'\b([A-Za-z_]\w*)\s*\(')
+
+    # Control-flow keywords that look like calls to the regex above.
+    _NOT_CALLS = frozenset({
+        "if", "for", "while", "switch", "return", "sizeof", "catch",
+        "static_cast", "reinterpret_cast", "const_cast", "dynamic_cast",
+    })
+
+    @classmethod
+    def _defined_functions(cls, code: str) -> set:
+        """Names of functions *defined* (not merely declared) at file scope in code."""
+        return {m.group(1) for m in cls._FUNC_DEF.finditer(code)} - cls._NOT_CALLS
+
+    @classmethod
+    def _unsatisfied_main_calls(cls, main_text: str, ported_code: str,
+                                original_source: str) -> List[str]:
+        """User-defined helpers that *main* calls but the port does not define.
+
+        Restoring a driver verbatim is only safe when the driver's own dependencies
+        survive in the port. `nvidia_shfl_scan.cu` is the counter-example: its main()
+        calls ``shuffle_integral_image_test()``, whose body needs
+        ``shfl_integral_image.cuh`` — a header this repo never vendored. The coder is
+        told, correctly, to drop that whole code path. Reattaching a main() that calls
+        it anyway converts a compile problem into an unfixable link problem, and every
+        refinement iteration then fights the restore.
+
+        Only names *defined in the original* are considered. Runtime and library
+        symbols (printf, exit, hipMalloc, the injected shims) are, by construction,
+        not function definitions in the original .cu, so they are never reported.
+        """
+        original_funcs = cls._defined_functions(original_source) - {"main"}
+        if not original_funcs:
+            return []
+        called = {m.group(1) for m in cls._CALL_SITE.finditer(main_text)} - cls._NOT_CALLS
+        available = cls._defined_functions(ported_code)
+        return sorted((called & original_funcs) - available)
 
     # A diagnostic emitted by the linker, not the compiler. `clang++: error: linker
     # command failed` always accompanies the real `ld.lld: undefined symbol: X` line,
@@ -1659,6 +1795,19 @@ class ModelRouter:
                 "ported_code MUST also include a complete main() with identical logic, "
                 "ported to HIP APIs. Do NOT strip main() — it drives the full test."
             )
+            if missing_headers:
+                # The two instructions above and below collide on exactly one line of
+                # the driver: main() calls the code path we just told the coder to
+                # drop. Left unresolved, the coder either keeps a call to a function
+                # it did not define (link error) or drops main() (also a link error).
+                prompt += (
+                    "\nRESOLVING THE CONFLICT: main() itself calls into the dropped "
+                    "code path. Reproduce main() exactly as above, EXCEPT omit the "
+                    "call to any function you dropped, omit the variables that hold "
+                    "only its result, and simplify any expression that used them. "
+                    "Everything else in main() stays. Do not stub the dropped "
+                    "function, and do not delete main()."
+                )
         return prompt
 
     def _build_kimi_refine_prompt(self, kernel_source: str,
@@ -2306,6 +2455,13 @@ class ModelRouter:
                     "[main] Coder dropped main() from a self-contained program — "
                     "restored it from the original CUDA source (no LLM call)")
                 print(f"║  │  🔧 MAIN RESTORED: coder dropped the driver — reattached{'':<7}║")
+            else:
+                # A declined restore is a decision, not an absence of one. Surface it.
+                for _note in regex_changelog:
+                    if _note.startswith("main() NOT restored"):
+                        result["changes"].append(f"[main] {_note}")
+                        print(f"║  │  ⚠ MAIN NOT RESTORED: driver needs code this port "
+                              f"dropped{'':<6}║")
             result["ported_code"] = extracted
             result["regex_changelog"] = regex_changelog  # A3: track regex fixes
             if verifier and hasattr(verifier, 'quick_compile_check'):
@@ -2333,8 +2489,11 @@ class ModelRouter:
                     # Feed compile errors to GLM evaluator as additional feedback
                     # A2A protocol: structure ALL errors, not just first 3
                     all_errs = compile_errs if compile_errs else [cc["compile_output"][:300]]
-                    # Check if the code was truncated
-                    is_truncated = "TRUNCATED" in extracted
+                    # Check if the code was truncated. Read the RAW model output, not
+                    # the extracted source: _sanitize_extracted deletes the marker so
+                    # it can never reach hipcc, and asking the compiled file whether
+                    # it still carries a marker we just removed always answers "no".
+                    is_truncated = "TRUNCATED" in code.output
                     if is_truncated:
                         result["changes"].append("[kimi27] Output was TRUNCATED — requesting shorter response")
                     try:
@@ -3663,9 +3822,17 @@ class ModelRouter:
                         usage.get("total_tokens", 0)
                         or usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
                     )
-                    # Truncation detection: if finish_reason is "length", the output was cut off
+                    # Truncation detection: if finish_reason is "length", the output was cut off.
+                    # The marker MUST be a C++ line comment. It was an HTML comment
+                    # (`<!-- ... -->`), and _extract_code's fallback strategies run to the
+                    # end of the text, so it was spliced into the source handed to hipcc.
+                    # At file scope `<!--` is not C++: clang reports "expected external
+                    # declaration" at the `<` (col 1) and "expected unqualified-id" at the
+                    # `--` (col 3) — two errors on one line that no model can fix, because
+                    # the model never wrote them. route() still detects it via
+                    # `"TRUNCATED" in extracted`, which this spelling preserves.
                     if finish_reason == "length":
-                        content += "\n<!-- TRUNCATED: output hit max_tokens limit -->"
+                        content += "\n// TRUNCATED: output hit max_tokens limit"
                     # TRIZ #9: Prepend prefill to content — the API returns
                     # only the continuation, we need the full string for parsing
                     if prefill:

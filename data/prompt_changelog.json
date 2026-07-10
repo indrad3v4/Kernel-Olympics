@@ -1,6 +1,26 @@
 {
   "versions": [
     {
+      "version": "v4.0.0",
+      "date": "2026-07-10",
+      "author": "fable",
+      "changes": [
+        "Kimi code prompt: resolve the collision between 'keep main()' and 'drop the unresolved-header code path' — main() calls that path, so reproduce it minus the dropped call",
+        "Truncation marker was an HTML comment (<!-- ... -->) spliced into C++ source: at file scope that is 'expected external declaration' at col 1 and 'expected unqualified-id' at col 3. Now a // comment; truncation detected from the raw model output",
+        "_sanitize_extracted strips leaked closing fences, trailing prose and the truncation marker from every _extract_code path",
+        "Markdown fence language tag generalized — ```c++ fell through the (cuda|hip|cpp|python) allow-list and swallowed the closing fence plus prose",
+        "_postprocess_port restores main() BEFORE the mechanical pass, so the helper-shim injection (gated on the file having a main()) actually fires for the restored driver",
+        "Restore is dependency-aware (_unsatisfied_main_calls): a driver calling a helper the port does not define is not reattached — that trades a compile error for an unfixable link error",
+        "Helper-shim re-injection guard keys on the shim's definitions, not its marker comment, which _extract_code strips",
+        "Helper shim now defines EXIT_WAIVED (a helper_string.h macro that _fix_ported_code strips along with its header)"
+      ],
+      "files_changed": [
+        "src/router.py",
+        "tests/test_main_preservation.py"
+      ],
+      "run_results": {}
+    },
+    {
       "version": "v3.0.0",
       "date": "2026-07-10",
       "author": "fable",
@@ -49,5 +69,5 @@
       "run_results": {}
     }
   ],
-  "current": "v3.0.0"
+  "current": "v4.0.0"
 }

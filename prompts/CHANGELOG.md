@@ -13,6 +13,60 @@ asserts the three stay in sync.
 
 ---
 
+## v4.0.0 (2026-07-10)
+
+MAJOR: the coder gains a new instruction. Fixes the first real run of v3.0.0, which
+proved the v3.0.0 work landed (`MAIN RESTORED`, a 10.5s plan, a clean budget stop)
+and then failed at `test_nvidia_shfl_scan.cpp:4:1: error: expected external declaration`.
+
+- Kimi code prompt: when a source has BOTH its own `main()` and an unresolved local
+  header, the two standing instructions — "keep `main()`" and "drop the code path that
+  needs the missing header" — collide, because `main()` *calls* that path. The prompt
+  now resolves it: reproduce `main()` minus the dropped call and the variables that
+  only held its result. Without this the coder either keeps a call to a function it
+  never defined, or deletes `main()`. Both are link errors.
+
+Non-prompt changes shipped alongside (same commit):
+
+- **The truncation marker was HTML.** `_call_model` appended
+  `<!-- TRUNCATED: output hit max_tokens limit -->` to the model's content, and
+  `_extract_code`'s fallbacks anchor on a code token and run to the *end of the
+  response* — so it reached hipcc. At C++ file scope `<` is
+  `expected external declaration` (col 1) and `--` is `expected unqualified-id`
+  (col 3): two errors on one line, cols 1 and 3, exactly the observed signature.
+  It is now a `//` comment, and truncation is detected from the raw model output.
+- `_sanitize_extracted` strips a leaked closing ``` fence, the prose after it, and the
+  truncation marker from every extraction path. None of these is a defect a model can
+  fix — it never wrote them — so each iteration reproduced identical errors
+  (`Δ+0, new:0`) until the budget drained.
+- The markdown-fence language tag is no longer an allow-list of
+  `(cuda|hip|cpp|python)`: ` ```c++ ` fell through to the raw-code strategy, which
+  swallowed the closing fence and everything after it.
+- **`_postprocess_port` now restores `main()` BEFORE the mechanical pass.**
+  `_fix_ported_code` injects the NVIDIA helper shims only when it sees a
+  self-contained program; restoring afterwards meant the file had no `main()` at fix
+  time, no shims were injected, and the driver just reattached called
+  `findCudaDevice` into a void. Restoring first also hipifies the driver in that same
+  pass, so it is never hipified in isolation — which is what used to duplicate the
+  shim block and `#define WAVEFRONT_SIZE`.
+- **The restore is dependency-aware** (`_unsatisfied_main_calls`). `nvidia_shfl_scan`'s
+  `main()` calls `shuffle_integral_image_test()`, whose body needs
+  `shfl_integral_image.cuh` — a header this repo never vendored and which the coder is
+  told to drop. Reattaching that driver verbatim invents an undefined symbol, trading a
+  compile error for an unfixable link error while every refinement fights the restore.
+  A driver calling a helper the port does not define is no longer reattached, and the
+  declined restore names the exact symbol.
+- The shim re-injection guard keys on the shim's **definitions**, not on its
+  `// _verifier_helper_shims` marker comment. `_extract_code`'s raw-code fallback
+  starts at the first `#include` and discards every line above it, marker included, so
+  the next pass re-injected the block and hipcc reported a redefinition of
+  `StopWatchInterface`.
+- The shim now defines `EXIT_WAIVED`. It is a `helper_string.h` macro, not a std one,
+  and `_fix_ported_code` strips `helper_*.h` — so every restored NVIDIA driver
+  referenced it undeclared.
+
+---
+
 ## v3.0.0 (2026-07-10)
 
 MAJOR: the planner's instructions changed behaviorally, and the error analyst is
