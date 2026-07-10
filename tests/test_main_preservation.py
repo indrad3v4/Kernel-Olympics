@@ -119,15 +119,17 @@ class TestEnsureMainPreserved:
         assert ModelRouter._is_self_contained(code)
         assert "scan_kernel" in code, "the port's own kernel must survive"
 
-    def test_restored_driver_is_hipified(self):
+    def test_restores_the_driver_verbatim_still_speaking_cuda(self):
+        """The driver is appended RAW. _postprocess_port runs the mechanical pass
+        over the combined file right afterwards, which both translates it and —
+        because the file now has a main() — injects the helper shims it calls."""
         code, _ = ModelRouter._ensure_main_preserved(
             PORT_WITHOUT_MAIN, SELF_CONTAINED_CUDA)
         tail = code.split("main() restored")[1]
-        assert "hipMalloc" in tail and "hipFree" in tail
-        assert ModelRouter._residual_cuda_symbols(tail) == []
+        assert "cudaMalloc" in tail and "cudaFree" in tail
 
     def test_restore_does_not_duplicate_the_injected_preamble(self):
-        """Hipifying an isolated main() re-injects the helper shims and
+        """Hipifying an isolated main() would re-inject the helper shims and
         WAVEFRONT_SIZE. Appending those to a file that has them is a
         redefinition error — one link error traded for a dozen compile ones."""
         hipified, _ = ModelRouter._hipify_source(SELF_CONTAINED_CUDA)
@@ -175,6 +177,196 @@ class TestPostprocessPort:
         _, changelog, restored = router._postprocess_port(raw, SELF_CONTAINED_CUDA)
         assert restored is False
         assert not any("main() restored" in c for c in changelog)
+
+    def test_restored_driver_gets_the_helper_shims_it_calls(self, router):
+        """ORDER BUG. _fix_ported_code injects findCudaDevice / sdk*Timer /
+        StopWatchInterface only when it sees a self-contained program. Restoring
+        main() AFTER the mechanical pass means the file was not self-contained at
+        fix time, so the shims were never injected and the driver we just
+        reattached called findCudaDevice into a void."""
+        code, _, restored = router._postprocess_port(
+            PORT_WITHOUT_MAIN, SELF_CONTAINED_CUDA)
+        assert restored is True
+        assert "static inline int findCudaDevice" in code
+        assert "struct StopWatchInterface {" in code
+
+    def test_restored_driver_is_hipified_by_the_mechanical_pass(self, router):
+        code, _, _ = router._postprocess_port(PORT_WITHOUT_MAIN, SELF_CONTAINED_CUDA)
+        tail = code.split("main() restored")[1]
+        assert "hipMalloc" in tail and "hipFree" in tail
+        assert ModelRouter._residual_cuda_symbols(tail) == []
+
+    def test_second_pass_does_not_duplicate_the_shim_block(self, router):
+        """The re-injection guard used to key on the `// _verifier_helper_shims`
+        marker comment. _extract_code's raw-code fallback starts at the first
+        #include and discards every line above it, marker included — so the next
+        pass re-injected the block and hipcc reported a redefinition of
+        StopWatchInterface. The guard now keys on the definitions themselves."""
+        once, _, _ = router._postprocess_port(PORT_WITHOUT_MAIN, SELF_CONTAINED_CUDA)
+        twice, _, restored = router._postprocess_port(once, SELF_CONTAINED_CUDA)
+        assert restored is False
+        assert twice.count("struct StopWatchInterface {") == 1
+        assert twice.count("static inline int findCudaDevice") == 1
+        assert twice.count("#define WAVEFRONT_SIZE") == 1
+        assert twice.count("int main(") == 1
+
+
+# ── The driver must not be restored into a file that cannot satisfy it ───
+
+# A driver that depends on a helper the coder may legitimately drop, mirroring
+# nvidia_shfl_scan.cu: shuffle_integral_image_test() needs shfl_integral_image.cuh,
+# a header this repo never vendored, so the coder is told to drop that code path.
+CUDA_WITH_HELPER = """
+#include <cuda_runtime.h>
+#include <cstdio>
+
+__global__ void k(float* x) { x[threadIdx.x] = 0.f; }
+
+bool portable_test(int argc, char** argv) { return true; }
+
+bool header_dependent_test() { return shfl_integral_image_kernel(); }
+
+int main(int argc, char** argv) {
+    int dev = findCudaDevice(argc, (const char**)argv);
+    if (dev < 0) exit(EXIT_WAIVED);
+    bool a = portable_test(argc, argv);
+    bool b = header_dependent_test();
+    return (a && b) ? 0 : 1;
+}
+"""
+
+
+class TestRestoreDependencies:
+    def test_declines_when_the_driver_calls_a_helper_the_port_dropped(self, router):
+        """Reattaching a driver that calls a function nobody defines converts a
+        compile problem into an unfixable link problem — and every refinement then
+        fights the restore, which re-appends the same driver each iteration."""
+        port = ("#include <hip/hip_runtime.h>\n"
+                "__global__ void k(float* x) { x[threadIdx.x] = 0.f; }\n"
+                "bool portable_test(int argc, char** argv) { return true; }\n")
+        code, changelog, restored = router._postprocess_port(port, CUDA_WITH_HELPER)
+        assert restored is False
+        assert "header_dependent_test" not in code
+        assert any("NOT restored" in c and "header_dependent_test" in c
+                   for c in changelog), changelog
+
+    def test_restores_when_every_helper_the_driver_calls_survives(self, router):
+        port = ("#include <hip/hip_runtime.h>\n"
+                "__global__ void k(float* x) { x[threadIdx.x] = 0.f; }\n"
+                "bool portable_test(int argc, char** argv) { return true; }\n"
+                "bool header_dependent_test() { return true; }\n")
+        code, _, restored = router._postprocess_port(port, CUDA_WITH_HELPER)
+        assert restored is True
+        assert ModelRouter._is_self_contained(code)
+
+    def test_unsatisfied_calls_ignores_runtime_and_library_symbols(self):
+        """printf/exit/hipMalloc are not defined in the original .cu, so they can
+        never be reported as dropped helpers."""
+        main = ModelRouter._extract_main(CUDA_WITH_HELPER)
+        port = ("bool portable_test(int a, char** b) { return true; }\n"
+                "bool header_dependent_test() { return true; }\n")
+        missing = ModelRouter._unsatisfied_main_calls(main, port, CUDA_WITH_HELPER)
+        assert missing == []
+        assert "printf" not in missing and "exit" not in missing
+        assert "findCudaDevice" not in missing  # a shim symbol, not defined in the .cu
+
+    def test_real_kernel_driver_needs_the_header_dependent_helper(self):
+        """The regression this whole class exists for, on the real sample."""
+        src = (REPO / "sample_kernels" / "cuda" / "nvidia_shfl_scan.cu").read_text(
+            encoding="utf-8", errors="replace")
+        main = ModelRouter._extract_main(src)
+        kernel_only = ("#include <hip/hip_runtime.h>\n"
+                       "__global__ void shfl_scan_test(int* d, int w, int* p) {}\n")
+        missing = ModelRouter._unsatisfied_main_calls(main, kernel_only, src)
+        assert "shuffle_integral_image_test" in missing
+        assert "shuffle_simple_test" in missing
+
+
+class TestDroppedPathConflict:
+    def test_coder_is_told_how_to_reconcile_main_with_a_dropped_path(self, router):
+        """"Keep main()" and "drop the header-dependent path" collide on one line:
+        main() calls that path. Unresolved, the coder either keeps a call to a
+        function it never defined, or deletes main(). Both are link errors."""
+        src = (REPO / "sample_kernels" / "cuda" / "nvidia_shfl_scan.cu").read_text(
+            encoding="utf-8", errors="replace")
+        hipified, _ = router._hipify_source(src)
+        p = router._build_kimi_code_prompt(src, [], preprocessed_source=hipified)
+        assert "Do NOT strip main()" in p
+        assert "RESOLVING THE CONFLICT" in p
+        assert "do not delete main()" in p
+
+    def test_no_conflict_note_when_every_header_resolves(self, router):
+        p = router._build_kimi_code_prompt(SELF_CONTAINED_CUDA, [])
+        assert "Do NOT strip main()" in p
+        assert "RESOLVING THE CONFLICT" not in p
+
+
+class TestHelperShims:
+    def test_shim_defines_exit_waived(self):
+        """EXIT_WAIVED is a helper_string.h macro, not a std one. _fix_ported_code
+        strips helper_*.h, so every restored NVIDIA driver referenced it undeclared."""
+        code, _ = ModelRouter._hipify_source(SELF_CONTAINED_CUDA)
+        assert "#define EXIT_WAIVED" in code
+
+    def test_real_sample_uses_exit_waived_and_the_shim_supplies_it(self):
+        src = (REPO / "sample_kernels" / "cuda" / "nvidia_shfl_scan.cu").read_text(
+            encoding="utf-8", errors="replace")
+        assert "EXIT_WAIVED" in src, "sample no longer exercises this path"
+        hipified, _ = ModelRouter._hipify_source(src)
+        assert "#define EXIT_WAIVED" in hipified
+
+    def test_shim_is_injected_exactly_once_across_repeated_passes(self):
+        code, _ = ModelRouter._hipify_source(SELF_CONTAINED_CUDA)
+        again, _ = ModelRouter._hipify_source(code)
+        assert again.count("struct StopWatchInterface {") == 1
+        assert again.count("#define EXIT_WAIVED") == 1
+
+
+# ── Artifacts that are text, not C++ ─────────────────────────────────────
+
+class TestSanitizeExtracted:
+    def test_html_truncation_marker_never_reaches_the_compiler(self):
+        """`<!-- TRUNCATED ... -->` was appended to the model's content and rode
+        the extraction fallbacks into the file hipcc compiled. At C++ file scope
+        `<` is `expected external declaration` (col 1) and `--` is
+        `expected unqualified-id` (col 3) — two errors on one line that no model
+        can fix, because no model wrote them."""
+        out = ("#include <hip/hip_runtime.h>\n"
+               "__global__ void k(float* x) {}\n"
+               "<!-- TRUNCATED: output hit max_tokens limit -->")
+        code = ModelRouter._extract_code(out)
+        assert "<!--" not in code and "-->" not in code
+        assert "__global__" in code
+
+    def test_cpp_line_comment_truncation_marker_is_also_stripped(self):
+        out = ("#include <hip/hip_runtime.h>\n"
+               "__global__ void k(float* x) {}\n"
+               "// TRUNCATED: output hit max_tokens limit")
+        code = ModelRouter._extract_code(out)
+        assert "TRUNCATED" not in code
+
+    @pytest.mark.parametrize("tag", ["c++", "C++", "HIP", "cu", "", "cpp"])
+    def test_any_fence_language_tag_is_handled(self, tag):
+        """An allow-list of (cuda|hip|cpp|python) meant ```c++ fell through to the
+        raw-code strategy, which swallowed the closing fence and the prose after."""
+        out = (f"Here is the port:\n```{tag}\n"
+               "#include <hip/hip_runtime.h>\n"
+               "__global__ void k(float* x) {}\n"
+               "```\nExplanation: I widened the shuffle mask to 0x3f.")
+        code = ModelRouter._extract_code(out)
+        assert "```" not in code
+        assert "Explanation" not in code
+        assert "__global__" in code
+
+    def test_trailing_prose_after_a_stray_fence_is_dropped(self):
+        code = ModelRouter._sanitize_extracted(
+            "#include <hip/hip_runtime.h>\nint main(){return 0;}\n```\nAll done!")
+        assert "```" not in code and "All done" not in code
+        assert "int main()" in code
+
+    def test_clean_code_is_left_alone(self):
+        src = "#include <hip/hip_runtime.h>\nint main(){return 0;}"
+        assert ModelRouter._sanitize_extracted(src) == src
 
 
 # ── P0: linker-error classification ──────────────────────────────────────
