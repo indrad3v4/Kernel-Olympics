@@ -329,6 +329,9 @@ class _NullSession:
     def log_patch(self, *_a: Any, **_kw: Any) -> None:
         return None
 
+    def log_semantic_repair(self, *_a: Any, **_kw: Any) -> None:
+        return None
+
     def log_symbols(self, *_a: Any, **_kw: Any) -> None:
         return None
 
@@ -1053,6 +1056,44 @@ class DebugSession:
         self.event("patch", reason=source_label, iteration=iteration,
                    lines_modified=added + removed)
         return report
+
+    # ── Stage 11b: semantic repair (deterministic repair engine) ────────────
+
+    def log_semantic_repair(self, patch: Dict, diagnostic: str = "",
+                            iteration: int = 0, **meta: Any) -> Optional[Path]:
+        """Persist one deterministic semantic-repair patch, complete (Phase 8).
+
+        The Semantic Translation Repair Engine turns a compiler diagnostic into
+        a minimal source patch recovered from the original CUDA. Every field it
+        produced — the CUDA snippet it restored from, the HIP snippet before,
+        the diagnostic, the unified diff, the root cause, the strategy, the
+        confidence, and the before/after compile error counts — is written here
+        so a repair is fully reproducible offline. Nothing is discarded.
+        """
+        try:
+            tag = f"semantic_repair_iter{iteration}_{_slug(patch.get('symbol', 'sym'), 32)}"
+            if patch.get("diff"):
+                self.write_text(STAGE_PATCHES, f"{tag}.diff", patch["diff"])
+            if patch.get("cuda_snippet"):
+                self.write_text(STAGE_PATCHES, f"{tag}_cuda_source.txt",
+                                patch["cuda_snippet"])
+            if patch.get("hip_snippet_before"):
+                self.write_text(STAGE_PATCHES, f"{tag}_hip_before.txt",
+                                patch["hip_snippet_before"])
+            path = self.write_json(STAGE_PATCHES, f"{tag}_report", {
+                "diagnostic": diagnostic or patch.get("diagnostic", ""),
+                "iteration": iteration,
+                **patch,
+                **meta,
+            })
+            self.event("semantic_repair", reason=patch.get("strategy", ""),
+                       iteration=iteration, symbol=patch.get("symbol", ""),
+                       accepted=patch.get("accepted", False),
+                       confidence=patch.get("confidence", ""))
+            return path
+        except Exception as exc:
+            self._record_error("log_semantic_repair", exc)
+            return None
 
     # ── Stage 12: failure snapshot ──────────────────────────────────────────
 

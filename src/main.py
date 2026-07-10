@@ -393,7 +393,7 @@ class KernelOlympics:
 
                     icons = {"plan": "🧠", "code": "⚡", "evaluate": "🔬",
                              "refine": "🔁", "verify": "✅", "compile": "🔨",
-                             "analyze": "🔍", "replan": "🔄"}
+                             "analyze": "🔍", "replan": "🔄", "repair": "🩹"}
 
                     port_result = self.router.route(
                         source, cr.get("findings", []),

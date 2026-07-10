@@ -690,6 +690,14 @@ class ModelRouter:
         # burning budget on an unstuck loop.
         self._last_error_sig: str = ""
         self._same_error_count: int = 0
+        # Semantic Translation Repair Engine: a deterministic strategy→outcome
+        # cache shared across every kernel this router handles in a session, so a
+        # repair learned on one file is tried first on the next (Phase 9). Also
+        # tracks which (patched) code we have already deterministically repaired,
+        # so a compile-fail iteration does not re-run the engine on code it just
+        # produced and get an unchanged result.
+        self._semantic_repair_cache: Dict[str, str] = {}
+        self._semantic_repaired_hashes: set = set()
 
     def _finalize_debug(self, result: Dict):
         """Write the summary — but only for a session route() itself created.
@@ -701,6 +709,68 @@ class ModelRouter:
         if not self._owns_debug_session:
             return None
         return self.debug.finalize(result)
+
+    def _attempt_semantic_repair(self, cuda_source: str, hip_source: str,
+                                 compile_errs: List[str], verifier,
+                                 kernel_name: str, iteration: int):
+        """Deterministic pre-LLM repair: compiler diagnostics → minimal patches.
+
+        Runs the Semantic Translation Repair Engine over the current compile
+        errors. The engine recovers semantic information the translation dropped
+        (a macro, a ``__device__`` helper, a struct) from the ORIGINAL CUDA
+        source and restores it with the smallest additive edit — never
+        regenerating the file, never calling a model.
+
+        Returns ``(patched_code, compile_check)`` when the repair strictly
+        reduces the error count (or compiles clean), else ``None``. The single
+        confirming ``quick_compile_check`` here is what guarantees the engine can
+        never hand back code that compiles worse than what it was given.
+        """
+        if not verifier or not hasattr(verifier, "quick_compile_check"):
+            return None
+        if not (cuda_source and hip_source and compile_errs):
+            return None
+        # Skip code we have already repaired once: if the last engine pass left
+        # this exact text, re-running it would only reproduce the same result.
+        code_hash = hash(hip_source)
+        if code_hash in self._semantic_repaired_hashes:
+            return None
+        try:
+            from verification.semantic_repair import SemanticRepairEngine
+        except Exception as exc:  # never let a repair import take down the loop
+            logger.debug("semantic repair unavailable: %s", exc)
+            return None
+
+        try:
+            engine = SemanticRepairEngine(
+                cuda_source, hip_source,
+                debug_session=self.debug, cache=self._semantic_repair_cache)
+            # Additive high-confidence pass (instant, no compile): restores every
+            # symbol the CUDA source can account for in one shot.
+            dry = engine.repair(compile_errs)
+        except Exception as exc:
+            logger.debug("semantic repair engine raised: %s", exc)
+            return None
+
+        self._semantic_repaired_hashes.add(code_hash)
+        if not dry.changed:
+            return None
+
+        # Confirm the patched code actually compiles better before adopting it.
+        with self.debug.stage("hipcc"):
+            cc = verifier.quick_compile_check(dry.patched_code, kernel_name=kernel_name)
+        before = len(compile_errs)
+        after = len(cc.get("errors", []))
+        improved = cc.get("compile_success") or after < before
+        self.debug.transition(
+            "SEMANTIC_REPAIR",
+            reason=(f"restored {len(dry.accepted_patches)} symbol(s) from CUDA source; "
+                    f"errors {before}→{after}" + ("" if improved else " (rejected — no improvement)")),
+            validation_result=improved, iteration=iteration)
+        if not improved:
+            return None
+        self._semantic_repaired_hashes.add(hash(dry.patched_code))
+        return dry.patched_code, cc
 
     # Definition-shaped markers for the injected NVIDIA helper shims. Any one of
     # them present means the block is already in the file. Checked instead of the
@@ -3672,6 +3742,40 @@ class ModelRouter:
                         result["iterations_used"] = iteration
                         result["abort_reason"] = "harness_origin"
                         break
+
+                    # ── Semantic Translation Repair Engine (deterministic, pre-LLM) ──
+                    # Before spending a GLM analysis + DeepSeek re-plan + Kimi refine
+                    # cycle on these errors, try to recover the lost semantic
+                    # information from the ORIGINAL CUDA source. A dropped macro,
+                    # __device__ helper or struct is restored with a minimal additive
+                    # edit — no model call, fully deterministic. Guarded to the errors
+                    # that live in the ported kernel (harness-origin and linker-only
+                    # cases are handled/aborted above and cannot be fixed by restoring
+                    # a symbol into the port). Only adopted when it strictly reduces
+                    # the error count, so it can never make the build worse.
+                    if (compile_errs and not linker_only
+                            and not state.structural_reject):
+                        if on_phase:
+                            on_phase("repair", "semantic-repair",
+                                     f"restoring dropped symbols from CUDA (iter {iteration})")
+                        repaired = self._attempt_semantic_repair(
+                            kernel_source, result["ported_code"], compile_errs,
+                            verifier, kernel_name, iteration)
+                        if repaired is not None:
+                            patched_code, repaired_cc = repaired
+                            n_fixed = len(compile_errs) - len(repaired_cc.get("errors", []))
+                            result["ported_code"] = patched_code
+                            result["changes"].append(
+                                f"[semantic-repair] Iter {iteration}: restored dropped "
+                                f"symbol(s) from original CUDA source — "
+                                f"errors {len(compile_errs)}→{len(repaired_cc.get('errors', []))} "
+                                f"(deterministic, no LLM)")
+                            print(f"║  │  🩹 SEMANTIC REPAIR: recovered {n_fixed} error(s) "
+                                  f"from CUDA source{'':<12}║")
+                            # Re-enter the loop: the top recompiles the patched code
+                            # and takes the success branch (or surfaces the remaining,
+                            # now-fewer errors for the next repair/LLM pass).
+                            continue
 
                     # TRIZ #3/#22/#28: Semantic error diffing — normalize before
                     # comparing so the same error at a different line number is
