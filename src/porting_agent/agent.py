@@ -6,13 +6,32 @@ Model: Fireworks API (AMD-hosted catalog)
 Output: ported code + confidence score + explanation of the fix
 
 Confidence-gated: if confidence < threshold, flag for human review.
+
+Every code path here that returns a ``ported_code`` field routes the string
+through :func:`verification.extraction.extract_code` (to strip prose /
+markdown / JSON wrappers) and then :func:`verification.lexical.validate_lexical`
+(to reject reasoning at top level).  A response that fails either gate is
+NEVER returned as ``ported_code`` — the caller sees ``rejected: True`` and
+the raw response in a diagnostic field instead.
 """
 
 import os
 import json
 import socket
+import sys
 from typing import Dict, Optional
 from pathlib import Path
+
+# The verification helpers live under src/verification.  When the agent is
+# imported via ``from porting_agent.agent import PortingAgent`` after
+# ``sys.path`` has been seeded with the ``src`` root (main.py does that),
+# this import resolves.  When tests import agent.py in isolation they must
+# also seed sys.path — we do the seed here as a safety net.
+_SRC_ROOT = Path(__file__).resolve().parent.parent
+if str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
+from verification.extraction import extract_code as _extract_code_v2
+from verification.lexical import validate_lexical as _validate_lexical
 
 
 def _force_ipv4():
@@ -212,19 +231,36 @@ CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explan
                 # Try JSON extraction first (handles prose-wrapped JSON)
                 parsed = self._extract_json_from_text(content)
                 if parsed and "ported_code" in parsed:
-                    parsed["ported_code"] = self._fix_ported_code(parsed["ported_code"])
-                    parsed["cost"] = round(call_cost, 4)
-                    return parsed
-                # Fallback: extract HIP code from text output
-                code_text = self._extract_code_from_text(content)
+                    fixed = self._fix_ported_code(parsed["ported_code"])
+                    ok, reason = self._gate_code(fixed)
+                    if not ok:
+                        # A JSON reply where the code field itself is prose is the
+                        # exact class of failure the bug report flagged.  Do not
+                        # return it as ported_code; fall through to the next
+                        # extraction attempt or the next model.
+                        print(f"║ ⚠ gate rejected {model} JSON payload: {reason[:80]}")
+                    else:
+                        parsed["ported_code"] = fixed
+                        parsed["cost"] = round(call_cost, 4)
+                        return parsed
+                # Fallback: extract HIP code from text output using both the
+                # provider-agnostic extractor and the legacy prose stripper.
+                extraction = _extract_code_v2(content)
+                code_text = (extraction.code or "").strip()
+                if not code_text:
+                    code_text = self._extract_code_from_text(content)
                 if code_text:
-                    return {
-                        "ported_code": self._fix_ported_code(code_text),
-                        "confidence": self._rubric_score_extracted(code_text),
-                        "changes": ["LLM returned text without valid JSON — extracted code block"],
-                        "explanation": "Code extracted from LLM text output",
-                        "cost": round(call_cost, 4),
-                    }
+                    fixed = self._fix_ported_code(code_text)
+                    ok, reason = self._gate_code(fixed)
+                    if ok:
+                        return {
+                            "ported_code": fixed,
+                            "confidence": self._rubric_score_extracted(code_text),
+                            "changes": ["LLM returned text without valid JSON — extracted code block"],
+                            "explanation": "Code extracted from LLM text output",
+                            "cost": round(call_cost, 4),
+                        }
+                    print(f"║ ⚠ gate rejected {model} text payload: {reason[:80]}")
                 raise ValueError(f"No usable code or JSON found in LLM response: {content[:200]}")
             except urllib.request.HTTPError as e:
                 err_body = e.read().decode(errors='replace')[:200]
@@ -240,6 +276,28 @@ CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explan
         if "ported_code" in result:
             result["ported_code"] = self._fix_ported_code(result["ported_code"])
         return result
+
+    @staticmethod
+    def _gate_code(code: str):
+        """Return ``(ok, reason)`` — lexical gate over a candidate port.
+
+        Runs the same lexical validator the router uses.  This is the last
+        barrier inside the porting agent: a response that fails here never
+        surfaces as ``ported_code`` in the returned dict, so a caller that
+        writes ``ported_code`` to disk (e.g. main.py's ported_kernels/ save)
+        cannot accidentally serialise reasoning.
+
+        Structural checks are deliberately deferred to the router — this
+        agent may legitimately return small snippets (template fallback) that
+        skip a full structural check.
+        """
+        if not code or not code.strip():
+            return False, "empty code"
+        try:
+            lex = _validate_lexical(code)
+        except Exception as exc:
+            return True, f"lexical gate errored (allowing): {exc!r}"
+        return lex.ok, lex.reason()
 
     @staticmethod
     def _extract_json_from_text(text: str) -> Optional[Dict]:

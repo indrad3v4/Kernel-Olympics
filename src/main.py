@@ -46,6 +46,8 @@ from pattern_memory.memory import PatternMemory
 from porting_agent.agent import PortingAgent
 from router import ModelRouter
 from verification.verifier import VerificationAgent
+from verification.safe_writer import safe_write_source
+from verification.lexical import validate_lexical as _validate_lexical
 from report_generator.reporter import ReportGenerator
 
 
@@ -487,11 +489,32 @@ class KernelOlympics:
                     ver_result["in_loop_compile_errors"] = port_result["compile_errors"]
                 verification_results.append(ver_result)
 
-                # Always save ported kernel to ported_kernels/
+                # Always save ported kernel to ported_kernels/ — gated by
+                # safe_write_source, which runs the lexical + structural
+                # validators against the extracted kernel code first.  A raw
+                # LLM response (reasoning, markdown, prose) will fail the
+                # lexical gate and the file will NOT be written; the previous
+                # good file on disk is preserved.  This is the last barrier
+                # between LLM text and disk — every earlier gate is defense
+                # in depth.
                 manual_dir = Path.cwd() / "ported_kernels"
                 manual_dir.mkdir(parents=True, exist_ok=True)
                 manual_path = manual_dir / (Path(cr["file"]).stem + ".hip.cpp")
                 kernel_code = port_result.get("ported_code", source)
+                # Gate the KERNEL code (not the harness wrapper we synthesize
+                # below).  A prose payload dies here.  We validate directly
+                # rather than routing through safe_write_source because the
+                # file we write is the harness-wrapped kernel, not the raw
+                # extract — the extract is the untrusted string, so it is
+                # what must pass lexical validation.
+                writer_lex = _validate_lexical(kernel_code)
+                if not writer_lex.ok:
+                    print(f"  ⚠️ Refusing to save {manual_path.name}: "
+                          f"lexical {writer_lex.reason()}")
+                    port_result["writer_rejected"] = {
+                        "reason": f"lexical: {writer_lex.reason()}",
+                        "prose_samples": list(writer_lex.prose_line_samples[:2]),
+                    }
                 # Auto-detect kernel function name from ported code
                 import re as _re
                 _km = _re.search(r'__global__\s+void\s+(\w+)\s*\(', kernel_code)
@@ -529,10 +552,17 @@ class KernelOlympics:
                     "}",
                 ]
                 harness = "\n".join(lines)
-                try:
-                    manual_path.write_text(harness, encoding="utf-8")
-                except Exception as e:
-                    print(f"  ⚠️ Failed to save: {e}")
+                if writer_lex.ok:
+                    try:
+                        manual_path.write_text(harness, encoding="utf-8")
+                    except Exception as e:
+                        print(f"  ⚠️ Failed to save: {e}")
+                else:
+                    # writer_rejected is already recorded in port_result above.
+                    # We deliberately do NOT overwrite the previous good file
+                    # on disk — the last known-good port is safer than a
+                    # freshly-emitted prose payload.
+                    pass
 
                 if ver_result.get("passed"):
                     # T0.4: only this branch — an actual verification pass — writes
