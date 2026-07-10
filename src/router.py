@@ -299,43 +299,37 @@ MODEL_CATALOG = {
         "temperature": 0.3,      # creativity for diverse plans
         "timeout": 120,          # TRIZ #1: planner is prose-heavy, needs moderate time
     },
-    "kimi27": {
-        "id": "accounts/fireworks/models/kimi-k2p7-code",  # ✅ VERIFIED WORKING
-        "role": "coder",            # UNCHANGED
-        "strength": "code generation, struct-aware HIP porting",
-        "cost_per_1k": 0.00095,
-        "local_first": False,
-        # Bug 1: 8192 was too tight once self-contained programs are sent in
-        # full (see _is_self_contained) — a ~15k-char / ~4300-token source
-        # plus its own main() must round-trip through the response, wrapped
-        # in {"ported_code": ...} JSON with escaping overhead on top.
-        # UNVERIFIED: confirm Fireworks accepts 16384 for kimi-k2p7-code
-        # before relying on it — _call_model degrades gracefully to a failed
-        # AgentResult if the API rejects the value, so this is safe to try.
-        "max_tokens": 16384,     # coder needs room for full kernel + JSON wrapper
-        "temperature": 0.1,      # code generation needs precision
-        "timeout": 180,          # TRIZ #1: coder with 8192+ tokens needs the most time
-    },
     "glm": {
         "id": "accounts/fireworks/models/glm-5p2",  # ✅ VERIFIED WORKING
-        "role": "evaluator",         # CHANGED: was planner → now evaluator (strict JSON)
-        "strength": "structured JSON output, correctness checking, wavefront64 validation",
+        "role": "coder",            # CHANGED: was evaluator → coder
+        "strength": "code generation, struct-aware HIP porting, structured output",
         "cost_per_1k": 0.0014,
+        "local_first": False,
+        "max_tokens": 16384,     # coder needs room for full kernel + JSON wrapper
+        "temperature": 0.1,      # code generation needs precision
+        "timeout": 180,          # coder with large tokens needs the most time
+    },
+    "kimi27": {
+        "id": "accounts/fireworks/models/kimi-k2p7-code",  # ✅ VERIFIED WORKING
+        "role": "evaluator",         # CHANGED: was coder → evaluator
+        "strength": "structured JSON output, correctness checking, wavefront64 validation, error analysis",
+        "cost_per_1k": 0.00095,
         "local_first": False,
         "max_tokens": 1024,      # evaluator output is compact (pass/fail + issues)
         "temperature": 0.0,      # deterministic evaluation
-        "timeout": 120,          # TRIZ #1: evaluator, compact output
+        "timeout": 120,          # evaluator, compact output
     },
     "gemma4": {
         "id": "accounts/fireworks/models/gemma-4-31b-it",  # Fireworks hosted
+        "fallback_id": "accounts/fireworks/models/deepseek-v4-flash",  # unavailable on this account
         "local_id": "gemma-4-31b-it",  # Model name when served via local vLLM
         "role": "verifier",          # final verification
-        "strength": "Verification — local vLLM on MI300X if available, else Fireworks",
+        "strength": "Verification — local vLLM on MI300X if available, else Fireworks (falls back to DeepSeek flash)",
         "cost_per_1k": 0.0,
-        "local_first": True,     # Try localhost:8000 first, then Fireworks
+        "local_first": True,     # Try localhost:8000 first, then Fireworks, then fallback
         "max_tokens": 1024,
         "temperature": 0.0,
-        "timeout": 60,           # TRIZ #1: fast verification model
+        "timeout": 60,           # fast verification model
     },
 }
 
@@ -344,10 +338,10 @@ MODEL_CATALOG = {
 # already defines the exact shape. json_schema is stricter but not all models support it.
 
 JSON_SCHEMAS = {
-    "glm": {  # GLM evaluator — json_object (more widely supported than json_schema)
+    "glm": {  # GLM coder — json_object for structured code output
         "type": "json_object",
     },
-    "kimi27": {
+    "kimi27": {  # Kimi evaluator — json_object
         "type": "json_object",
     },
     # DeepSeek is planner — no response_format (prose/reasoning is OK)
@@ -506,12 +500,12 @@ SYSTEM_PROMPTS = {
         "header swaps or API renames that the draft already applies, and keep the plan "
         "to a terse checklist — the coder needs the delta, not a tutorial."
     ),
-    "kimi27": (
+    "glm": (
         f"You are a CUDA-to-HIP code porting specialist. [prompt {PROMPT_VERSION}] "
         "Port CUDA kernels to AMD ROCm/HIP, fixing warp→wavefront issues. "
         "Respond with JSON: {\"ported_code\":str,\"confidence\":int,\"changes\":[str],\"explanation\":str}."
     ),
-    "glm": (
+    "kimi27": (
         f"You are a HIP kernel code evaluator. [prompt {PROMPT_VERSION}] "
         "Check ported code for wavefront64 correctness, CUDA remnants, and compilation safety. "
         'Respond with JSON: {"pass":bool,"issues":[str],"feedback":str,"verdict":str}. '
@@ -520,9 +514,8 @@ SYSTEM_PROMPTS = {
         "Output ONLY the JSON object. The first character MUST be {. "
         "No text before or after the JSON."
     ),
-    # Used by the in-loop GLM error-analysis call. Kept here (not inline at the
-    # call site) so every system prompt carries a version tag from one place.
-    "glm_error_analyst": (
+    # Used by the in-loop evaluator error-analysis call.
+    "kimi_error_analyst": (
         f"You are a HIP/ROCm compile error analyst. [prompt {PROMPT_VERSION}] "
         "Respond ONLY with JSON."
     ),
@@ -3683,7 +3676,7 @@ class ModelRouter:
                         self._debug_stage = "10_evaluation"
                         glm_err = self._call_model(
                             "glm", glm_err_prompt,
-                            system_prompt=SYSTEM_PROMPTS.get("glm_error_analyst", ""),
+                            system_prompt=SYSTEM_PROMPTS.get("kimi_error_analyst", ""),
                             prefill='{"fixes":'  # TRIZ #9: force JSON
                         )
                         self._debug_stage = ""
