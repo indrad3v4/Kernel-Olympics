@@ -1599,6 +1599,49 @@ class ModelRouter:
         return bool(re.search(r'^\s*int\s+main\s*\(', source, re.MULTILINE))
 
     @staticmethod
+    def _strip_to_kernel_only(source: str) -> str:
+        """Extract only ``__global__`` and ``__device__`` function bodies.
+
+        Strips: copyright comments, ``#include`` lines, ``#define`` outside
+        kernels, host-only functions, ``int main()``, and all other non-kernel
+        code.  Result starts with the first ``__global__`` / ``__device__``
+        function so the coder cannot see (and therefore cannot reproduce)
+        copyright banners, host helpers, or the host driver.
+
+        TRIZ #10 (Preliminary Action) + #22 (Throwing Away): instead of telling
+        the coder not to reproduce host code, simply never show it.
+        """
+        lines = source.splitlines()
+        extracted = []
+        in_kernel = False
+        brace_depth = 0
+
+        for line in lines:
+            stripped = line.strip()
+            # Detect start of __global__ or __device__ function
+            if (stripped.startswith('__global__')
+                    or stripped.startswith('__device__')) and not in_kernel:
+                in_kernel = True
+                extracted.append(line)
+                brace_depth += line.count('{') - line.count('}')
+                # Single-line balanced kernel (e.g. __global__ void k() { x; })
+                # closes brace on same line — immediately reset.
+                if brace_depth <= 0:
+                    in_kernel = False
+                    extracted.append('')  # blank separator
+                continue
+
+            if in_kernel:
+                extracted.append(line)
+                brace_depth += line.count('{') - line.count('}')
+                if brace_depth <= 0 and len(extracted) > 1:
+                    in_kernel = False
+                    # Add a blank line between kernels
+                    extracted.append('')
+
+        return '\n'.join(extracted)
+
+    @staticmethod
     def _compute_port_mode(kernel_source: str) -> PortMode:
         """Determine whether the coder should port the whole program or just the device subset.
 
@@ -2044,16 +2087,26 @@ class ModelRouter:
         # in FULL — truncating a fixed-length embed cut off main() itself for
         # any source past ~6000 chars, so Kimi ported only the kernels and
         # never saw (let alone could reproduce) the driver that runs them.
+        # TRIZ #10/#22: For DEVICE_SUBSET, strip to kernel-only so the coder
+        # cannot see (and therefore cannot reproduce) host code. What the
+        # coder never sees, it cannot reproduce.
         self_contained = self._is_self_contained(kernel_source)
-        source_for_prompt = kernel_source if self_contained else kernel_source[:6000]
+        if self_contained and port_mode == PortMode.DEVICE_SUBSET.value:
+            source_for_prompt = self._strip_to_kernel_only(kernel_source)
+        else:
+            source_for_prompt = kernel_source if self_contained else kernel_source[:6000]
         if preprocessed_source:
             # The DRAFT is what Kimi edits, so it is the thing that must be shown in
             # full (Bug 1: a self-contained program truncated below its own main()
             # can never be reproduced). The CUDA original becomes a bounded excerpt:
             # the draft is a faithful mechanical translation of it, so re-sending it
             # whole doubles the prompt to restate what the draft already says.
-            draft = (preprocessed_source if self_contained
-                     else preprocessed_source[:6000])
+            # TRIZ #10/#22: strip draft to kernel-only for DEVICE_SUBSET
+            if self_contained and port_mode == PortMode.DEVICE_SUBSET.value:
+                draft = self._strip_to_kernel_only(preprocessed_source)
+            else:
+                draft = (preprocessed_source if self_contained
+                         else preprocessed_source[:6000])
             excerpt = kernel_source[:2000]
             elided = "\n... (original elided — the draft below is its translation)" \
                 if len(kernel_source) > len(excerpt) else ""
@@ -2136,7 +2189,8 @@ class ModelRouter:
                                   regex_changelog: Optional[List[str]] = None,
                                   frozen_base_code: str = "",
                                   preprocessed_source: str = "",
-                                  structural_report: Optional[Dict] = None) -> str:
+                                  structural_report: Optional[Dict] = None,
+                                  port_mode: Optional[str] = None) -> str:
         """Build the Kimi refinement prompt for orchestration loop iterations.
 
         Kimi receives the original kernel, its previous output, and
@@ -2210,8 +2264,13 @@ class ModelRouter:
         # self-containment from the original kernel_source (ground truth),
         # not previous_code, since previous_code may itself be missing
         # main() precisely because of the bug this fix addresses.
+        # TRIZ #10/#22: For DEVICE_SUBSET, strip the original CUDA reference
+        # to kernel-only so the coder sees only what it should port.
         self_contained = self._is_self_contained(kernel_source)
-        source_for_prompt = kernel_source if self_contained else kernel_source[:4000]
+        if self_contained and port_mode == PortMode.DEVICE_SUBSET.value:
+            source_for_prompt = self._strip_to_kernel_only(kernel_source)
+        else:
+            source_for_prompt = kernel_source if self_contained else kernel_source[:4000]
         previous_for_prompt = previous_code if self_contained else previous_code[:4000]
         prompt += (
             f"Original CUDA:\n```cuda\n{source_for_prompt}```\n\n"
@@ -4297,6 +4356,7 @@ class ModelRouter:
                     frozen_base_code=(frozen_base_code if run_crashed_this_iter else ""),
                     preprocessed_source=hipified_source,
                     structural_report=result.get("structural"),
+                    port_mode=port_mode.value,
                 )
                 self.debug.transition("PATCH_GENERATION",
                                       reason=f"refine on {feedback_label} (mode={state.repair_mode})",
