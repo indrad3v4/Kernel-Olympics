@@ -138,27 +138,65 @@ def test_harness_transpose_2d_block():
 
 
 def test_generate_harness_skips_wrapping_when_source_has_main():
-    """A ported source that already defines int main() must be returned as-is.
+    """A self-contained source with no spec is returned as-is (no double main).
 
-    Regression test for the nvidia_shfl_scan.cu failure: wrapping a complete
-    NVIDIA sample program (which brings its own main()) in the generic
-    harness produced two main() definitions -> 'redefinition of main', and
-    every downstream compile error was then unattributable to the ported
-    code (see docs/fix-plan-harness-and-diagnostics.md, Bug 2).
+    Regression test for the original nvidia_shfl_scan double-main failure:
+    wrapping a program that brings its own main() in the generic harness
+    produced two main() definitions -> 'redefinition of main'. For a kernel
+    with NO spec, returning the source unchanged is the correct guard.
+
+    (The nvidia_shfl_scan case itself is now covered by
+    ``test_generate_harness_device_subset_strips_leaked_main`` — its spec
+    declares DEVICE_SUBSET, so a leaked main is stripped and the spec
+    harness drives the kernel instead of compiling the model's own driver.)
     """
     agent = VerificationAgent()
     source = (
-        "__global__ void shfl_scan_test(int *data, int width, int *partial_sums) {}\n"
+        "__global__ void some_kernel(int *data, int width, int *partial_sums) {}\n"
         "int main() {\n"
-        "    shfl_scan_test<<<1,1>>>(nullptr, 32, nullptr);\n"
+        "    some_kernel<<<1,1>>>(nullptr, 32, nullptr);\n"
         "    return 0;\n"
         "}\n"
     )
-    harness, kernel_start, kernel_end = agent._generate_harness("nvidia_shfl_scan", "", source)
+    # kernel name with no spec on disk -> self-contained early return
+    harness, kernel_start, kernel_end = agent._generate_harness("no_spec_kernel", "", source)
     assert harness == source
     assert harness.count("int main(") == 1
     assert kernel_start == 1
     assert kernel_end == len(source.splitlines())
+
+
+def test_generate_harness_device_subset_strips_leaked_main():
+    """A DEVICE_SUBSET port that leaks main()/host code must not compile it.
+
+    Root cause of the 2026-07 nvidia_shfl_scan TIMEOUT: contradictory prompt
+    instructions made the coder emit the whole unportable NVIDIA sample plus a
+    stray driver. The spec declares DEVICE_SUBSET, so the verifier must strip
+    any leaked host driver and build the synthesized spec harness — one main(),
+    the device kernel preserved, and none of the SDK-only host symbols.
+    """
+    agent = VerificationAgent()
+    if agent.load_spec("nvidia_shfl_scan") is None:
+        import pytest
+        pytest.skip("nvidia_shfl_scan spec not present")
+    leaked = (
+        "__global__ void shfl_scan_test(int *data, int width, int *partial_sums = NULL)\n"
+        "{\n"
+        "    int id = blockIdx.x * blockDim.x + threadIdx.x;\n"
+        "    data[id] = __shfl_up_sync(0xffffffff, data[id], 1, width);\n"
+        "}\n"
+        "int main(int argc, char **argv) {\n"
+        "    cudaDeviceProp p;\n"
+        "    findCudaDevice(argc, (const char**)argv);\n"
+        "    return p.major;\n"
+        "}\n"
+    )
+    harness, kernel_start, kernel_end = agent._generate_harness("nvidia_shfl_scan", "", leaked)
+    assert harness.count("int main(") == 1
+    assert "__global__ void shfl_scan_test" in harness
+    assert "__shfl_up_sync" in harness  # device body preserved, not truncated
+    for host_sym in ("findCudaDevice", "cudaDeviceProp", "p.major"):
+        assert host_sym not in harness
 
 
 def test_generate_harness_main_detection_ignores_indentation_and_comments():

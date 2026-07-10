@@ -1899,11 +1899,67 @@ class ModelRouter:
         main_text = ModelRouter._extract_main(kernel_source)
         if not main_text:
             return PortMode.WHOLE_PROGRAM
-        unsatisfied = ModelRouter._unsatisfied_main_calls(
-            main_text, kernel_source, kernel_source)
-        if unsatisfied:
+        # A self-contained program whose driver depends on code that cannot be
+        # reproduced in HIP must be ported as DEVICE_SUBSET: keep only the
+        # __global__/__device__ kernels and let the synthesized harness drive
+        # them. Two deterministic signals of an unportable driver:
+        #   1. an unvendored quoted local header (e.g. shfl_integral_image.cuh)
+        #      whose functions can never be defined here; and
+        #   2. an NVIDIA CUDA-SDK helper header (helper_cuda.h / helper_functions.h
+        #      / helper_timer.h …) — these supply host-only utilities like
+        #      findCudaDevice / checkCudaErrors / the sdk*Timer family that have
+        #      no HIP equivalent and cannot be reproduced by the coder.
+        #
+        # BUG FIX: the previous implementation called
+        # ``_unsatisfied_main_calls(main_text, kernel_source, kernel_source)`` —
+        # comparing the source against ITSELF, so ``available`` always equalled
+        # ``original_funcs`` and the dropped-symbol set was always empty. This
+        # function could therefore NEVER return DEVICE_SUBSET: every full NVIDIA
+        # sample was ported WHOLE_PROGRAM, told to reproduce main(), and dragged
+        # in unportable SDK host code that no refinement iteration could compile
+        # (the nvidia_shfl_scan TIMEOUT). Programs with neither signal below stay
+        # WHOLE_PROGRAM, exactly as before.
+        if ModelRouter._unresolved_local_headers(kernel_source):
+            return PortMode.DEVICE_SUBSET
+        if ModelRouter._uses_cuda_sdk_helpers(kernel_source):
             return PortMode.DEVICE_SUBSET
         return PortMode.WHOLE_PROGRAM
+
+    # NVIDIA CUDA-Samples helper headers: host-only utilities (findCudaDevice,
+    # checkCudaErrors, StopWatchInterface / sdk*Timer, …) that ship only with the
+    # CUDA Samples repo and have no ROCm/HIP equivalent. A self-contained program
+    # that includes one cannot be reproduced whole — only its device kernels port.
+    _CUDA_SDK_HELPER_HEADERS = re.compile(
+        r'#\s*include\s*[<"]\s*helper_\w+\.(?:h|hpp|cuh)\s*[>"]')
+
+    @staticmethod
+    def _uses_cuda_sdk_helpers(source: str) -> bool:
+        """True when *source* includes an NVIDIA CUDA-SDK ``helper_*`` header."""
+        return bool(ModelRouter._CUDA_SDK_HELPER_HEADERS.search(source))
+
+    @staticmethod
+    def _spec_port_mode(kernel_name: str, verifier=None) -> Optional["PortMode"]:
+        """Return the hand-tagged ``port_mode`` from *kernel_name*'s JSON spec.
+
+        Function-level analysis alone cannot always tell that a driver is
+        unportable, so a human may tag ``port_mode`` in the spec. That tag is
+        the authoritative override (see test_port_mode's design note and the
+        route() comment). Returns None when there is no spec, no verifier to
+        load it, or the spec does not name a recognized mode.
+        """
+        if verifier is None or not hasattr(verifier, "load_spec"):
+            return None
+        try:
+            spec = verifier.load_spec(kernel_name)
+        except Exception:
+            return None
+        if not spec:
+            return None
+        raw = spec.get("port_mode")
+        for mode in PortMode:
+            if raw == mode.value:
+                return mode
+        return None
 
     @staticmethod
     def _extract_main(source: str) -> str:
@@ -2394,7 +2450,13 @@ class ModelRouter:
             "If the kernel is large, minimize explanation to save tokens. "
             "Prefer full code over partial code with verbose explanation."
         )
-        if self_contained:
+        # DEVICE_SUBSET is a *refinement* of self_contained: the source has a
+        # main() but its host driver is unportable, so we deliberately drop it.
+        # Guard the "keep main()" instruction with `not DEVICE_SUBSET` — otherwise
+        # it fires alongside the DEVICE_SUBSET "drop main()" instruction above and
+        # the coder receives directly contradictory orders, producing the whole
+        # unportable program *and* a stray harness (the nvidia_shfl_scan failure).
+        if self_contained and port_mode != PortMode.DEVICE_SUBSET.value:
             prompt += (
                 "\nCRITICAL: The CUDA source above has its own main() function. Your "
                 "ported_code MUST also include a complete main() with identical logic, "
@@ -2614,7 +2676,20 @@ class ModelRouter:
             "Respond with JSON: {\"ported_code\": str, \"confidence\": 0-100, "
             "\"changes\": [str], \"explanation\": str}."
         )
-        if self_contained:
+        # DEVICE_SUBSET wins over self_contained (every DEVICE_SUBSET source is
+        # also self_contained). Without this guard the refine loop re-injects
+        # "keep main()" every iteration, so a device-subset port can never
+        # converge — it kept dragging back the unportable host driver.
+        if port_mode == PortMode.DEVICE_SUBSET.value:
+            prompt += (
+                "\nDEVICE-SUBSET MODE: The original CUDA source has its own main(), "
+                "but its host driver depends on code that cannot be ported (missing "
+                "local headers / undefined host symbols). Output ONLY the __global__ "
+                "and/or __device__ kernel function(s). Do NOT include main(), host "
+                "helper functions, or a test harness — the system synthesizes the "
+                "harness that drives your kernel."
+            )
+        elif self_contained:
             prompt += (
                 "\nCRITICAL: The original CUDA source has its own main() function. Your "
                 "ported_code MUST also include a complete main() with identical logic, "
@@ -2721,7 +2796,8 @@ class ModelRouter:
                                          error_delta: int = 0,
                                          stagnation_count: int = 0,
                                          error_context: List[str] = None,
-                                         self_contained: bool = False) -> str:
+                                         self_contained: bool = False,
+                                         port_mode: Optional[str] = None) -> str:
         """Build GLM prompt for compile-error analysis (TRIZ #28).
 
         When hipcc fails, GLM analyzes the compile errors + code and tells
@@ -2774,7 +2850,23 @@ class ModelRouter:
         # 15k-char program is invisible here. Saying so prevents the analyst from
         # reading its absence as the defect.
         self_contained_note = ""
-        if self_contained:
+        if port_mode == PortMode.DEVICE_SUBSET.value:
+            # DEVICE_SUBSET intentionally drops the host driver — the harness is
+            # synthesized. Telling the analyst to "restore main()" here (the
+            # self_contained advice below) steers Kimi to re-import the exact
+            # unportable host code that caused the errors, so the loop stagnates
+            # (Δ+0) until the wall-clock budget is spent. Give the opposite advice.
+            self_contained_note = (
+                "\nCONTEXT: this is a DEVICE-SUBSET port. The original CUDA source has a "
+                "main() and host helpers, but they depend on unportable code and were "
+                "deliberately DROPPED; a synthesized harness drives the kernel. If any "
+                "error names main(), a host helper, a test harness, cudaDeviceProp, "
+                "findCudaDevice/checkCudaErrors, or another host-only symbol, the correct "
+                "fix is to REMOVE that leaked host code from the port — NEVER to restore "
+                "main(), add a driver, or add a harness. Only __global__/__device__ "
+                "functions belong in the output.\n"
+            )
+        elif self_contained:
             self_contained_note = (
                 "\nCONTEXT: the original CUDA source is a COMPLETE, SELF-CONTAINED program "
                 "with its own main(). The code excerpt below may be truncated before that "
@@ -2972,7 +3064,17 @@ class ModelRouter:
         # The spec's port_mode is the authoritative source for the harness
         # decision. If a hand-written spec already exists with port_mode set,
         # trust it; otherwise compute one from the CUDA source.
+        #
+        # BUG FIX: this previously ignored the spec entirely and used only the
+        # computed heuristic — so nvidia_shfl_scan.json's hand-tagged
+        # DEVICE_SUBSET was silently discarded, the porter was told to reproduce
+        # the whole unportable NVIDIA sample, and the run timed out. Consult the
+        # spec first (the "authoritative override" the comment always claimed),
+        # then fall back to the source heuristic.
         port_mode = ModelRouter._compute_port_mode(kernel_source)
+        spec_mode = ModelRouter._spec_port_mode(kernel_name, verifier)
+        if spec_mode is not None:
+            port_mode = spec_mode
         result["port_mode"] = port_mode.value
 
         # ── TRIZ #13 / #24: Auto-generate spec from CUDA source ──
@@ -4141,7 +4243,8 @@ class ModelRouter:
                             result["ported_code"], compile_errs, iteration, patterns,
                             error_delta=error_delta, stagnation_count=stagnation_count,
                             error_context=cc.get("error_context"),
-                            self_contained=self._is_self_contained(kernel_source))
+                            self_contained=self._is_self_contained(kernel_source),
+                            port_mode=result.get("port_mode"))
                         self._debug_stage = "10_evaluation"
                         glm_err = self._call_model(
                             "kimi27", glm_err_prompt,
