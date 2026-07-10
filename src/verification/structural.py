@@ -154,6 +154,54 @@ def _strip_strings_and_comments(code: str) -> str:
     return ''.join(out)
 
 
+def strip_comments(code: str) -> str:
+    """Blank out comments only, preserving string literals, length and newlines.
+
+    :func:`_strip_strings_and_comments` is the right tool for balance counting and
+    symbol extraction — a brace or an identifier inside ``"..."`` is not code. It
+    is the WRONG tool for anything that reads a preprocessor directive, because
+    ``#include "foo.cuh"`` carries its payload *inside* a string literal, and
+    blanking it turns the line into ``#include "        "``.
+
+    Offsets and line numbers are preserved, so a match found here maps directly
+    back onto the original source.
+    """
+    out = list(code)
+    i, n = 0, len(code)
+    while i < n:
+        ch = code[i]
+        if ch == '/' and i + 1 < n and code[i + 1] == '/':
+            while i < n and code[i] != '\n':
+                out[i] = ' '
+                i += 1
+            continue
+        if ch == '/' and i + 1 < n and code[i + 1] == '*':
+            out[i] = out[i + 1] = ' '
+            i += 2
+            while i + 1 < n and not (code[i] == '*' and code[i + 1] == '/'):
+                if code[i] != '\n':
+                    out[i] = ' '
+                i += 1
+            if i + 1 < n:
+                out[i] = out[i + 1] = ' '
+                i += 2
+            continue
+        # A string or char literal is skipped over intact — that is the whole
+        # point — but we must still consume it so a '//' inside it is not
+        # mistaken for a comment.
+        if ch in ('"', "'"):
+            quote = ch
+            i += 1
+            while i < n and code[i] != quote:
+                if code[i] == '\\':
+                    i += 1
+                i += 1
+            i += 1
+            continue
+        i += 1
+    return ''.join(out)
+
+
 def _balance(code: str, opener: str, closer: str) -> Tuple[bool, int]:
     """Return (balanced, depth). Negative depth = a closer with no opener."""
     depth = 0
