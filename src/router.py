@@ -30,6 +30,8 @@ from verification.structural import (
     validate_structure as _validate_structure,
     ValidationResult as _StructuralResult,
 )
+from verification.lexical import validate_lexical as _validate_lexical
+from verification.extraction import extract_code as _extract_code_v2
 
 
 # ── Per-iteration state ─────────────────────────────────────────────────────
@@ -1368,8 +1370,27 @@ class ModelRouter:
         the single choke point that gates every generation the loop consumes; wiring
         it here means the initial Kimi call, the refine, and the refine-retry all
         pay the ~1ms check before a 60s hipcc call fires on a truncated brace.
+
+        Extraction and lexical validation run FIRST — before any regex fix or the
+        structural check.  A response that is pure reasoning ("Let's search memory
+        more concretely.  I think...") has balanced braces (zero of each) and would
+        pass the structural gate, then compile-fail with ``error: unknown type name
+        'local'`` — a symptom of raw LLM text having been written to disk.  The
+        lexical gate catches that class and folds its errors into the structural
+        result, so the existing "structural reject → refine, no compile, no repair"
+        path fires without duplicating the plumbing.
         """
-        code = self._extract_code(model_output)
+        # Prefer the provider-agnostic extractor.  It handles JSON fields, fenced
+        # blocks, and raw-code windows, and NEVER returns markdown fences or
+        # trailing prose as part of the code.  On extraction failure we still
+        # try the legacy fallback so a partially-recognized response is not
+        # silently discarded — the lexical gate below decides whether either
+        # candidate is actually source code.
+        extraction = _extract_code_v2(model_output)
+        if extraction.ok:
+            code = extraction.code
+        else:
+            code = self._extract_code(model_output)
 
         # Why a restore was declined matters as much as when one happened: a silent
         # no-op here looks identical to "the coder kept its main()".
@@ -1396,6 +1417,15 @@ class ModelRouter:
                 + ", which this port does not define; reattaching it would create an "
                   "undefined symbol instead of fixing one")
 
+        # Lexical gate FIRST — pure reasoning, markdown, and role tags never
+        # reach hipcc.  A failure here is folded into the structural result so
+        # the existing structural-reject → refine path fires unchanged.
+        try:
+            lexical = _validate_lexical(code)
+        except Exception as _lx_exc:  # a bug in the gate must not kill the loop
+            logger.debug("lexical validation errored: %s", _lx_exc)
+            lexical = None
+
         # Structural gate against the post-fix code, not the raw extract: hipcc will
         # see the fixed version, so that is what must stand up. A failure here is a
         # hard reject upstream (see the loop's pre-compile check), so keep this
@@ -1405,6 +1435,20 @@ class ModelRouter:
         except Exception as _sv_exc:  # never let the gate itself take down the loop
             logger.debug("structural validation errored: %s", _sv_exc)
             structural = _StructuralResult(ok=True, warnings=["structural check errored"])
+
+        if lexical is not None and not lexical.ok:
+            merged_errors = ["[lexical] " + e for e in lexical.errors]
+            merged_errors.extend(structural.errors)
+            structural = _StructuralResult(
+                ok=False,
+                errors=merged_errors,
+                warnings=list(structural.warnings) + [
+                    "lexical: " + s for s in lexical.prose_line_samples[:2]
+                ],
+                missing_symbols=list(structural.missing_symbols),
+            )
+            changelog.append(
+                "[lexical] rejected: " + "; ".join(lexical.errors)[:120])
 
         return code, changelog, restored, structural
 
