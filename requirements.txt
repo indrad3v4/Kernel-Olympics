@@ -1,10 +1,12 @@
-# Kernel Olympics has no third-party *runtime* dependencies — the pipeline
-# runs on the Python standard library (urllib for HTTP, sqlite3 for the
-# pattern store). The packages below are for development / CI only.
+# Kernel Olympics — Web + Development dependencies
+# The core pipeline runs on the Python standard library alone.
+# These packages add the web frontend (FastAPI) and testing tools.
 
-# AMD ROCm / HIP deps (installed via Docker image, not pip)
-#   - hipcc, rocm-dev, rocm-libs
+# Web frontend (deployed via Railway / Docker)
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
 
-# Development
-pytest>=7.0      # Unit test runner
-pytest-cov>=4.0  # Coverage reports
+# Development / CI
+pytest>=7.0
+pytest-cov>=4.0

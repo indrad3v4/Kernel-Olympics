@@ -1,26 +1,23 @@
-# Build stage
-FROM rocm/dev-ubuntu-22.04:latest as builder
-
-RUN apt-get update && apt-get install -y \
-    python3 python3-pip git rocm-dev rocm-libs hipcc \
-    && rm -rf /var/lib/apt/lists/*
+FROM python:3.11-slim
 
 WORKDIR /app
+
+# Install system deps (just git for version info)
+RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+
+# Install Python web deps
 COPY requirements.txt .
-RUN pip3 install -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-COPY src/ ./src/
-COPY sample_kernels/ ./sample_kernels/
+# Copy project
+COPY . .
 
-# Runtime stage
-FROM rocm/dev-ubuntu-22.04:runtime
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/')" || exit 1
 
-RUN apt-get update && apt-get install -y \
-    python3 python3-pip rocm-dev rocm-libs \
-    && rm -rf /var/lib/apt/lists/*
+# Expose port
+EXPOSE 8000
 
-WORKDIR /app
-COPY --from=builder /app /app
-
-ENTRYPOINT ["python3", "-m", "src.main"]
-CMD ["--input", "sample_kernels/cuda/warp_reduce.cu"]
+# Run web app
+CMD ["uvicorn", "web_app:app", "--host", "0.0.0.0", "--port", "8000"]
