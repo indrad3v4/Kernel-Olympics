@@ -293,6 +293,31 @@ MAX_PIPELINE_SECONDS = int(os.environ.get("MAX_PIPELINE_SECONDS", "180"))
 # round-trip, so we fail fast instead of issuing a request doomed to time out.
 MIN_LLM_TIMEOUT_SECONDS = 5
 
+# ── P0: phase budgets ──
+# Clamping each call to the REMAINING budget is not enough. Each model's own
+# timeout is a large fraction of the whole pipeline: deepseek 120s and kimi27
+# 180s against a 180s budget. Nothing stopped the planner from eating the entire
+# run before the coder had written a line.
+#
+# The 2026-07-10 run is exactly that: DeepSeek planned for 86.9s, Kimi coded for
+# 93.5s — together 180.4s, 100% of the budget — and the loop reached its deadline
+# holding code that had never compiled, let alone been refined. It could not have
+# converged from there, at any max_iterations.
+#
+# The planner is the phase to squeeze. Its output is advisory: Kimi's prompt
+# handles deepseek_plan="" and route() already logs "proceeding without plan".
+# Without the coder there is no kernel at all. So the planner gets a slice, and
+# the coder plus one compile get a reservation the planner may not touch.
+PLAN_BUDGET_FRACTION = 0.20      # planner may use at most 20% of the pipeline budget
+CODE_RESERVE_FRACTION = 0.55     # of the budget, held back for the coder
+COMPILE_RESERVE_SECONDS = 25     # clock kept for hipcc; a compile cannot be interrupted
+
+# Output-token ceiling for a planner that was handed a hipified draft. It is asked
+# for a delta checklist — "__shfl_up_sync width 32→64 at L78", not a porting essay —
+# and tokens emitted are what the phase's wall time is actually made of. The 2048
+# default let a 38.2s plan restate a translation the regex had already finished.
+PLAN_DELTA_MAX_TOKENS = 640
+
 # ── P0: stagnation thresholds ──
 # Each stagnant iteration costs a Kimi refine (~180s) + a GLM analysis (~30s) +
 # a DeepSeek re-plan (~80s). Three of them do not fit in a 3-minute demo, so the
@@ -353,6 +378,30 @@ class Deadline:
             return timeout_s
         return max(0.0, min(timeout_s, rem))
 
+    def has_at_least(self, seconds: float) -> bool:
+        """True when `seconds` of budget remain (always true when unlimited)."""
+        if self.unlimited:
+            return True
+        return self.remaining() >= seconds
+
+    def phase_cap(self, fraction: float, reserve_s: float = 0.0) -> Optional[float]:
+        """Seconds a single phase may spend, or None when unlimited.
+
+        Two independent limits, whichever is tighter:
+          - `fraction` of the TOTAL budget — a share, so a fast phase cannot
+            hoard the clock just because it happened to run first;
+          - whatever remains after holding back `reserve_s` for later phases.
+
+        Returns a value that may be <= 0, meaning "this phase cannot run at all".
+        Callers decide whether to skip it or fail; the distinction matters, since
+        skipping the planner is fine and skipping the coder is not.
+        """
+        if self.unlimited:
+            return None
+        share = self.budget_s * fraction
+        after_reserve = self.remaining() - reserve_s
+        return min(share, after_reserve)
+
 
 # ── Prompt versioning ──
 # Every system prompt string below carries "[prompt vX.Y.Z]" so a run's output
@@ -361,7 +410,7 @@ class Deadline:
 #   MAJOR — behavioral change (new instructions, removed constraints)
 #   MINOR — context additions (new examples, expanded edge cases)
 #   PATCH — wording, typo, formatting fixes
-PROMPT_VERSION = "v1.0.0"
+PROMPT_VERSION = "v3.0.0"
 
 # ── Role-specific system prompts ──
 # Each model gets its OWN role definition. No shared prompts.
@@ -375,7 +424,11 @@ SYSTEM_PROMPTS = {
         "Focus on warp(32)→wavefront(64) divergence, __shfl mask widths, shared memory sizing, "
         "header replacements, and any local .cuh dependencies that must be inlined or removed. "
         "Write your plan as clear prose with a numbered checklist of fixes. "
-        "Reason freely — your plan will be consumed by a coder agent."
+        "Reason freely — your plan will be consumed by a coder agent. "
+        "EXCEPTION: when you are shown a HIP draft that has already been mechanically "
+        "translated, plan ONLY the warp→wavefront semantics that remain. Do not restate "
+        "header swaps or API renames that the draft already applies, and keep the plan "
+        "to a terse checklist — the coder needs the delta, not a tutorial."
     ),
     "kimi27": (
         f"You are a CUDA-to-HIP code porting specialist. [prompt {PROMPT_VERSION}] "
@@ -623,38 +676,85 @@ class ModelRouter:
         return text.strip()
 
     @staticmethod
-    def _compute_adaptive_max_tokens(kernel_source: str, deepseek_plan: str = "",
-                                     overhead_ratio: float = 1.5) -> int:
-        """Estimate the output token budget needed for Kimi's generation.
+    def _hipify_source(cuda_source: str):
+        """Mechanically translate CUDA → HIP before any LLM sees the kernel.
 
-        TRIZ #6 (Universality) / #21 (Rushing Through):
-        Instead of a fixed 16384 max_tokens for every kernel (which causes
-        slow generations for small kernels), compute an adaptive budget:
-          1. Kernel source → ~4 chars/token → estimate output size as 1.5× source
-          2. Add 500 tokens overhead for JSON wrapper + explanation
-          3. Clamp between MIN_ADAPTIVE_TOKENS and MAX_ADAPTIVE_TOKENS (16384)
+        Returns (hipified_source, changelog).
 
-        Args:
-            kernel_source: Original CUDA kernel source text.
-            deepseek_plan: Optional plan text (adds plan-proportional overhead).
-            overhead_ratio: Output-to-input ratio estimate (default 1.5×).
+        This is the same deterministic transform `_fix_ported_code` already runs
+        on Kimi's OUTPUT, pointed at the INPUT instead. Nothing new is invented:
+        that table is idempotent (verified in tests), so a hipified source may
+        pass through it again after Kimi without drift.
 
-        Returns:
-            Adaptive max_tokens value (int).
+        Why this matters: on nvidia_shfl_scan.cu (15k chars, 419 lines) it
+        rewrites 53 cuda* API calls, 2 CUDA includes, 2 NVIDIA helper headers and
+        38 checkCudaErrors call sites — in ~19ms. Those are transforms the coder
+        was spending ~90s of LLM time reproducing by hand, one token at a time.
+
+        What it CANNOT do is warp(32)→wavefront(64) semantics: __shfl width
+        arguments, shared memory sized blockDim/32, mask literals whose meaning
+        (not spelling) changes. That is the part worth an LLM, and it is exactly
+        what the SIGSEGV in the 2026-07-09 run was.
         """
-        MIN_ADAPTIVE_TOKENS = 1024
-        MAX_ADAPTIVE_TOKENS = 16384
+        out = ModelRouter._fix_ported_code(cuda_source, return_changelog=True)
+        if isinstance(out, tuple):
+            return out
+        return out, []
 
-        # Conservative estimate: ~4 chars per token for code
-        source_tokens = max(1, len(kernel_source) // 4)
-        plan_overhead = max(0, len(deepseek_plan) // 4) if deepseek_plan else 0
-        overhead_tokens = 500  # JSON wrapper + explanation + instructions
+    @staticmethod
+    def _residual_cuda_symbols(source: str) -> List[str]:
+        """CUDA identifiers the mechanical pass could not translate.
 
-        # Output is roughly overhead_ratio × input for code + plan context
-        # The plan context adds to input length but output is based on source
-        estimated = int(source_tokens * overhead_ratio + overhead_tokens + plan_overhead * 0.3)
+        A non-empty list means hipify alone cannot be trusted — something in the
+        source has no deterministic HIP spelling, so the fast path must not claim
+        a port. Used as a cheap pre-check before spending a compile on it.
+        """
+        return sorted(set(re.findall(r'\bcuda[A-Z]\w*', source)
+                          + re.findall(r'\bcu(?:Blas|Rand|Fft|Sparse|Solver)\w*', source)))
 
-        return max(MIN_ADAPTIVE_TOKENS, min(MAX_ADAPTIVE_TOKENS, estimated))
+    # Warp-level primitives whose MEANING changes on a 64-lane wavefront. A regex
+    # can rename them; it cannot re-derive the lane arithmetic around them.
+    _WAVEFRONT_SENSITIVE = re.compile(
+        r'__shfl\w*|__syncwarp|__ballot\w*|__activemask|__any_sync|__all_sync'
+        r'|__match_\w+_sync|__reduce_\w+_sync|\bwarpSize\b'
+    )
+
+    @classmethod
+    def _needs_wavefront_semantics(cls, source: str, patterns: Optional[List[Dict]] = None) -> bool:
+        """True when a mechanical port cannot possibly be correct.
+
+        The fast path costs a real hipcc compile (~20s of a 180s budget). Spending
+        it on a kernel that uses __shfl or warpSize buys nothing: the translation
+        will compile and then SIGSEGV, because shared memory sized blockDim/32 and
+        a width=32 shuffle are wrong on wavefront64 no matter how the symbols are
+        spelled. That is the 2026-07-09 crash, and it is statically visible.
+
+        Checks the source directly (robust when the classifier found nothing) and
+        the classifier's findings (catches spellings the regex misses).
+        """
+        if cls._WAVEFRONT_SENSITIVE.search(source):
+            return True
+        for p in (patterns or []):
+            name = str(p.get("pattern", "")).lower()
+            if "shfl" in name or "warp" in name or "ballot" in name or "syncwarp" in name:
+                return True
+        return False
+
+    @staticmethod
+    def _compute_adaptive_max_tokens(source: str, model_key: str = "kimi27") -> int:
+        """Scale the coder's output budget to the kernel it must emit.
+
+        kimi27 asks for 16384 tokens on every call. A 2k-char kernel cannot use
+        them, but the request still reserves capacity and the model still drifts
+        toward filling the space. Budget for the source round-tripping back out,
+        plus the JSON wrapper and escaping overhead, then clamp.
+
+        ~4 chars/token is the usual English/code ratio; x2 covers the response
+        restating the kernel, and the floor keeps small kernels from truncating.
+        """
+        ceiling = MODEL_CATALOG.get(model_key, {}).get("max_tokens", 16384)
+        estimated = int((len(source) / 4) * 2) + 512  # round-trip + JSON wrapper
+        return max(2048, min(ceiling, estimated))
 
     @staticmethod
     def _fix_ported_code(code: str, return_changelog: bool = False):
@@ -878,164 +978,6 @@ class ModelRouter:
         if return_changelog:
             return code, changelog
         return code
-
-    # ── TRIZ #10 (Preliminary Action) / #24 (Mediator): HIPIFY mechanical pre-processor ──
-    # HIPIFY CLI (github.com/ROCm-Developer-Tools/HIPIFY) does mechanical CUDA→HIP
-    # translation in ~2s — header renames, API renames, basic include swaps — but it
-    # is NEVER called in the pipeline. Instead, the pipeline sends ALL work through
-    # expensive LLMs (DeepSeek 86.9s + Kimi 93.5s = 180.4s) for the first plan+code
-    # pass, consuming the entire MAX_PIPELINE_SECONDS=180 budget before a single
-    # compile iteration can run.
-    #
-    # This method is a pure-Python stand-in for hipify-perl / hipify-clang. It applies
-    # the same mechanical transformations to raw CUDA source in ~0.01s (deterministic,
-    # zero LLM cost), producing a baseline HIP draft. The draft is then:
-    #   (a) Fed to DeepSeek's plan prompt so it only plans NON-trivial changes
-    #   (b) Used as Kimi's STARTING code — Kimi edits/decorates instead of generating
-    #       the entire port from scratch, drastically reducing token count and latency
-    #   (c) Set as the initial ported_code default — if hipify produces a complete
-    #       mechanical translation, compile-first succeeds and the LLM loop is skipped
-    @staticmethod
-    def _hipify_source(cuda_source: str) -> str:
-        """Mechanical CUDA→HIP translation — pure Python, no external tool.
-
-        This is the PRE-pipeline transformation (runs BEFORE any LLM call),
-        complementary to _fix_ported_code() which runs POST-LLM as a safety net.
-        Together they form a HIPIFY sandwich: mechanical pre-pass → LLM semantic
-        pass → mechanical cleanup pass.
-
-        Reuses the same regex patterns as _fix_ported_code but operates on the
-        ORIGINAL CUDA source before any LLM touches it.
-        """
-        hip = cuda_source
-        changelog = []
-
-        def _sub(pat, repl, text, desc):
-            new_text, n = re.subn(pat, repl, text)
-            if n > 0:
-                changelog.append(f'{desc} (×{n})')
-            return new_text
-
-        # ── Header replacements ──
-        hip = _sub(r'#include\s*[<"]cuda_runtime\.h[>"]', '#include <hip/hip_runtime.h>', hip,
-                   'cuda_runtime.h→hip/hip_runtime.h')
-        hip = _sub(r'#include\s*[<"]cuda_runtime_api\.h[>"]', '#include <hip/hip_runtime.h>', hip,
-                   'cuda_runtime_api.h→hip/hip_runtime.h')
-        hip = _sub(r'#include\s*[<"]cuda_math\.h[>"]\n?', '', hip, 'cuda_math.h removed')
-        hip = _sub(r'#include\s*[<"]helper_cuda\.h[>"]\n?', '', hip, 'helper_cuda.h removed')
-        hip = _sub(r'#include\s*[<"]helper_functions\.h[>"]\n?', '', hip, 'helper_functions.h removed')
-        hip = _sub(r'#include\s*[<"]helper_string\.h[>"]\n?', '', hip, 'helper_string.h removed')
-        hip = _sub(r'#include\s*[<"]helper_timer\.h[>"]\n?', '', hip, 'helper_timer.h removed')
-        hip = _sub(r'#include\s*[<"]helper_image\.h[>"]\n?', '', hip, 'helper_image.h removed')
-        hip = _sub(r'#include\s*[<"]helper_gl\.h[>"]\n?', '', hip, 'helper_gl.h removed')
-        hip = _sub(r'#include\s*[<"]device_launch_parameters\.h[>"]\n?', '', hip,
-                   'device_launch_parameters.h removed')
-        hip = _sub(r'#include\s*[<"]curand\.h[>"]', '#include <hiprand/hiprand.h>', hip,
-                   'curand.h→hiprand/hiprand.h')
-        hip = _sub(r'#include\s*[<"]curand_kernel\.h[>"]', '#include <hiprand/hiprand_kernel.h>', hip,
-                   'curand_kernel.h→hiprand/hiprand_kernel.h')
-        hip = _sub(r'#include\s*[<"]cufft\.h[>"]', '#include <hipfft/hipfft.h>', hip,
-                   'cufft.h→hipfft/hipfft.h')
-        hip = _sub(r'#include\s*[<"]cublas_v2\.h[>"]', '#include <hipblas/hipblas.h>', hip,
-                   'cublas_v2.h→hipblas/hipblas.h')
-        hip = _sub(r'#include\s*[<"]cusparse\.h[>"]', '#include <hipsparse/hipsparse.h>', hip,
-                   'cusparse.h→hipsparse/hipsparse.h')
-        hip = _sub(r'#include\s*[<"]cusolver_common\.h[>"]', '#include <hipsolver/hipsolver.h>', hip,
-                   'cusolver_common.h→hipsolver/hipsolver.h')
-        hip = _sub(r'#include\s*[<"]nvrtc\.h[>"]\n?', '', hip, 'nvrtc.h removed')
-        hip = _sub(r'#include\s*"[^"]*\.cuh"\n?', '', hip, 'local .cuh headers removed')
-        hip = _sub(r'#include\s*<[^>]*\.cuh>\n?', '', hip, 'system .cuh headers removed')
-        hip = _sub(r'#include\s*[<"][^>"]*cuda[^>"]*[>"]\n?', '', hip,
-                   'remaining CUDA includes removed')
-
-        # ── API renames ──
-        hip = _sub(r'\bcudaMalloc\b', 'hipMalloc', hip, 'cudaMalloc→hipMalloc')
-        hip = _sub(r'\bcudaFree\b', 'hipFree', hip, 'cudaFree→hipFree')
-        hip = _sub(r'\bcudaMemcpy\b', 'hipMemcpy', hip, 'cudaMemcpy→hipMemcpy')
-        hip = _sub(r'\bcudaMemcpyAsync\b', 'hipMemcpyAsync', hip, 'cudaMemcpyAsync→hipMemcpyAsync')
-        hip = _sub(r'\bcudaMemset\b', 'hipMemset', hip, 'cudaMemset→hipMemset')
-        hip = _sub(r'\bcudaDeviceSynchronize\b', 'hipDeviceSynchronize', hip,
-                   'cudaDeviceSynchronize→hipDeviceSynchronize')
-        hip = _sub(r'\bcudaGetLastError\b', 'hipGetLastError', hip,
-                   'cudaGetLastError→hipGetLastError')
-        hip = _sub(r'\bcudaError_t\b', 'hipError_t', hip, 'cudaError_t→hipError_t')
-        hip = _sub(r'\bcudaSuccess\b', 'hipSuccess', hip, 'cudaSuccess→hipSuccess')
-        hip = _sub(r'\bcudaGetDeviceCount\b', 'hipGetDeviceCount', hip,
-                   'cudaGetDeviceCount→hipGetDeviceCount')
-        hip = _sub(r'\bcudaSetDevice\b', 'hipSetDevice', hip, 'cudaSetDevice→hipSetDevice')
-        hip = _sub(r'\bcudaGetDeviceProperties\b', 'hipGetDeviceProperties', hip,
-                   'cudaGetDeviceProperties→hipGetDeviceProperties')
-        hip = _sub(r'\bcudaDeviceProp\b', 'hipDeviceProp_t', hip, 'cudaDeviceProp→hipDeviceProp_t')
-        hip = _sub(r'\bcudaStreamCreate\b', 'hipStreamCreate', hip, 'cudaStreamCreate→hipStreamCreate')
-        hip = _sub(r'\bcudaStreamSynchronize\b', 'hipStreamSynchronize', hip,
-                   'cudaStreamSynchronize→hipStreamSynchronize')
-        hip = _sub(r'\bcudaEventCreate\b', 'hipEventCreate', hip, 'cudaEventCreate→hipEventCreate')
-        hip = _sub(r'\bcudaEventRecord\b', 'hipEventRecord', hip, 'cudaEventRecord→hipEventRecord')
-        hip = _sub(r'\bcudaEventSynchronize\b', 'hipEventSynchronize', hip,
-                   'cudaEventSynchronize→hipEventSynchronize')
-        hip = _sub(r'\bcudaEventElapsedTime\b', 'hipEventElapsedTime', hip,
-                   'cudaEventElapsedTime→hipEventElapsedTime')
-        hip = _sub(r'\bcudaMemcpyHostToDevice\b', 'hipMemcpyHostToDevice', hip,
-                   'cudaMemcpyHostToDevice→hipMemcpyHostToDevice')
-        hip = _sub(r'\bcudaMemcpyDeviceToHost\b', 'hipMemcpyDeviceToHost', hip,
-                   'cudaMemcpyDeviceToHost→hipMemcpyDeviceToHost')
-        hip = _sub(r'\bcudaMemcpyDeviceToDevice\b', 'hipMemcpyDeviceToDevice', hip,
-                   'cudaMemcpyDeviceToDevice→hipMemcpyDeviceToDevice')
-        hip = _sub(r'\bcudaMallocHost\b', 'hipHostMalloc', hip, 'cudaMallocHost→hipHostMalloc')
-        hip = _sub(r'\bcudaFreeHost\b', 'hipHostFree', hip, 'cudaFreeHost→hipHostFree')
-        hip = _sub(r'\bcudaEvent_t\b', 'hipEvent_t', hip, 'cudaEvent_t→hipEvent_t')
-        hip = _sub(r'\bcudaGetDevice\b', 'hipDeviceGet', hip, 'cudaGetDevice→hipDeviceGet')
-        hip = _sub(r'\bcheckCudaErrors\s*\(', '(void)(', hip, 'checkCudaErrors→(void)(')
-        hip = _sub(r'\bcuda_device\b', 'hip_device', hip, 'cuda_device→hip_device')
-        hip = _sub(r'\bthreadFence\b', '__threadfence', hip, 'threadFence→__threadfence')
-        hip = _sub(r'\bthreadfence\b', '__threadfence', hip, 'threadfence→__threadfence')
-
-        # ── Shuffle intrinsic mask renames ──
-        hip = _sub(r'(__shfl_xor_sync\s*\()0x1f(,)', r'\g<1>0x3f\g<2>', hip,
-                   '__shfl_xor_sync mask 0x1f→0x3f')
-        hip = _sub(r'(__shfl_up_sync\s*\()0x1f(,)', r'\g<1>0x3f\g<2>', hip,
-                   '__shfl_up_sync mask 0x1f→0x3f')
-        hip = _sub(r'(__shfl_down_sync\s*\()0x1f(,)', r'\g<1>0x3f\g<2>', hip,
-                   '__shfl_down_sync mask 0x1f→0x3f')
-        hip = _sub(r'(__shfl_\w+_sync\s*\()0x[fF]{8}(,)', r'\g<1>0xffffffffffffffffULL\g<2>', hip,
-                   '__shfl mask 0xffffffff→0xffffffffffffffffULL')
-        hip = _sub(r'\b__syncwarp\s*\(\s*\)', '__syncthreads()', hip,
-                   '__syncwarp()→__syncthreads()')
-
-        # ── Warp size constant ──
-        hip = _sub(r'(?<!#define )\bwarpSize\b', '64', hip, 'warpSize→64')
-        hip = _sub(r'\bWARP_SIZE\b(?!\s*64)', 'WAVEFRONT_SIZE', hip, 'WARP_SIZE→WAVEFRONT_SIZE')
-
-        # ── Vector type dismantling (CUDA-specific types → fundamental types) ──
-        for cuda_type, base_type in [
-            (r'\buint4\b', 'unsigned int'),
-            (r'\buint2\b', 'unsigned int'),
-            (r'\buint3\b', 'unsigned int'),
-            (r'\buchar4\b', 'unsigned char'),
-            (r'\buchar2\b', 'unsigned char'),
-            (r'\bint4\b', 'int'),
-            (r'\bint2\b', 'int'),
-            (r'\bint3\b', 'int'),
-            (r'\bfloat4\b', 'float'),
-            (r'\bfloat2\b', 'float'),
-            (r'\bdouble4\b', 'double'),
-            (r'\bdouble2\b', 'double'),
-            (r'\blong4\b', 'long'),
-            (r'\blong2\b', 'long'),
-        ]:
-            hip = _sub(rf'(__shared__\s+){cuda_type}(\s+\w+)', rf'\g<1>{base_type}\g<2>',
-                       hip, f'{cuda_type}(shared)→{base_type}')
-            hip = _sub(rf'(?<![.\w]){cuda_type}(?=[\s*;,()\[\]])', base_type,
-                       hip, f'{cuda_type}→{base_type}')
-
-        # ── Grid/Block dimension fixes ──
-        hip = _sub(r'\bdim3\b', 'dim3', hip, 'dim3 → dim3 (no-op, kept for compat)')
-        hip = _sub(r'\bgridDim\b', 'hipGridDim', hip, 'gridDim→hipGridDim')
-        hip = _sub(r'\bblockDim\b', 'hipBlockDim', hip, 'blockDim→hipBlockDim')
-        hip = _sub(r'\bblockIdx\b', 'hipBlockIdx', hip, 'blockIdx→hipBlockIdx')
-        hip = _sub(r'\bthreadIdx\b', 'hipThreadIdx', hip, 'threadIdx→hipThreadIdx')
-
-        return hip
 
     @staticmethod
     def _rubric_score_pipeline(kimi_success: bool, glm_success: bool,
@@ -1270,6 +1212,26 @@ class ModelRouter:
 
     # ── Phase prompt builders ────────────────────────────────────
 
+    def _postprocess_port(self, model_output: str, kernel_source: str):
+        """Turn a raw coder response into the code the compiler will actually see.
+
+        Returns ``(code, regex_changelog, main_restored)``.
+
+        Every path that accepts model output — the initial port, a refine, and the
+        refine's retry — must apply the same three steps in the same order, or the
+        pipeline compiles something different from what it reasoned about.
+        """
+        code = self._extract_code(model_output)
+        fixed = self._fix_ported_code(code, return_changelog=True)
+        if isinstance(fixed, tuple):
+            code, changelog = fixed
+        else:
+            code, changelog = fixed, []
+        code, restored = self._ensure_main_preserved(code, kernel_source)
+        if restored:
+            changelog.append("main() restored from the original CUDA source")
+        return code, changelog, restored
+
     @staticmethod
     def _is_self_contained(source: str) -> bool:
         """True when *source* defines its own ``int main(`` — a complete,
@@ -1286,6 +1248,161 @@ class ModelRouter:
         docs/fix-plan-self-contained-programs.md, Bug 1).
         """
         return bool(re.search(r'^\s*int\s+main\s*\(', source, re.MULTILINE))
+
+    @staticmethod
+    def _extract_main(source: str) -> str:
+        """Return the full text of *source*'s ``int main(...)`` definition, or "".
+
+        Brace-matched rather than regex-terminated: a driver's body contains
+        nested blocks and string literals with braces in them, so "everything
+        up to the next ``}`` at column 0" silently truncates mid-function on
+        any program that indents its closing brace.
+
+        Skips a ``main`` that is only declared (``int main(int, char**);``) —
+        there is nothing to preserve there.
+        """
+        m = re.search(r'^[ \t]*int[ \t]+main[ \t]*\(', source, re.MULTILINE)
+        if not m:
+            return ""
+        open_brace = source.find("{", m.end())
+        if open_brace < 0:
+            return ""
+        # A declaration ends at ';' before any body opens.
+        semi = source.find(";", m.end())
+        if 0 <= semi < open_brace:
+            return ""
+
+        depth = 0
+        in_string = in_char = in_line_comment = in_block_comment = False
+        escape = False
+        for i in range(open_brace, len(source)):
+            ch = source[i]
+            nxt = source[i + 1] if i + 1 < len(source) else ""
+            if in_line_comment:
+                if ch == "\n":
+                    in_line_comment = False
+                continue
+            if in_block_comment:
+                if ch == "*" and nxt == "/":
+                    in_block_comment = False
+                continue
+            if in_string or in_char:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif (ch == '"' and in_string) or (ch == "'" and in_char):
+                    in_string = in_char = False
+                continue
+            if ch == "/" and nxt == "/":
+                in_line_comment = True
+                continue
+            if ch == "/" and nxt == "*":
+                in_block_comment = True
+                continue
+            if ch == '"':
+                in_string = True
+                continue
+            if ch == "'":
+                in_char = True
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return source[m.start():i + 1]
+        return ""  # unbalanced — refuse to hand back a truncated driver
+
+    @classmethod
+    def _ensure_main_preserved(cls, ported_code: str, original_source: str):
+        """Re-append the driver when the coder dropped a self-contained program's main().
+
+        Returns ``(code, restored: bool)``.
+
+        The 2026-07-09 run's entire 180s budget went to this: the CUDA source was a
+        complete program, the coder returned only the kernels, and hipcc failed with
+        ``ld.lld: error: undefined symbol: main``. Every agent downstream then
+        reasoned about a *compile* error that was really a missing-driver error, and
+        three LLM phases (plan, analyse, re-plan) could not fix what none of them
+        had been told.
+
+        The driver is not regenerated — it is lifted from the original source and put
+        through the same mechanical CUDA→HIP pass the rest of the file already went
+        through, so no model is in the loop and the cost is a regex.
+
+        Only fires when the original was self-contained and the port is not: a port
+        that kept its main() is left untouched, and a bare kernel snippet has no
+        driver to restore.
+        """
+        if not ported_code or not original_source:
+            return ported_code, False
+        if not cls._is_self_contained(original_source):
+            return ported_code, False
+        if cls._is_self_contained(ported_code):
+            return ported_code, False
+
+        # Hipify the WHOLE source, then cut main() out of the result — never hipify
+        # the isolated main(). _fix_ported_code prepends the helper shims and
+        # `#define WAVEFRONT_SIZE 64` to anything that looks self-contained, and an
+        # extracted main() does. Appending that preamble to a file that already
+        # carries it redefines StopWatchInterface and findCudaDevice, trading one
+        # link error for a dozen compile errors. Cutting from the hipified whole
+        # yields the driver alone, already translated, preamble left behind.
+        hipified_source = cls._fix_ported_code(original_source)
+        if isinstance(hipified_source, tuple):
+            hipified_source = hipified_source[0]
+
+        hipified_main = cls._extract_main(hipified_source)
+        if not hipified_main or not cls._extract_main(original_source):
+            return ported_code, False
+
+        return (ported_code.rstrip() + "\n\n"
+                "// ── main() restored from the original CUDA source ──\n"
+                "// The port dropped the driver of a self-contained program. This is the\n"
+                "// original main(), mechanically hipified — no model rewrote it.\n"
+                + hipified_main + "\n"), True
+
+    # A diagnostic emitted by the linker, not the compiler. `clang++: error: linker
+    # command failed` always accompanies the real `ld.lld: undefined symbol: X` line,
+    # so both spellings must count or the set is never "linker-only".
+    _LINKER_ERROR = re.compile(
+        r'undefined (?:symbol|reference)|linker command failed|^\s*ld(?:\.lld)?\s*:')
+
+    @classmethod
+    def _is_linker_only(cls, compile_errors: List[str],
+                        error_origins: Optional[List[str]] = None) -> bool:
+        """True when every hipcc diagnostic is a link failure, not a compile error.
+
+        ``undefined symbol: main`` is not something the coder can debug from the error
+        text: nothing in the file it wrote is syntactically wrong. Sending it to the
+        error analyst buys a confident, plausible, useless root cause, and sending it
+        to the planner buys a fresh strategy for a problem that is not strategic. Both
+        cost ~38s of a 180s budget. The fix is a regex (`_ensure_main_preserved`), so
+        the models are skipped entirely.
+
+        Note this is deliberately NOT `all(o == "link" for o in error_origins)`:
+        verifier._classify_error_origin tags only the ``undefined symbol: main`` line
+        "link" and leaves its inseparable ``clang++: ... linker command failed`` mate
+        "unknown", so that predicate is false on every real link failure. Origins are
+        used as corroboration; the text is what decides.
+        """
+        errs = [e for e in compile_errors if e.strip()]
+        if not errs:
+            return False
+        if not all(cls._LINKER_ERROR.search(e) for e in errs):
+            return False
+        # An origins list that names a non-link compile error contradicts the text.
+        return not any(o in ("ported_code", "harness") for o in (error_origins or []))
+
+    @classmethod
+    def _is_missing_main_error(cls, compile_errors: List[str],
+                               error_origins: Optional[List[str]] = None) -> bool:
+        """True when the linker is specifically saying ``main`` is undefined."""
+        if "link" in (error_origins or []):
+            return True
+        return any(re.search(r'undefined (?:symbol|reference to)[\s\S]{0,10}\bmain\b', e)
+                   for e in compile_errors)
 
     @staticmethod
     def _unresolved_local_headers(source: str) -> List[str]:
@@ -1316,35 +1433,43 @@ class ModelRouter:
         a detailed porting plan as prose. No JSON required — reasoning is the asset here.
         The plan is passed to Kimi-Coder as context.
 
-        TRIZ #10 (Preliminary Action) / #24 (Mediator):
-        When hipified_source is provided, it contains the mechanically-translated
-        HIP code (headers swapped, API renames, masks widened). DeepSeek only needs
-        to plan the non-trivial warp→wavefront semantic changes.
+        hipified_source: the mechanically translated draft (see _hipify_source). When
+        supplied, the planner is asked for the DELTA only. Planning the header swaps
+        and cuda*→hip* renames that a regex already performed is work whose output is
+        discarded: the coder is editing the draft, not the original. On 2026-07-09 the
+        planner spent 38.2s — 21% of the budget — re-deriving a translation that had
+        finished in 19ms, and the one thing it needed to say (the __shfl_up_sync width)
+        was a single line.
         """
+        if hipified_source:
+            # No CUDA embed at all. The draft IS the translation of it, and the
+            # planner's job here is not translation.
+            prompt = (
+                "A CUDA kernel has already been mechanically translated to HIP: headers "
+                "swapped, cuda*→hip* renamed, checkCudaErrors replaced, WAVEFRONT_SIZE "
+                "defined. That work is DONE and correct. Do not plan it again.\n\n"
+                "Plan ONLY the warp(32)→wavefront(64) semantics a regex cannot do:\n"
+                + self._WAVEFRONT_CHECKLIST + "\n"
+            )
+            pattern_summary = _format_patterns_summary(patterns)
+            if pattern_summary:
+                prompt += pattern_summary + "\n"
+            prompt += (
+                f"HIP DRAFT (already translated — plan the edits to THIS):\n"
+                f"```hip\n{hipified_source[:4000]}\n```\n\n"
+                "Reply with a short numbered checklist: one line per edit, naming the "
+                "construct and the exact replacement. If a checklist item does not apply "
+                "to this kernel, omit it. Do not restate what is already done. "
+                "Be brief — the coder needs the delta, not a tutorial."
+            )
+            return prompt
+
         prompt = (
             "Analyze this CUDA kernel and produce a porting plan for AMD ROCm/HIP.\n"
             "Identify every CUDA-specific construct and its HIP replacement.\n"
             "Prioritize: warp(32)→wavefront(64) divergence, __shfl mask widths, "
             "shared memory sizing, header swaps, local .cuh dependencies.\n\n"
         )
-
-        use_hipified = bool(hipified_source)
-
-        if use_hipified:
-            prompt += (
-                "NOTE: The code below has already been MECHANICALLY hipify'd "
-                "(headers swapped, API calls renamed, shuffle masks updated).\n"
-                "Do NOT plan for changes that are already done. Focus ONLY on the\n"
-                "non-trivial 20% that mechanical transformation cannot handle:\n"
-                "- warp(32) → wavefront(64) in shared memory sizing\n"
-                "- warpSize used in arithmetic/comparison boundaries\n"
-                "- __syncwarp() usage patterns\n"
-                "- Local .cuh header dependencies (inline or drop)\n"
-                "- CheckCudaErrors / helper_cuda.h compat shim injection\n\n"
-                "MECHANICALLY HIPIFY'D CODE (your starting point):\n"
-                f"```hip\n{hipified_source[:4000]}\n```\n\n"
-                "ORIGINAL CUDA (for reference — compare to see what still needs changing):\n"
-            )
 
         pattern_summary = _format_patterns_summary(patterns)
         if pattern_summary:
@@ -1407,6 +1532,28 @@ class ModelRouter:
         )
         return prompt
 
+    # Semantics the mechanical pass cannot do: meaning changes, not spellings.
+    # These stay on the coder's checklist even when a hipified draft is supplied.
+    _WAVEFRONT_CHECKLIST = (
+        "- __shfl_*_sync: the `width` argument and mask semantics change on "
+        "wavefront64 (masks → 0x3f / 0xffffffffffffffffULL; width must not stay 32)\n"
+        "- shared memory sized blockDim/32 → blockDim/64 (this is the usual SIGSEGV)\n"
+        "- warpSize or a hardcoded 32 → WAVEFRONT_SIZE (64)\n"
+        "- __syncwarp() → __syncthreads()\n"
+    )
+
+    # Spellings the mechanical pass already handles. Only listed when no
+    # preprocessed draft was supplied.
+    _MECHANICAL_CHECKLIST = (
+        "- #define WAVEFRONT_SIZE 64 at top\n"
+        "- Replace #include <cuda_runtime.h> → #include <hip/hip_runtime.h>\n"
+        "- Remove #include <helper_cuda.h>, <helper_functions.h>, <device_launch_parameters.h>\n"
+        "- Remove ALL #include \"*.cuh\" local headers (inline their content if needed)\n"
+        "- checkCudaErrors(x) → (void)(x); findCudaDevice/sdkCreateTimer/sdkStartTimer/"
+        "sdkStopTimer/sdkGetTimerValue/sdkDeleteTimer/StopWatchInterface/getLastCudaError "
+        "have no HIP equivalent — replace with hipSetDevice/std::chrono or remove\n"
+    )
+
     def _build_kimi_code_prompt(self, kernel_source: str,
                                 patterns: List[Dict],
                                 deepseek_plan: str = "",
@@ -1416,63 +1563,43 @@ class ModelRouter:
         Role: Kimi-Coder — generates the actual ported HIP kernel code.
         Now receives DeepSeek's plan as context (was GLM analysis before).
 
-        TRIZ #2 / #28: When preprocessed_source is provided, it contains the
-        mechanically hipify'd version of the CUDA source (headers swapped,
-        API calls renamed, shuffle masks updated). Kimi only needs to handle
-        warp→wavefront semantics — the remaining 20% that regex can't do.
-        The checklist is shortened to exclude items already handled by the
-        preprocessor.
+        preprocessed_source: a mechanically hipified draft (see _hipify_source).
+        When supplied, Kimi EDITS it rather than re-porting from scratch: the
+        53 API renames and 38 checkCudaErrors sites are already done, so the
+        checklist narrows to wavefront semantics and the response is a diff-sized
+        edit rather than a 419-line rewrite. Output tokens are the coder's real
+        latency, and a rewrite is also what reintroduced compile errors on the
+        2026-07-09 run.
 
         Output format: JSON with ported_code (str), confidence (0-100),
         changes (list[str]), explanation (str).
         """
-        use_preprocessed = bool(preprocessed_source)
-
-        if use_preprocessed:
+        if preprocessed_source:
             prompt = (
-                "Port this CUDA kernel to AMD ROCm/HIP. "
-                "The code below has been MECHANICALLY hipify'd "
-                "(headers swapped, API renames done, shuffle masks widened).\n"
-                "You only need to fix warp(32)→wavefront(64) SEMANTIC issues "
-                "that mechanical transforms cannot handle:\n\n"
-                "CHECKLIST (warp→wavefront only):\n"
-                "- shared memory sized for warp 32 → WAVEFRONT_SIZE (64)\n"
-                "- __syncwarp() → __syncthreads()\n"
-                "- warpSize used in arithmetic/comparison → WAVEFRONT_SIZE (64)\n"
-                "- #define WAVEFRONT_SIZE 64 at top\n"
-                "- Remove ALL #include \"*.cuh\" local headers "
-                "(inline their content if needed)\n\n"
+                "A CUDA kernel has ALREADY been mechanically translated to HIP "
+                "(headers, cuda*→hip* API renames, checkCudaErrors, WAVEFRONT_SIZE). "
+                "Your job is the part a regex cannot do: warp(32)→wavefront(64) "
+                "SEMANTICS.\n\n"
+                "EDIT the HIP draft below. Do NOT re-port from scratch and do not "
+                "restructure code that is already correct — change only what the "
+                "checklist calls out.\n\n"
+                "CHECKLIST (semantics only — the mechanical work is done):\n"
+                + self._WAVEFRONT_CHECKLIST + "\n"
             )
-            source_to_show = preprocessed_source
         else:
             prompt = (
                 "Port this CUDA kernel to AMD ROCm/HIP. Fix warp(32)→wavefront(64) issues.\n\n"
                 "CHECKLIST:\n"
-                "- __shfl_xor_sync mask 0x1f → 0x3f for wavefront64\n"
-                "- __shfl_down_sync masks → 0xffffffffffffffffULL (64-bit)\n"
-                "- warpSize 32 → WAVEFRONT_SIZE 64 or dynamic\n"
-                "- shared memory sized for warp 32 → WAVEFRONT_SIZE (64)\n"
-                "- __syncwarp() → __syncthreads()\n"
-                "- #define WAVEFRONT_SIZE 64 at top\n"
-                "- Replace #include <cuda_runtime.h> → #include <hip/hip_runtime.h>\n"
-                "- Remove #include <helper_cuda.h>, <helper_functions.h>, <device_launch_parameters.h>\n"
-                "- Remove ALL #include \"*.cuh\" local headers (inline their content if needed)\n"
-                "- checkCudaErrors(x) → (void)(x); findCudaDevice/sdkCreateTimer/sdkStartTimer/"
-                "sdkStopTimer/sdkGetTimerValue/sdkDeleteTimer/StopWatchInterface/getLastCudaError "
-                "have no HIP equivalent — replace with hipSetDevice/std::chrono or remove\n\n"
+                + self._WAVEFRONT_CHECKLIST
+                + self._MECHANICAL_CHECKLIST + "\n"
             )
-            source_to_show = kernel_source
 
         if deepseek_plan:
             try:
                 plan_msg = self._build_deepseek_plan_message(deepseek_plan, kernel_source)
-                # TRIZ #21 (Rushing Through): Cap plan at 1500 chars instead of 4000.
-                # The A2AMessage structure puts the most critical info (API mappings)
-                # first, so truncation preserves what matters. Plan prose past 1500
-                # chars has rapidly diminishing returns for code generation accuracy.
-                prompt += f"DeepSeek Planner's plan (follow this):\n{plan_msg.to_prompt(max_chars=1500)}\n\n"
+                prompt += f"DeepSeek Planner's plan (follow this):\n{plan_msg.to_prompt(max_chars=4000)}\n\n"
             except Exception:
-                prompt += f"DeepSeek Planner's plan (follow this):\n{deepseek_plan[:1000]}\n\n"
+                prompt += f"DeepSeek Planner's plan (follow this):\n{deepseek_plan[:2000]}\n\n"
 
         pattern_summary = _format_patterns_summary(patterns)
         if pattern_summary:
@@ -1483,15 +1610,23 @@ class ModelRouter:
         # any source past ~6000 chars, so Kimi ported only the kernels and
         # never saw (let alone could reproduce) the driver that runs them.
         self_contained = self._is_self_contained(kernel_source)
-        source_for_prompt = source_to_show if self_contained else source_to_show[:6000]
-
-        # When preprocessed source is used, show it labeled as "Pre-processed HIP"
-        if use_preprocessed:
-            prompt += f"Pre-processed HIP source (mechanical transforms done by hipify):\n```hip\n{source_for_prompt}\n```\n\n"
+        source_for_prompt = kernel_source if self_contained else kernel_source[:6000]
+        if preprocessed_source:
+            # The DRAFT is what Kimi edits, so it is the thing that must be shown in
+            # full (Bug 1: a self-contained program truncated below its own main()
+            # can never be reproduced). The CUDA original becomes a bounded excerpt:
+            # the draft is a faithful mechanical translation of it, so re-sending it
+            # whole doubles the prompt to restate what the draft already says.
+            draft = (preprocessed_source if self_contained
+                     else preprocessed_source[:6000])
+            excerpt = kernel_source[:2000]
+            elided = "\n... (original elided — the draft below is its translation)" \
+                if len(kernel_source) > len(excerpt) else ""
             prompt += (
-                "ORIGINAL CUDA (for reference — the pre-processed version above is "
-                "what you should modify):\n```cuda\n"
-                f"{kernel_source if self_contained else kernel_source[:3000]}\n```\n\n"
+                f"ORIGINAL CUDA (reference only — do not port this again):\n"
+                f"```cuda\n{excerpt}{elided}\n```\n\n"
+                f"HIP DRAFT TO EDIT (mechanically translated; return this file with "
+                f"the checklist applied):\n```hip\n{draft}\n```\n\n"
             )
         else:
             prompt += f"```cuda\n{source_for_prompt}\n```\n\n"
@@ -1512,8 +1647,8 @@ class ModelRouter:
             )
 
         prompt += (
-            'Respond with JSON: {"ported_code": str, "confidence": 0-100, '
-            '"changes": [str], "explanation": str}.\n'
+            "Respond with JSON: {\"ported_code\": str, \"confidence\": 0-100, "
+            "\"changes\": [str], \"explanation\": str}.\n"
             "IMPORTANT: The ported_code field must contain the COMPLETE HIP kernel source. "
             "If the kernel is large, minimize explanation to save tokens. "
             "Prefer full code over partial code with verbose explanation."
@@ -1535,7 +1670,8 @@ class ModelRouter:
                                   checklist_override: list[str] = None,
                                   stagnation_count: int = 0,
                                   regex_changelog: Optional[List[str]] = None,
-                                  frozen_base_code: str = "") -> str:
+                                  frozen_base_code: str = "",
+                                  preprocessed_source: str = "") -> str:
         """Build the Kimi refinement prompt for orchestration loop iterations.
 
         Kimi receives the original kernel, its previous output, and
@@ -1552,6 +1688,13 @@ class ModelRouter:
         compiles and only crashes at runtime. Kimi is told to patch it, not to
         rewrite it — a full rewrite is what reintroduced compile errors on the
         2026-07-09 run.
+
+        preprocessed_source: the mechanically hipified draft. NOT embedded here —
+        `previous_code` is already the working HIP copy, and re-sending the draft
+        would grow the prompt this parameter exists to shrink. It is used to state
+        that the mechanical pass is done, and to name any cuda* symbols that have
+        crept back into `previous_code` (a regression the loop otherwise rediscovers
+        through hipcc, one iteration at a time).
         """
         # TRIZ #15: Use evolved checklist if provided, else fallback to static
         checklist = checklist_override if checklist_override else [
@@ -1625,6 +1768,25 @@ class ModelRouter:
             prompt += (
                 f"\nAUTO-FIXED ITEMS (already applied — do NOT redo):\n{changelog_text}\n\n"
             )
+
+        # ── Mechanical pass already applied (see _hipify_source) ──
+        # Cheap to say, expensive to rediscover: without it each refine spends
+        # output tokens re-deriving cuda*→hip* renames that a regex did in 19ms.
+        if preprocessed_source:
+            prompt += (
+                "\nMECHANICAL PASS ALREADY APPLIED: headers, cuda*→hip* API renames, "
+                "checkCudaErrors and WAVEFRONT_SIZE are done deterministically. Do not "
+                "redo them and do not reintroduce CUDA spellings. Spend your edit on "
+                "wavefront64 semantics.\n"
+            )
+            crept_back = self._residual_cuda_symbols(previous_code)
+            if crept_back:
+                prompt += (
+                    f"⚠️ Your previous output reintroduced CUDA symbols that the "
+                    f"mechanical pass had removed: {', '.join(crept_back[:8])}. "
+                    f"Remove them.\n"
+                )
+            prompt += "\n"
         # ── P1 two-layer SIGSEGV fix: Layer 1 is immutable ──
         # The base kernel below already passed hipcc. The only defect is at runtime.
         # Rewriting it trades a crashing binary for one that does not build at all.
@@ -1755,7 +1917,8 @@ class ModelRouter:
                                          patterns: List[Dict],
                                          error_delta: int = 0,
                                          stagnation_count: int = 0,
-                                         error_context: List[str] = None) -> str:
+                                         error_context: List[str] = None,
+                                         self_contained: bool = False) -> str:
         """Build GLM prompt for compile-error analysis (TRIZ #28).
 
         When hipcc fails, GLM analyzes the compile errors + code and tells
@@ -1773,6 +1936,13 @@ class ModelRouter:
         without these snippets, any error past char 3000 is structurally
         unanalyzable and GLM's output degrades to empty/priority-only fixes
         (the "1 fixes, 0 includes, 0 APIs" plateau in the 2026-07-09 run).
+
+        self_contained: the ORIGINAL CUDA source defines its own main(). Without
+        this, an ``undefined symbol: main`` gets a generic "fix the linker errors"
+        answer, because nothing in the code excerpt explains it. Route() now restores
+        main() mechanically before the analyst is ever called, so this flag exists to
+        make the analyst's advice correct in the residual case where some other
+        symbol failed to link and the driver is nonetheless present.
         """
         err_text = "\n".join(compile_errors[:10])
         ctx_text = ""
@@ -1797,12 +1967,26 @@ class ModelRouter:
                 f"The current approach is not working. Try a COMPLETELY different strategy.\n"
             )
 
+        # The excerpt below is the first 3000 chars, so a driver near the end of a
+        # 15k-char program is invisible here. Saying so prevents the analyst from
+        # reading its absence as the defect.
+        self_contained_note = ""
+        if self_contained:
+            self_contained_note = (
+                "\nCONTEXT: the original CUDA source is a COMPLETE, SELF-CONTAINED program "
+                "with its own main(). The code excerpt below may be truncated before that "
+                "main() — do NOT report a missing driver as a defect unless a linker error "
+                "names it. If one does, the correct fix is 'restore main() from the original "
+                "CUDA source', never 'write a new main()' or 'add a test harness'.\n"
+            )
+
         prompt = (
             f"You are a HIP/ROCm compile error analyst. Kimi generated code that fails to compile.\n"
             f"Analyze the compiler errors and tell Kimi EXACTLY what to fix.\n\n"
             f"COMPILER ERRORS (hipcc, iteration {iteration}):\n"
             f"{err_text}\n"
-            f"{ctx_text}\n"
+            f"{ctx_text}"
+            f"{self_contained_note}\n"
             f"CURRENT CODE (first 3000 chars):\n"
             f"```hip\n{ported_code[:3000]}\n```\n\n"
             "Analyze each error and provide:\n"
@@ -1839,7 +2023,8 @@ class ModelRouter:
               on_phase=None,
               verifier=None,
               kernel_name: str = "test_kernel",
-              max_seconds: Optional[float] = None) -> Dict:
+              max_seconds: Optional[float] = None,
+              fast_path: bool = True) -> Dict:
         """Route kernel through the loop engineering pipeline.
 
         Loop: DeepSeek (plan) → Kimi (code) → [hipcc compile FIRST] → GLM (evaluate only if compile passes) → feedback → Kimi refines
@@ -1863,6 +2048,8 @@ class ModelRouter:
             kernel_name: Name of kernel (for verifier build dir isolation).
             max_seconds: Hard wall-clock budget. Defaults to MAX_PIPELINE_SECONDS.
                 Pass 0 (or a negative value) to disable the budget entirely.
+            fast_path: Try the mechanical hipify → compile → run shortcut before
+                any LLM call. Set False to exercise the model loop directly.
 
         Returns:
             {"ported_code": ..., "confidence": ..., "changes": [...],
@@ -1877,7 +2064,8 @@ class ModelRouter:
                     "compile_errors": [], "compile_passed": False,
                     "best_attempt_code": "", "best_attempt_iteration": 0,
                     "best_attempt_confidence": 0.0,
-                    "prompt_version": PROMPT_VERSION, "timed_out": False}
+                    "prompt_version": PROMPT_VERSION, "timed_out": False,
+                    "fast_path_used": False, "hipify_transforms": 0}
 
         # P0: start the wall-clock budget before the first LLM call. _call_model
         # reads self._deadline and clamps every request timeout to what is left.
@@ -1892,7 +2080,8 @@ class ModelRouter:
                   "compile_error_history": [],
                   "best_attempt_code": "", "best_attempt_iteration": 0,
                   "best_attempt_confidence": 0.0,
-                  "prompt_version": PROMPT_VERSION, "timed_out": False}
+                  "prompt_version": PROMPT_VERSION, "timed_out": False,
+                  "fast_path_used": False, "hipify_transforms": 0}
         if not deadline.unlimited:
             result["changes"].append(
                 f"[budget] Wall-clock limit {budget:.0f}s (prompt {PROMPT_VERSION})")
@@ -1935,6 +2124,71 @@ class ModelRouter:
         except Exception as e:
             result["changes"].append(f"[spec] Auto-generation failed: {e} — using generic harness fallback")
 
+        # ── Phase 0: mechanical hipify, then a compile-first fast path ──
+        # HIPIFY does every deterministic CUDA→HIP transform in ~19ms. The loop
+        # was paying an LLM ~90s to reproduce them one token at a time.
+        hipified_source, hipify_changelog = self._hipify_source(kernel_source)
+        result["hipify_transforms"] = len(hipify_changelog)
+        result["changes"].append(
+            f"[hipify] {len(hipify_changelog)} mechanical transforms applied before any LLM call")
+
+        residual = self._residual_cuda_symbols(hipified_source)
+        if residual:
+            result["changes"].append(
+                f"[hipify] {len(residual)} CUDA symbols have no deterministic HIP spelling "
+                f"({', '.join(residual[:5])}) — the coder is required")
+
+        # Don't spend a compile discovering what the source already says. A kernel
+        # using __shfl/warpSize needs lane arithmetic no regex can supply.
+        needs_semantics = self._needs_wavefront_semantics(hipified_source, patterns)
+        if needs_semantics:
+            result["changes"].append(
+                "[fast-path] skipped — kernel uses warp-level primitives whose semantics "
+                "change on wavefront64; a mechanical port would compile and then crash")
+
+        if (fast_path and not residual and not needs_semantics
+                and verifier and hasattr(verifier, "quick_compile_check")):
+            if on_phase: on_phase("hipify", "hipify (regex)", "mechanical CUDA→HIP, no LLM")
+            cc = verifier.quick_compile_check(hipified_source, kernel_name=kernel_name)
+            # isinstance guard: a bare MagicMock verifier reads as "no information",
+            # never as a pass — the fast path must never be taken on a guess.
+            if isinstance(cc, dict) and cc.get("compile_success") is True:
+                # RUN-FIRST. A compile-pass is not a port: the 2026-07-09 kernel
+                # compiled and then SIGSEGVed on shared memory sized blockDim/32.
+                # Mechanical translation cannot fix wavefront64 semantics, so the
+                # binary must actually run before we skip the models.
+                rc = (verifier.quick_run_check(kernel_name)
+                      if hasattr(verifier, "quick_run_check") else None)
+                if isinstance(rc, dict) and rc.get("run_success") is True:
+                    result["ported_code"] = hipified_source
+                    result["compile_passed"] = True
+                    result["compile_errors"] = []
+                    result["orchestrator_passed"] = True
+                    result["model_used"] = "hipify"
+                    result["confidence"] = 85
+                    result["iterations_used"] = 0
+                    result["fast_path_used"] = True
+                    result["best_attempt_code"] = hipified_source
+                    result["best_attempt_confidence"] = 0.85
+                    result["regex_changelog"] = hipify_changelog
+                    result["cost"] = round(self.total_cost, 4)
+                    result["changes"].append(
+                        f"[fast-path] hipify output compiled AND ran clean — "
+                        f"skipped DeepSeek, Kimi and GLM entirely (0 LLM calls)")
+                    print(f"║  │  ⚡ FAST PATH: mechanical port compiled and ran — no LLM needed{'':<3}║")
+                    return result
+
+                sig = (rc.get("signal") or f"exit {rc.get('run_exit_code')}"
+                       ) if isinstance(rc, dict) else "no run information"
+                result["changes"].append(
+                    f"[fast-path] hipify output compiled but did not run clean ({sig}) — "
+                    f"handing the draft to the coder for wavefront64 semantics")
+            else:
+                n_errs = len(cc.get("errors", [])) if isinstance(cc, dict) else "?"
+                result["changes"].append(
+                    f"[fast-path] hipify output did not compile ({n_errs} errors) — "
+                    f"handing the draft to the coder")
+
         # Track pipeline phase outcomes for rubric scoring
         planner_success = False
         coder_success = False
@@ -1944,73 +2198,65 @@ class ModelRouter:
         compile_passed = False  # TRIZ #23: track compile state as feedback signal
         deepseek_plan_output = ""
 
-        # ── TRIZ #10 (Preliminary Action): HIPIFY mechanical pre-processing ──
-        # HIPIFY is a deterministic CUDA→HIP translator (github.com/ROCm-Developer-Tools/HIPIFY)
-        # that does header renames, API renames, and basic #include swaps in ~2s.
-        # This pure-Python equivalent runs in ~0.01s on the ORIGINAL CUDA source
-        # BEFORE any LLM call, producing a baseline HIP draft.
-        #
-        # The hipified draft serves three purposes:
-        #   (a) Fed to DeepSeek's plan prompt — it only plans NON-trivial changes
-        #   (b) Fed to Kimi as preprocessed_source — Kimi edits the mechanical draft
-        #       instead of generating the entire port from scratch (drastically
-        #       reducing token count and latency, saving ~40-50s of Kimi's 93.5s avg)
-        #   (c) Set as the default initial ported_code — if compile-first succeeds on
-        #       the mechanical draft, the entire LLM pipeline is shortcut
-        if on_phase: on_phase("hipify", "pre-processor", "mechanical CUDA→HIP translation")
-        try:
-            hipified_source = self._hipify_source(kernel_source)
-            result["changes"].append(
-                f"[hipify] Pre-processed {len(kernel_source)}→{len(hipified_source)} chars "
-                f"— mechanical CUDA→HIP translation complete"
-            )
-        except Exception as e:
-            hipified_source = kernel_source
-            result["changes"].append(f"[hipify] Pre-processing failed: {e} — reverting to raw CUDA")
-
-        # TRIZ #10/#24: Seed best_attempt with the mechanical translation as fallback.
-        # If the LLM pipeline exhausts the budget, the hipify'd code is still returned
-        # rather than an empty string.
-        result["ported_code"] = hipified_source
-        best_attempt_code = hipified_source  # mechanical baseline
-
-        # TRIZ #28 (Mechanical Substitution): If a verifier is available, try
-        # compiling the hipify'd output FIRST — if it compiles, skip all LLM calls.
-        # Mechanical transformations get ~95% of kernels to compile on their own.
-        if verifier and hasattr(verifier, 'quick_compile_check'):
-            if on_phase: on_phase("compile", "hipcc", "compile-check hipify baseline")
-            cc = verifier.quick_compile_check(hipified_source, kernel_name=kernel_name)
-            if cc["compile_success"]:
-                result["ported_code"] = hipified_source
-                result["confidence"] = 60  # mechanical-only: moderate confidence
-                result["model_used"] = "hipify"
-                result["changes"].append(
-                    "[hipify] ⚡ Hipify'd code COMPILES — skipping entire LLM pipeline "
-                    f"(saved ~{MAX_PIPELINE_SECONDS}s budget)"
-                )
-                return result
-
         # ── Phase 1: DeepSeek PLANS the port (reasoning model — prose OK) ──
-        if on_phase: on_phase("plan", "DeepSeek-v4-pro", "planning CUDA→HIP strategy")
-        ds_prompt = self._build_deepseek_plan_prompt(kernel_source, patterns,
-                                                     hipified_source=hipified_source)
-        plan = self._call_model("deepseek", ds_prompt,
-                                system_prompt=SYSTEM_PROMPTS.get("deepseek", ""))
-        # I3: Log model I/O for reproducibility
-        try:
-            (run_dir / "phase1_plan_input.json").write_text(
-                json.dumps({"prompt": ds_prompt[:5000]}, indent=2), encoding="utf-8")
-            (run_dir / "phase1_plan_output.json").write_text(
-                json.dumps({"model": "deepseek", "success": plan.success,
-                            "output": plan.output[:5000]}, indent=2), encoding="utf-8")
-        except OSError:
-            pass
+        # P0: the planner runs on a slice, not on the whole clock. Its own timeout
+        # is 120s of a 180s budget; unclamped it starves the coder and every
+        # refinement behind it. The plan is advisory — the port is not.
+        plan_cap = deadline.phase_cap(
+            PLAN_BUDGET_FRACTION,
+            reserve_s=(budget * CODE_RESERVE_FRACTION + COMPILE_RESERVE_SECONDS),
+        ) if not deadline.unlimited else None
+
+        plan_skipped = plan_cap is not None and plan_cap < MIN_LLM_TIMEOUT_SECONDS
+        if plan_skipped:
+            # Planning at all would eat the coder's reservation. Skip it outright
+            # rather than spend the clock discovering that.
+            plan = AgentResult("deepseek", False, "", 0.0)
+            result["changes"].append(
+                f"[deepseek] Planning SKIPPED — a {budget:.0f}s budget leaves no slice for "
+                f"a plan once the coder's share is reserved; porting without one")
+        else:
+            if on_phase: on_phase("plan", "DeepSeek-v4-pro", "planning CUDA→HIP strategy")
+            # Hand the planner the mechanical draft so it plans the wavefront delta
+            # rather than re-deriving the translation. Only when hipify actually did
+            # something: on a source it could not transform, the draft carries no
+            # information the original doesn't, and the full prompt is the honest one.
+            delta_plan = bool(hipify_changelog)
+            ds_prompt = self._build_deepseek_plan_prompt(
+                kernel_source, patterns,
+                hipified_source=(hipified_source if delta_plan else ""))
+            # A delta plan is a checklist, not an essay. Output tokens are this
+            # phase's latency, and 2048 of them is what a 38s plan is made of.
+            plan = self._call_model("deepseek", ds_prompt,
+                                    system_prompt=SYSTEM_PROMPTS.get("deepseek", ""),
+                                    max_seconds=plan_cap,
+                                    max_tokens_override=(PLAN_DELTA_MAX_TOKENS
+                                                         if delta_plan else None))
+            # I3: Log model I/O for reproducibility
+            try:
+                (run_dir / "phase1_plan_input.json").write_text(
+                    json.dumps({"prompt": ds_prompt[:5000]}, indent=2), encoding="utf-8")
+                (run_dir / "phase1_plan_output.json").write_text(
+                    json.dumps({"model": "deepseek", "success": plan.success,
+                                "output": plan.output[:5000]}, indent=2), encoding="utf-8")
+            except (OSError, TypeError, ValueError) as _log_exc:
+                logger.debug("run-dir logging skipped: %s", _log_exc)
+
         if plan.success:
             planner_success = True
             deepseek_plan_output = plan.output
-            result["changes"].append(f"[deepseek] Plan generated ({len(plan.output)} chars)")
-        else:
-            result["changes"].append("[deepseek] Planning FAILED — proceeding without plan")
+            cap_note = f", cap {plan_cap:.0f}s" if plan_cap is not None else ""
+            result["changes"].append(
+                f"[deepseek] Plan generated ({len(plan.output)} chars{cap_note})")
+        elif not plan_skipped:
+            # A planner that overran its slice is not a model failure. Name which it was,
+            # so a slow endpoint is not mistaken for a broken one.
+            if plan_cap is not None:
+                result["changes"].append(
+                    f"[deepseek] Planning did not finish within its {plan_cap:.0f}s slice "
+                    f"— proceeding without plan; the coder's budget is intact")
+            else:
+                result["changes"].append("[deepseek] Planning FAILED — proceeding without plan")
 
         # ── Phase 2: Kimi CODES the initial port ──
         if on_phase: on_phase("code", "Kimi K2.7", "generating HIP port from plan")
@@ -2021,21 +2267,27 @@ class ModelRouter:
         kimi_prompt = self._build_kimi_code_prompt(kernel_source, patterns,
                                                    deepseek_plan=deepseek_plan_output,
                                                    preprocessed_source=hipified_source)
-        # TRIZ #6/#21: adaptive max_tokens instead of fixed 16384.
-        # Small kernels get a smaller budget → faster generation.
-        # large kernels still get up to 16384.
-        adaptive_tokens = self._compute_adaptive_max_tokens(
-            kernel_source, deepseek_plan=deepseek_plan_output)
+        # P0: the coder may use everything left except the clock hipcc needs. A
+        # compile cannot be interrupted, so the reserve is subtracted up front
+        # rather than discovered afterwards.
+        code_cap = (None if deadline.unlimited
+                    else max(deadline.remaining() - COMPILE_RESERVE_SECONDS, 0.0))
+        # Output tokens are the coder's latency. Size the budget to the kernel.
+        adaptive_tokens = self._compute_adaptive_max_tokens(hipified_source or kernel_source)
         code = self._call_model("kimi27", kimi_prompt,
                                 system_prompt=SYSTEM_PROMPTS.get("kimi27", ""),
+                                max_seconds=code_cap,
                                 max_tokens_override=adaptive_tokens)
         # I3: Log Kimi code generation
         try:
             (run_dir / "phase2_kimi_output.json").write_text(
                 json.dumps({"model": "kimi27", "success": code.success,
                             "output": code.output[:5000]}, indent=2), encoding="utf-8")
-        except OSError:
-            pass
+        except (OSError, TypeError, ValueError) as _log_exc:
+            # I3 reproducibility logging must never take down a port. json.dumps
+            # raises TypeError on a non-serializable value, which an OSError-only
+            # guard let escape all the way out of route().
+            logger.debug("run-dir logging skipped: %s", _log_exc)
         # TRIZ #23/#22/#3: baseline for the loop's error-delta and new-error tracking.
         # Seeded from the pre-loop compile check below (if it fails) so iteration 1's
         # delta is measured against real prior state instead of a phantom zero.
@@ -2044,12 +2296,16 @@ class ModelRouter:
         prev_errors_norm = set()  # TRIZ #3: normalized baseline for semantic diffing
         if code.success:
             coder_success = True
-            extracted = self._extract_code(code.output)
-            extracted = self._fix_ported_code(extracted, return_changelog=True)
-            if isinstance(extracted, tuple):
-                extracted, regex_changelog = extracted
-            else:
-                regex_changelog = []
+            # P0: the coder dropping main() on a self-contained program cost the
+            # 2026-07-09 run its whole budget. Restore it here, before the first
+            # compile, so no LLM phase ever sees the resulting link error.
+            extracted, regex_changelog, main_restored = self._postprocess_port(
+                code.output, kernel_source)
+            if main_restored:
+                result["changes"].append(
+                    "[main] Coder dropped main() from a self-contained program — "
+                    "restored it from the original CUDA source (no LLM call)")
+                print(f"║  │  🔧 MAIN RESTORED: coder dropped the driver — reattached{'':<7}║")
             result["ported_code"] = extracted
             result["regex_changelog"] = regex_changelog  # A3: track regex fixes
             if verifier and hasattr(verifier, 'quick_compile_check'):
@@ -2109,7 +2365,10 @@ class ModelRouter:
             # budget can expire during this very first Kimi call, in which case
             # _call_model returns a failed AgentResult and this branch would
             # otherwise report a model failure and hide the real cause.
-            if deadline.exhausted():
+            # `code_cap` below the call floor is the same condition seen earlier:
+            # the clock has not formally run out, but no call could have succeeded.
+            starved = code_cap is not None and code_cap < MIN_LLM_TIMEOUT_SECONDS
+            if deadline.exhausted() or starved:
                 result["timed_out"] = True
                 result["abort_reason"] = "pipeline_timeout"
                 result["changes"].append(
@@ -2155,15 +2414,26 @@ class ModelRouter:
             # Checked here (not mid-call) because an iteration is the unit of work
             # we can abandon cleanly: best_attempt_code already holds the furthest
             # compiling version, so stopping now returns real value instead of Ctrl+C.
-            if deadline.exhausted():
+            #
+            # An iteration costs a compile plus at least one LLM call. Entering one
+            # with less than that on the clock spends an uninterruptible hipcc run
+            # to produce errors nobody will ever get to act on.
+            iteration_floor = COMPILE_RESERVE_SECONDS + MIN_LLM_TIMEOUT_SECONDS
+            if deadline.exhausted() or not deadline.has_at_least(iteration_floor):
                 result["timed_out"] = True
                 result["abort_reason"] = "pipeline_timeout"
                 result["iterations_used"] = iteration - 1
+                # T0.1: do not call it "the best compiling attempt" when nothing
+                # compiled. compile_passed is the only thing that earns that word.
+                if compile_passed and best_attempt_code:
+                    kept = f"returning the best compiling attempt (iter {best_attempt_iteration})"
+                else:
+                    kept = ("returning the last attempt — nothing compiled, so it is "
+                            "saved for manual hipcc, not served from cache")
                 result["changes"].append(
                     f"[budget] Wall-clock limit {budget:.0f}s reached after "
                     f"{deadline.elapsed():.0f}s — stopping at iteration {iteration - 1} "
-                    f"and returning the best compiling attempt "
-                    f"(iter {best_attempt_iteration or 0})")
+                    f"and {kept}")
                 print(f"║  │  ⏱ TIMEOUT: {budget:.0f}s budget spent — returning best attempt{'':<10}║")
                 break
 
@@ -2176,6 +2446,14 @@ class ModelRouter:
             # escalation below and the GLM-informed re-plan after it — costing ~160s
             # for two strategies where only the second one is ever used.
             replanned_this_iter = False
+            # Bound here, not inside `if glm_err.success:`. The informed re-plan below
+            # reads glm_analysis unconditionally, so a failed GLM analyst call — the
+            # exact case its own "falling back to raw errors" branch handles — used to
+            # crash route() with UnboundLocalError instead of falling back.
+            glm_analysis = None
+            # Same reason: the informed re-plan reads linker_only, which is otherwise
+            # only bound on the compile-failure path.
+            linker_only = False
             if verifier and hasattr(verifier, 'quick_compile_check'):
                 if on_phase: on_phase("compile", "hipcc", f"compile-first check (attempt {iteration}/{max_iterations})")
                 cc = verifier.quick_compile_check(result["ported_code"], kernel_name=kernel_name)
@@ -2186,8 +2464,8 @@ class ModelRouter:
                                     "compile_success": cc["compile_success"],
                                     "errors": cc.get("errors", [])[:8]},
                                    indent=2), encoding="utf-8")
-                except OSError:
-                    pass
+                except (OSError, TypeError, ValueError) as _log_exc:
+                    logger.debug("run-dir logging skipped: %s", _log_exc)
                 if cc["compile_success"]:
                     result["changes"].append(
                         f"[hipcc] Compile-first check {iteration}: PASSED ✅")
@@ -2257,6 +2535,14 @@ class ModelRouter:
                 else:
                     compile_failed_this_iter = True
                     compile_errs = cc.get("errors", [])
+                    error_origins = cc.get("error_origins", [])
+                    # P0: a link failure carries no information any model can act on.
+                    # The missing-main case is already gone by here — _postprocess_port
+                    # reattaches the driver before the first compile — so what remains
+                    # is an undefined symbol the coder must inline. The planner and the
+                    # analyst are skipped for it (see the guards below); on 2026-07-09
+                    # they cost 38.2s + 12.9s + 38.1s to say nothing.
+                    linker_only = self._is_linker_only(compile_errs, error_origins)
 
                     # ── P1 (two-layer SIGSEGV): reject a regressing Layer 2 ──
                     # We had code that compiled (Layer 1), asked Kimi to fix a runtime
@@ -2302,7 +2588,12 @@ class ModelRouter:
                     # ported code doesn't define main(). A raw "undefined
                     # symbol: main" string doesn't tell Kimi what happened;
                     # spell it out instead of letting it guess.
-                    main_link_error = "link" in cc.get("error_origins", [])
+                    #
+                    # Reaching this means the mechanical restore could not run (the
+                    # original's main() would not extract), so the coder is the last
+                    # resort — hence the explicit instruction in the feedback below.
+                    main_link_error = self._is_missing_main_error(
+                        compile_errs, error_origins)
                     # Bug 4: assign, don't accumulate — see note at the pre-loop check above.
                     result["compile_errors"] = list(compile_errs)
                     result["compile_error_history"].append({"iteration": iteration, "errors": list(compile_errs)})
@@ -2460,8 +2751,11 @@ class ModelRouter:
                     #       identical across iterations (rigid plateau)
                     #   (b) stagnation_count >= 2  → 2 iterations without improvement
                     #       (looser plateau — catches the 1-error-rotated case above)
+                    # `not linker_only`: a re-plan cannot resolve a link failure. The
+                    # strategy was never the problem — a symbol is simply absent.
                     if ((kimi_plateau_count >= 1 or stagnation_count >= 2)
                             and replan_count == 0
+                            and not linker_only
                             and iteration < max_iterations):
                         trigger = ("kimi_plateau=" + str(kimi_plateau_count)
                                    if kimi_plateau_count >= 1
@@ -2520,7 +2814,8 @@ class ModelRouter:
                     # re-plan — but only once (see hard-stagnation abort above for what
                     # happens next).
                     if (stagnation_count >= STAGNATION_ABORT_THRESHOLD
-                            and replan_count == 0 and iteration < max_iterations):
+                            and replan_count == 0 and not linker_only
+                            and iteration < max_iterations):
                         result["changes"].append(
                             f"[hipcc] Stagnation detected ({stagnation_count} iterations no improvement) "
                             f"— escalating to DeepSeek re-plan")
@@ -2552,6 +2847,14 @@ class ModelRouter:
                     err_summary = "; ".join(compile_errs[:3]) if compile_errs else cc["compile_output"][:300]
                     result["changes"].append(
                         f"[hipcc] Compile-first check {iteration}: FAILED: {err_summary[:120]}")
+
+                    if linker_only:
+                        result["changes"].append(
+                            f"[linker] Iter {iteration}: all {len(compile_errs)} diagnostics are "
+                            f"link failures — skipped the GLM analyst and both DeepSeek re-plans "
+                            f"(neither can supply a missing symbol)")
+                        print(f"║  │  🔗 LINK-ONLY: skipping GLM + DeepSeek — "
+                              f"nothing to plan{'':<12}║")
 
                     # TRIZ #22/#28: Feed only NEW (semantically) errors to Kimi.
                     # A2A protocol: structure ALL errors via A2AMessage, not just first 3-5.
@@ -2626,14 +2929,20 @@ class ModelRouter:
                     # See docs/fix-plan-harness-and-diagnostics.md, "Regression introduced
                     # by a0d2bc5". Bug 5 aborts the loop entirely in this case (below);
                     # skipping the analyst call here avoids paying for it either way.
-                    if compile_errs and iteration < max_iterations and not all_harness_origin:
+                    #
+                    # `not linker_only` for the same reason: the analyst is asked to
+                    # find a root cause in the code it is shown, and a link failure's
+                    # root cause is a symbol that is not there. It answers anyway.
+                    if (compile_errs and iteration < max_iterations
+                            and not all_harness_origin and not linker_only):
                         if on_phase: on_phase("analyze", "GLM-5.2",
                             f"analyzing compile errors for Kimi (iter {iteration})")
                         print(f"║  │  🔍 GLM analyzing {len(compile_errs)} compile errors for Kimi{'':<30}║")
                         glm_err_prompt = self._build_glm_error_analysis_prompt(
                             result["ported_code"], compile_errs, iteration, patterns,
                             error_delta=error_delta, stagnation_count=stagnation_count,
-                            error_context=cc.get("error_context"))
+                            error_context=cc.get("error_context"),
+                            self_contained=self._is_self_contained(kernel_source))
                         glm_err = self._call_model(
                             "glm", glm_err_prompt,
                             system_prompt=SYSTEM_PROMPTS.get("glm_error_analyst", ""),
@@ -2745,6 +3054,7 @@ class ModelRouter:
             # takes a stagnating run from ~3min/iteration to roughly one Kimi call.
             if (compile_failed_this_iter
                     and not replanned_this_iter
+                    and not linker_only
                     and replan_count < MAX_REPLANS
                     and iteration < max_iterations
                     and compile_errs
@@ -2982,10 +3292,35 @@ class ModelRouter:
                     feedback_label = "runtime crash + GLM findings"
                 else:
                     feedback_label = "GLM feedback"
+
+                # ── P2: budget-aware dispatch ──
+                # The iteration-boundary check above ran BEFORE this iteration's
+                # compile, GLM analysis and re-plan spent their share. By the time we
+                # reach the refine, the clock may hold less than a Kimi call needs —
+                # on 2026-07-09 one started with ~31s left, was killed mid-flight by
+                # the deadline, and returned nothing. A call that cannot finish is
+                # strictly worse than no call: it costs the clock and yields no code.
+                refine_cap = (None if deadline.unlimited
+                              else max(deadline.remaining() - COMPILE_RESERVE_SECONDS, 0.0))
+                if refine_cap is not None and refine_cap < MIN_LLM_TIMEOUT_SECONDS:
+                    result["timed_out"] = True
+                    result["abort_reason"] = "pipeline_timeout"
+                    result["iterations_used"] = iteration
+                    result["changes"].append(
+                        f"[budget] {deadline.remaining():.0f}s left after iteration "
+                        f"{iteration} — not enough for a refine plus the {COMPILE_RESERVE_SECONDS}s "
+                        f"compile reserve. Skipping the call rather than starting one the "
+                        f"deadline would kill in flight.")
+                    print(f"║  │  ⏱ BUDGET: too little left to refine — stopping cleanly{'':<8}║")
+                    break
+
                 if on_phase: on_phase("refine", "Kimi K2.7", f"refining with {feedback_label} (iter {iteration}→{iteration+1})")
                 # TRIZ #15: Evolve prompt based on compile error patterns
                 evolved = opt.evolve_prompt(result.get("compile_errors", []))
-                result["changes"].append(f"[prompt-v{evolved.version_id}] Checklist evolved: {len(evolved.checklist)} items")
+                # version_id already carries its own "v" ("v2"), and this is the
+                # PromptOptimizer's checklist version — not router.PROMPT_VERSION.
+                result["changes"].append(
+                    f"[checklist {evolved.version_id}] Evolved: {len(evolved.checklist)} items")
                 refine_prompt = self._build_kimi_refine_prompt(
                     kernel_source, result["ported_code"],
                     evaluator_feedback, patterns,
@@ -2998,24 +3333,41 @@ class ModelRouter:
                     # RUNTIME crash on code that compiles. On a compile failure there
                     # is no good baseline to freeze, and a rewrite is what we want.
                     frozen_base_code=(frozen_base_code if run_crashed_this_iter else ""),
+                    preprocessed_source=hipified_source,
                 )
                 refine = self._call_model(
                     "kimi27", refine_prompt,
                     system_prompt=SYSTEM_PROMPTS.get("kimi27", ""),
+                    max_seconds=refine_cap,
+                    max_tokens_override=adaptive_tokens,
                 )
                 if refine.success:
-                    extracted = self._extract_code(refine.output)
-                    extracted = self._fix_ported_code(extracted, return_changelog=True)
-                    if isinstance(extracted, tuple):
-                        extracted, regex_changelog = extracted
-                    else:
-                        regex_changelog = []
+                    extracted, regex_changelog, main_restored = self._postprocess_port(
+                        refine.output, kernel_source)
+                    if main_restored:
+                        result["changes"].append(
+                            f"[main] Refine at iter {iteration} dropped main() — "
+                            f"restored from the original CUDA source")
                     result["ported_code"] = extracted
                     result["regex_changelog"] = regex_changelog  # A3: track regex fixes
                     result["changes"].append(
                         f"[kimi27] Refined with {feedback_label} "
                         f"(iteration {iteration} → {iteration + 1})")
                 else:
+                    # P2: the refine that just failed consumed clock. A 1.5x-timeout
+                    # retry issued with nothing left is the in-flight kill again, one
+                    # call later — re-read the deadline instead of trusting refine_cap.
+                    retry_cap = (None if deadline.unlimited
+                                 else max(deadline.remaining() - COMPILE_RESERVE_SECONDS, 0.0))
+                    if retry_cap is not None and retry_cap < MIN_LLM_TIMEOUT_SECONDS:
+                        result["timed_out"] = True
+                        result["abort_reason"] = "pipeline_timeout"
+                        result["iterations_used"] = iteration
+                        result["changes"].append(
+                            f"[kimi27] Refinement failed (iteration {iteration}) and "
+                            f"{deadline.remaining():.0f}s remain — no room to retry. Keeping "
+                            f"the previous code.")
+                        break
                     result["changes"].append(
                         f"[kimi27] Refinement failed (iteration {iteration}), retrying with 1.5x timeout...")
                     # S4: Retry once with increased timeout — API failures are transient
@@ -3023,16 +3375,18 @@ class ModelRouter:
                     MODEL_CATALOG["kimi27"]["timeout"] = int(original_timeout * 1.5)
                     retry_refine = self._call_model(
                         "kimi27", refine_prompt,
-                        system_prompt=SYSTEM_PROMPTS.get("kimi27", "")
+                        system_prompt=SYSTEM_PROMPTS.get("kimi27", ""),
+                        max_seconds=retry_cap,
+                        max_tokens_override=adaptive_tokens,
                     )
                     MODEL_CATALOG["kimi27"]["timeout"] = original_timeout
                     if retry_refine.success:
-                        extracted = self._extract_code(retry_refine.output)
-                        extracted = self._fix_ported_code(extracted, return_changelog=True)
-                        if isinstance(extracted, tuple):
-                            extracted, regex_changelog = extracted
-                        else:
-                            regex_changelog = []
+                        extracted, regex_changelog, main_restored = self._postprocess_port(
+                            retry_refine.output, kernel_source)
+                        if main_restored:
+                            result["changes"].append(
+                                f"[main] Retry at iter {iteration} dropped main() — "
+                                f"restored from the original CUDA source")
                         result["ported_code"] = extracted
                         result["regex_changelog"] = regex_changelog
                         result["changes"].append(
@@ -3067,6 +3421,15 @@ class ModelRouter:
                   f"fix the underlying strategy{'':<4}║")
 
         # ── Phase 4: Gemma 4 final verification ──
+        # Gemma 4 here is deliberate, not a fallback for GLM: it is the only entry in
+        # MODEL_CATALOG with local_first=True, so this phase runs on the MI300X's own
+        # vLLM when one is up and costs nothing. GLM-5.2 remains the in-loop evaluator
+        # and error analyst; the two roles never swap. It reuses SYSTEM_PROMPTS["glm"]
+        # because the task — "judge this HIP kernel, answer in JSON" — is the same one.
+        #
+        # When the budget is already spent this call returns a failed AgentResult in
+        # ~0s (_call_model checks deadline.exhausted() first), which is why a timed-out
+        # run still shows a "final verification 0.0s" line.
         if result["ported_code"]:
             if on_phase: on_phase("verify", "Gemma 4", "final verification")
             gemma_prompt = self._build_glm_evaluate_prompt(
@@ -3152,12 +3515,30 @@ class ModelRouter:
     def _call_model(self, model_key: str, prompt: str,
                     system_prompt: str = "",
                     prefill: str = "",
+                    max_seconds: Optional[float] = None,
                     max_tokens_override: Optional[int] = None) -> AgentResult:
         model_info = MODEL_CATALOG[model_key]
         model_id = model_info["id"]
         local_first = model_info.get("local_first", False)
         model_timeout = model_info.get("timeout", 90)
+        # Output tokens are the coder's real latency. Never raise the catalog
+        # ceiling — only lower it to what this particular kernel needs.
+        catalog_tokens = model_info.get("max_tokens", 1024)
+        max_tokens = (min(catalog_tokens, max_tokens_override)
+                      if max_tokens_override else catalog_tokens)
+        # A phase cap. The model's own timeout is a ceiling for a call in
+        # isolation; this is the ceiling for a call inside a budgeted pipeline.
+        if max_seconds is not None:
+            model_timeout = min(model_timeout, max_seconds)
         t0 = time.perf_counter()
+        # The cap bounds the whole phase, retry included — otherwise a 36s cap
+        # becomes 36s + a 72s retry, and the reservation it was protecting is gone.
+        phase_end = (t0 + max_seconds) if max_seconds is not None else None
+
+        def _phase_remaining() -> float:
+            if phase_end is None:
+                return float("inf")
+            return phase_end - time.perf_counter()
 
         # P0: never start a request that cannot finish inside the pipeline budget.
         # Without this a single kimi27 call (180s timeout, retried at 2x = 360s)
@@ -3193,14 +3574,14 @@ class ModelRouter:
                     data_bytes = json.dumps({
                         "model": local_model,
                         "messages": messages,
-                        "max_tokens": model_info.get("max_tokens", 512),
+                        "max_tokens": min(max_tokens, model_info.get("max_tokens", 512)),
                     }).encode()
                     req = urllib.request.Request(
                         "http://localhost:8000/v1/chat/completions",
                         data=data_bytes,
                         headers={"Content-Type": "application/json"}
                     )
-                    local_timeout = deadline.clamp_timeout(30)
+                    local_timeout = deadline.clamp_timeout(min(30, _phase_remaining()))
                     if local_timeout < MIN_LLM_TIMEOUT_SECONDS:
                         raise PipelineTimeoutError(
                             f"{deadline.remaining():.1f}s left — too little for a local call")
@@ -3226,7 +3607,7 @@ class ModelRouter:
                     payload = {
                         "model": model_id,
                         "messages": messages,
-                        "max_tokens": max_tokens_override if max_tokens_override is not None else model_info.get("max_tokens", 1024),
+                        "max_tokens": max_tokens,
                         "temperature": model_info.get("temperature", 0.2),
                     }
                     # Use json_schema for DeepSeek (strict), json_object for others
@@ -3248,7 +3629,8 @@ class ModelRouter:
                                     "Content-Type": "application/json"
                                 }
                             )
-                            attempt_timeout = deadline.clamp_timeout(model_timeout * (attempt + 1))
+                            attempt_timeout = deadline.clamp_timeout(
+                                min(model_timeout * (attempt + 1), _phase_remaining()))
                             if attempt_timeout < MIN_LLM_TIMEOUT_SECONDS:
                                 raise PipelineTimeoutError(
                                     f"{deadline.remaining():.1f}s left — too little for a "
@@ -3257,9 +3639,11 @@ class ModelRouter:
                                 raw = resp.read()
                             break  # success — exit retry loop
                         except urllib.error.URLError as e:
-                            # Don't burn the remaining budget on a retry that cannot fit.
+                            # Don't burn the remaining budget — or the phase's slice —
+                            # on a retry that cannot fit.
                             if ("timed out" in str(e).lower() and attempt == 0
-                                    and not deadline.exhausted()):
+                                    and not deadline.exhausted()
+                                    and _phase_remaining() >= MIN_LLM_TIMEOUT_SECONDS):
                                 # Retry with 2x timeout
                                 continue
                             raise  # Re-raise for outer handler

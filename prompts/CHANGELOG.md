@@ -13,6 +13,44 @@ asserts the three stay in sync.
 
 ---
 
+## v3.0.0 (2026-07-10)
+
+MAJOR: the planner's instructions changed behaviorally, and the error analyst is
+now told when the program it is judging owns a `main()` it cannot see. Fixes the
+PR #13 post-mortem (`prompts/to-fable-post-pr13-gap-analysis.md`), where a run
+spent 181.2s and shipped nothing because `nvidia_shfl_scan.cu` lost its driver.
+
+- DeepSeek system prompt: gains an explicit exception — when handed a mechanically
+  translated HIP draft, plan **only** the wavefront64 semantics delta and keep it to
+  a terse checklist. Restating header swaps and API renames the draft already applies
+  is work whose output the coder discards.
+- DeepSeek plan prompt (`_build_deepseek_plan_prompt`): a `hipified_source` argument
+  switches it to a delta prompt that embeds the HIP draft and **no CUDA original at
+  all** (15,555 → 4,965 chars on `nvidia_shfl_scan.cu`). Output is capped at
+  `PLAN_DELTA_MAX_TOKENS` (640) instead of the 2048 that a 38.2s plan was made of.
+- GLM error-analyst prompt (`_build_glm_error_analysis_prompt`): a `self_contained`
+  flag states that the original CUDA source owns a `main()` which may sit past the
+  3000-char excerpt, so a missing driver must not be reported as a defect. If a
+  linker error does name it, the only correct fix is "restore `main()` from the
+  original source" — never "write a new `main()`" or "add a test harness".
+
+Non-prompt changes shipped alongside (same commit):
+
+- `_extract_main` / `_ensure_main_preserved` / `_postprocess_port`: the coder dropping
+  `main()` from a self-contained program is repaired with a brace-matched extraction
+  from the original, mechanically hipified, **before the first compile**. No model is
+  in that loop. `main()` is cut from the hipified *whole* source, never hipified in
+  isolation — the latter re-injects the helper shims and `#define WAVEFRONT_SIZE`,
+  trading one link error for a dozen redefinition errors.
+- `_is_linker_only` / `_is_missing_main_error`: when every hipcc diagnostic is a link
+  failure, the GLM analyst and both DeepSeek re-plans are skipped. Neither can supply
+  a symbol that is absent; on 2026-07-09 they cost 38.2 + 12.9 + 38.1s to say nothing.
+- Budget-aware refine dispatch: a Kimi refine (and its 1.5x retry) is not started
+  unless the clock holds the call plus `COMPILE_RESERVE_SECONDS`. The old code began a
+  refine with ~31s left and the deadline killed it mid-flight, returning nothing.
+
+---
+
 ## v2.0.0 (2026-07-10)
 
 MAJOR: the coder's instructions changed behaviorally. It is now handed a

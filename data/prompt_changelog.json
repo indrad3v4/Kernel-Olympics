@@ -1,6 +1,24 @@
 {
   "versions": [
     {
+      "version": "v3.0.0",
+      "date": "2026-07-10",
+      "author": "fable",
+      "changes": [
+        "DeepSeek system prompt: when shown a mechanically translated HIP draft, plan only the wavefront64 semantics delta as a terse checklist",
+        "DeepSeek plan prompt: hipified_source switches it to a delta prompt with no CUDA original embedded (15555 -> 4965 chars on nvidia_shfl_scan.cu), capped at PLAN_DELTA_MAX_TOKENS=640",
+        "GLM error-analyst prompt: self_contained flag stops it reporting a truncated-away main() as a defect, and pins the fix to 'restore main() from the original source'",
+        "main() preservation: _extract_main / _ensure_main_preserved / _postprocess_port reattach a dropped driver before the first compile, with no LLM call",
+        "Linker-only short-circuit: _is_linker_only skips the GLM analyst and both DeepSeek re-plans when every diagnostic is a link failure",
+        "Budget-aware refine dispatch: a refine (and its retry) is skipped unless the clock holds the call plus COMPILE_RESERVE_SECONDS"
+      ],
+      "files_changed": [
+        "src/router.py",
+        "tests/test_main_preservation.py"
+      ],
+      "run_results": {}
+    },
+    {
       "version": "v2.0.0",
       "date": "2026-07-10",
       "author": "fable",
@@ -31,5 +49,5 @@
       "run_results": {}
     }
   ],
-  "current": "v2.0.0"
+  "current": "v3.0.0"
 }
