@@ -167,14 +167,14 @@ class TestEnsureMainPreserved:
 class TestPostprocessPort:
     def test_applies_extract_fix_and_restore_in_one_step(self, router):
         raw = f"```cpp\n{PORT_WITHOUT_MAIN}\n```"
-        code, changelog, restored = router._postprocess_port(raw, SELF_CONTAINED_CUDA)
+        code, changelog, restored, _structural = router._postprocess_port(raw, SELF_CONTAINED_CUDA)
         assert restored is True
         assert ModelRouter._is_self_contained(code)
         assert any("main() restored" in c for c in changelog)
 
     def test_reports_no_restore_when_none_was_needed(self, router):
         raw = f"```cpp\n{SELF_CONTAINED_CUDA}\n```"
-        _, changelog, restored = router._postprocess_port(raw, SELF_CONTAINED_CUDA)
+        _, changelog, restored, _structural = router._postprocess_port(raw, SELF_CONTAINED_CUDA)
         assert restored is False
         assert not any("main() restored" in c for c in changelog)
 
@@ -184,14 +184,14 @@ class TestPostprocessPort:
         main() AFTER the mechanical pass means the file was not self-contained at
         fix time, so the shims were never injected and the driver we just
         reattached called findCudaDevice into a void."""
-        code, _, restored = router._postprocess_port(
+        code, _, restored, _structural = router._postprocess_port(
             PORT_WITHOUT_MAIN, SELF_CONTAINED_CUDA)
         assert restored is True
         assert "static inline int findCudaDevice" in code
         assert "struct StopWatchInterface {" in code
 
     def test_restored_driver_is_hipified_by_the_mechanical_pass(self, router):
-        code, _, _ = router._postprocess_port(PORT_WITHOUT_MAIN, SELF_CONTAINED_CUDA)
+        code, _, _, _ = router._postprocess_port(PORT_WITHOUT_MAIN, SELF_CONTAINED_CUDA)
         tail = code.split("main() restored")[1]
         assert "hipMalloc" in tail and "hipFree" in tail
         assert ModelRouter._residual_cuda_symbols(tail) == []
@@ -202,8 +202,8 @@ class TestPostprocessPort:
         #include and discards every line above it, marker included — so the next
         pass re-injected the block and hipcc reported a redefinition of
         StopWatchInterface. The guard now keys on the definitions themselves."""
-        once, _, _ = router._postprocess_port(PORT_WITHOUT_MAIN, SELF_CONTAINED_CUDA)
-        twice, _, restored = router._postprocess_port(once, SELF_CONTAINED_CUDA)
+        once, _, _, _ = router._postprocess_port(PORT_WITHOUT_MAIN, SELF_CONTAINED_CUDA)
+        twice, _, restored, _ = router._postprocess_port(once, SELF_CONTAINED_CUDA)
         assert restored is False
         assert twice.count("struct StopWatchInterface {") == 1
         assert twice.count("static inline int findCudaDevice") == 1
@@ -244,7 +244,7 @@ class TestRestoreDependencies:
         port = ("#include <hip/hip_runtime.h>\n"
                 "__global__ void k(float* x) { x[threadIdx.x] = 0.f; }\n"
                 "bool portable_test(int argc, char** argv) { return true; }\n")
-        code, changelog, restored = router._postprocess_port(port, CUDA_WITH_HELPER)
+        code, changelog, restored, _ = router._postprocess_port(port, CUDA_WITH_HELPER)
         assert restored is False
         assert "header_dependent_test" not in code
         assert any("NOT restored" in c and "header_dependent_test" in c
@@ -255,7 +255,7 @@ class TestRestoreDependencies:
                 "__global__ void k(float* x) { x[threadIdx.x] = 0.f; }\n"
                 "bool portable_test(int argc, char** argv) { return true; }\n"
                 "bool header_dependent_test() { return true; }\n")
-        code, _, restored = router._postprocess_port(port, CUDA_WITH_HELPER)
+        code, _, restored, _ = router._postprocess_port(port, CUDA_WITH_HELPER)
         assert restored is True
         assert ModelRouter._is_self_contained(code)
 

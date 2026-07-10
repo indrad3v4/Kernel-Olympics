@@ -26,6 +26,10 @@ logger = logging.getLogger(__name__)
 
 from prompt_evolution import prompt_opt, PromptOptimizer
 from verification.spec_parser import auto_generate_spec as _auto_gen_spec
+from verification.structural import (
+    validate_structure as _validate_structure,
+    ValidationResult as _StructuralResult,
+)
 
 
 def _force_ipv4():
@@ -1275,7 +1279,7 @@ class ModelRouter:
     def _postprocess_port(self, model_output: str, kernel_source: str):
         """Turn a raw coder response into the code the compiler will actually see.
 
-        Returns ``(code, regex_changelog, main_restored)``.
+        Returns ``(code, regex_changelog, main_restored, structural)``.
 
         Every path that accepts model output — the initial port, a refine, and the
         refine's retry — must apply the same steps in the same order, or the
@@ -1289,6 +1293,12 @@ class ModelRouter:
         into a void. Restoring first also means the driver is hipified by that same
         pass — it is never hipified in isolation, which is what used to duplicate
         the shim block and #define WAVEFRONT_SIZE.
+
+        The structural report is computed against the FINAL code (after main-restore
+        and the mechanical pass) so it reflects exactly what hipcc will see. It is
+        the single choke point that gates every generation the loop consumes; wiring
+        it here means the initial Kimi call, the refine, and the refine-retry all
+        pay the ~1ms check before a 60s hipcc call fires on a truncated brace.
         """
         code = self._extract_code(model_output)
 
@@ -1316,7 +1326,18 @@ class ModelRouter:
                 + ", ".join(blockers)
                 + ", which this port does not define; reattaching it would create an "
                   "undefined symbol instead of fixing one")
-        return code, changelog, restored
+
+        # Structural gate against the post-fix code, not the raw extract: hipcc will
+        # see the fixed version, so that is what must stand up. A failure here is a
+        # hard reject upstream (see the loop's pre-compile check), so keep this
+        # scoped strictly to defects that cannot occur in valid C++.
+        try:
+            structural = _validate_structure(kernel_source, code)
+        except Exception as _sv_exc:  # never let the gate itself take down the loop
+            logger.debug("structural validation errored: %s", _sv_exc)
+            structural = _StructuralResult(ok=True, warnings=["structural check errored"])
+
+        return code, changelog, restored, structural
 
     @staticmethod
     def _is_self_contained(source: str) -> bool:
@@ -1820,7 +1841,8 @@ class ModelRouter:
                                   stagnation_count: int = 0,
                                   regex_changelog: Optional[List[str]] = None,
                                   frozen_base_code: str = "",
-                                  preprocessed_source: str = "") -> str:
+                                  preprocessed_source: str = "",
+                                  structural_report: Optional[Dict] = None) -> str:
         """Build the Kimi refinement prompt for orchestration loop iterations.
 
         Kimi receives the original kernel, its previous output, and
@@ -1917,6 +1939,27 @@ class ModelRouter:
             prompt += (
                 f"\nAUTO-FIXED ITEMS (already applied — do NOT redo):\n{changelog_text}\n\n"
             )
+
+        # ── Structural report from the pre-hipcc gate ──
+        # These are text-level defects the compiler will otherwise reproduce every
+        # iteration (unbalanced braces, dropped helpers, duplicated bodies). Naming
+        # them here means the coder acts on the shape of its own output, not on a
+        # parser error whose root cause is that shape.
+        if structural_report:
+            struct_lines = []
+            if structural_report.get("errors"):
+                struct_lines.append("STRUCTURAL ERRORS (blocked hipcc — fix these FIRST):")
+                struct_lines.extend(f"  ❌ {e}" for e in structural_report["errors"])
+            if structural_report.get("missing_symbols"):
+                struct_lines.append(
+                    "SYMBOLS DROPPED from the original CUDA source (restore them):")
+                struct_lines.append(
+                    "  " + ", ".join(structural_report["missing_symbols"][:12]))
+            if structural_report.get("warnings"):
+                struct_lines.append("STRUCTURAL WARNINGS:")
+                struct_lines.extend(f"  ⚠ {w}" for w in structural_report["warnings"][:6])
+            if struct_lines:
+                prompt += "\n" + "\n".join(struct_lines) + "\n\n"
 
         # ── Mechanical pass already applied (see _hipify_source) ──
         # Cheap to say, expensive to rediscover: without it each refine spends
@@ -2448,7 +2491,7 @@ class ModelRouter:
             # P0: the coder dropping main() on a self-contained program cost the
             # 2026-07-09 run its whole budget. Restore it here, before the first
             # compile, so no LLM phase ever sees the resulting link error.
-            extracted, regex_changelog, main_restored = self._postprocess_port(
+            extracted, regex_changelog, main_restored, structural = self._postprocess_port(
                 code.output, kernel_source)
             if main_restored:
                 result["changes"].append(
@@ -2464,7 +2507,47 @@ class ModelRouter:
                               f"dropped{'':<6}║")
             result["ported_code"] = extracted
             result["regex_changelog"] = regex_changelog  # A3: track regex fixes
-            if verifier and hasattr(verifier, 'quick_compile_check'):
+            result["structural"] = {
+                "ok": structural.ok,
+                "reason": structural.reason(),
+                "missing_symbols": list(structural.missing_symbols),
+                "warnings": list(structural.warnings),
+                "errors": list(structural.errors),
+            }
+            # ── Pre-hipcc structural gate ──
+            # A 60s hipcc call on an unbalanced brace, a truncation marker, or a
+            # gutted file only teaches the compiler what a text-level check would
+            # have caught in <1ms. When the gate rejects, we skip the compile and
+            # let the loop feed the structural report to Kimi as targeted feedback
+            # on the first refine — the budget saved here is what buys the extra
+            # repair iterations F1's whole point is to enable.
+            if not structural.ok:
+                for _err in structural.errors:
+                    result["changes"].append(f"[structural] REJECT: {_err}")
+                print(f"║  │  🧱 STRUCTURAL REJECT: {structural.reason()[:38]:<38}║")
+                evaluator_feedback = (
+                    "STRUCTURAL VALIDATION FAILED — your last output cannot be "
+                    "compiled because it is not valid C++ at the text level.\n"
+                    + "; ".join(structural.errors)
+                    + (f"\nSymbols missing vs the original: "
+                       + ", ".join(structural.missing_symbols)
+                       if structural.missing_symbols else "")
+                    + "\nRe-emit the COMPLETE ported HIP kernel with balanced braces "
+                      "and no truncation markers. Preserve every function present in "
+                      "the original CUDA source."
+                )
+                # Skip the pre-loop hipcc — the refine loop below will pick up
+                # this feedback and drive the next Kimi call.
+                result["compile_errors"] = [
+                    f"[structural] {e}" for e in structural.errors]
+                result["compile_error_history"].append(
+                    {"iteration": 0, "errors": list(result["compile_errors"])})
+                prev_error_count = len(result["compile_errors"])
+                prev_errors_set = set(result["compile_errors"])
+                prev_errors_norm = prev_errors_set
+                # Fall through past the initial hipcc block into the refine loop;
+                # the two unconditional lines below still fire.
+            elif verifier and hasattr(verifier, 'quick_compile_check'):
                 if on_phase: on_phase("compile", "hipcc", "in-loop compilation check")
                 cc = verifier.quick_compile_check(extracted, kernel_name=kernel_name)
                 if cc["compile_success"]:
@@ -2613,15 +2696,65 @@ class ModelRouter:
             # Same reason: the informed re-plan reads linker_only, which is otherwise
             # only bound on the compile-failure path.
             linker_only = False
-            if verifier and hasattr(verifier, 'quick_compile_check'):
+            # ── Pre-compile structural gate for THIS iteration's code ──
+            # The refine that produced result["ported_code"] set result["structural"];
+            # if it flagged a hard defect, hipcc will only reproduce parser noise the
+            # coder never introduced. Convert the structural report into synthetic
+            # compile errors and skip hipcc so the next refine iteration hits.
+            iter_structural = result.get("structural")
+            if iter_structural and not iter_structural.get("ok", True):
+                compile_failed_this_iter = True
+                struct_errs = [f"[structural] {e}"
+                               for e in iter_structural.get("errors", [])]
+                if iter_structural.get("missing_symbols"):
+                    struct_errs.append(
+                        "[structural] symbols dropped: "
+                        + ", ".join(iter_structural["missing_symbols"][:8]))
+                result["compile_errors"] = struct_errs
+                result["compile_error_history"].append(
+                    {"iteration": iteration, "errors": list(struct_errs)})
+                try:
+                    (run_dir / f"iteration_{iteration}_structural.json").write_text(
+                        json.dumps({
+                            "iteration": iteration,
+                            "gate": "structural",
+                            "compile_success": False,
+                            "structural": iter_structural,
+                            "ported_code_preview": (result["ported_code"] or "")[:2000],
+                        }, indent=2), encoding="utf-8")
+                except (OSError, TypeError, ValueError) as _log_exc:
+                    logger.debug("structural log skipped: %s", _log_exc)
+                result["changes"].append(
+                    f"[structural] Iter {iteration}: rejected before hipcc — "
+                    + "; ".join(iter_structural.get("errors", [])[:2])[:120])
+                print(f"║  │  🧱 STRUCTURAL GATE (iter {iteration}): hipcc skipped "
+                      f"— see structural feedback{'':<3}║")
+                evaluator_feedback = (
+                    "STRUCTURAL VALIDATION FAILED (iter {}). hipcc was NOT run — "
+                    "the code has defects that would only produce parser noise.\n"
+                    "Errors: {}\n"
+                    "Missing symbols vs original: {}\n"
+                    "Re-emit the COMPLETE port with balanced braces, no truncation "
+                    "markers, and every function from the original CUDA present."
+                ).format(
+                    iteration,
+                    "; ".join(iter_structural.get("errors", [])),
+                    ", ".join(iter_structural.get("missing_symbols", [])) or "(none reported)",
+                )
+                # Fall through past the hipcc block into the refine step.
+            elif verifier and hasattr(verifier, 'quick_compile_check'):
                 if on_phase: on_phase("compile", "hipcc", f"compile-first check (attempt {iteration}/{max_iterations})")
                 cc = verifier.quick_compile_check(result["ported_code"], kernel_name=kernel_name)
-                # I3: Log iteration compile result for reproducibility
+                # I3: Log iteration compile result for reproducibility.
+                # Now includes the structural score and dropped symbols so a failing
+                # iteration is diagnosable from its JSON alone.
                 try:
                     (run_dir / f"iteration_{iteration}_compile.json").write_text(
                         json.dumps({"iteration": iteration,
                                     "compile_success": cc["compile_success"],
-                                    "errors": cc.get("errors", [])[:8]},
+                                    "errors": cc.get("errors", [])[:8],
+                                    "structural": iter_structural or {},
+                                    "ported_code_preview": (result["ported_code"] or "")[:2000]},
                                    indent=2), encoding="utf-8")
                 except (OSError, TypeError, ValueError) as _log_exc:
                     logger.debug("run-dir logging skipped: %s", _log_exc)
@@ -3493,6 +3626,7 @@ class ModelRouter:
                     # is no good baseline to freeze, and a rewrite is what we want.
                     frozen_base_code=(frozen_base_code if run_crashed_this_iter else ""),
                     preprocessed_source=hipified_source,
+                    structural_report=result.get("structural"),
                 )
                 refine = self._call_model(
                     "kimi27", refine_prompt,
@@ -3501,7 +3635,7 @@ class ModelRouter:
                     max_tokens_override=adaptive_tokens,
                 )
                 if refine.success:
-                    extracted, regex_changelog, main_restored = self._postprocess_port(
+                    extracted, regex_changelog, main_restored, structural = self._postprocess_port(
                         refine.output, kernel_source)
                     if main_restored:
                         result["changes"].append(
@@ -3509,6 +3643,25 @@ class ModelRouter:
                             f"restored from the original CUDA source")
                     result["ported_code"] = extracted
                     result["regex_changelog"] = regex_changelog  # A3: track regex fixes
+                    result["structural"] = {
+                        "ok": structural.ok,
+                        "reason": structural.reason(),
+                        "missing_symbols": list(structural.missing_symbols),
+                        "warnings": list(structural.warnings),
+                        "errors": list(structural.errors),
+                    }
+                    if not structural.ok:
+                        # A refine that broke the file structurally is the same
+                        # failure mode as the initial-port reject above: hipcc
+                        # will fail with parser noise the model never introduced.
+                        # Flag it so the next iteration's compile-fail branch
+                        # treats it as a structural regression rather than a
+                        # real error to chase.
+                        for _err in structural.errors:
+                            result["changes"].append(
+                                f"[structural] refine at iter {iteration}: {_err}")
+                        print(f"║  │  🧱 STRUCTURAL REJECT (refine): "
+                              f"{structural.reason()[:31]:<31}║")
                     result["changes"].append(
                         f"[kimi27] Refined with {feedback_label} "
                         f"(iteration {iteration} → {iteration + 1})")
@@ -3540,7 +3693,7 @@ class ModelRouter:
                     )
                     MODEL_CATALOG["kimi27"]["timeout"] = original_timeout
                     if retry_refine.success:
-                        extracted, regex_changelog, main_restored = self._postprocess_port(
+                        extracted, regex_changelog, main_restored, structural = self._postprocess_port(
                             retry_refine.output, kernel_source)
                         if main_restored:
                             result["changes"].append(
@@ -3548,6 +3701,17 @@ class ModelRouter:
                                 f"restored from the original CUDA source")
                         result["ported_code"] = extracted
                         result["regex_changelog"] = regex_changelog
+                        result["structural"] = {
+                            "ok": structural.ok,
+                            "reason": structural.reason(),
+                            "missing_symbols": list(structural.missing_symbols),
+                            "warnings": list(structural.warnings),
+                            "errors": list(structural.errors),
+                        }
+                        if not structural.ok:
+                            for _err in structural.errors:
+                                result["changes"].append(
+                                    f"[structural] retry at iter {iteration}: {_err}")
                         result["changes"].append(
                             f"[kimi27] Retry succeeded with {feedback_label} "
                             f"(iteration {iteration} → {iteration + 1})")
