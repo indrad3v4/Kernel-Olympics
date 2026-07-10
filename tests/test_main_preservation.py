@@ -402,10 +402,10 @@ class TestRouteLinkerShortCircuit:
         hipcc never sees `undefined symbol: main` and no LLM phase is ever asked to
         reason about it. The 2026-07-09 run spent its whole budget on that question."""
         def side_effect(model_key, *a, **k):
-            if model_key == "kimi27":
+            if model_key == "glm":
                 return AgentResult(model_key, True,
                                    f"```cpp\n{PORT_WITHOUT_MAIN}\n```", 0.5)
-            if model_key == "glm":
+            if model_key == "kimi27":
                 return AgentResult(model_key, True, '{"pass": true, "issues": []}', 0.9)
             return AgentResult(model_key, True, "plan", 0.5)
         mock_call.side_effect = side_effect
@@ -429,7 +429,7 @@ class TestRouteLinkerShortCircuit:
         assert ModelRouter._is_self_contained(compiled)
 
         called = [c.args[0] for c in mock_call.call_args_list]
-        assert called.count("kimi27") == 1, f"coder was re-invoked: {called}"
+        assert called.count("glm") == 1, f"coder was re-invoked: {called}"
         assert called.count("deepseek") == 1, f"planner re-ran: {called}"
 
     @patch.object(ModelRouter, '_call_model')
@@ -440,7 +440,7 @@ class TestRouteLinkerShortCircuit:
                  "clang++: error: linker command failed with exit code 1"]
 
         def side_effect(model_key, *a, **k):
-            if model_key == "kimi27":
+            if model_key == "glm":
                 return AgentResult(model_key, True,
                                    f"```cpp\n{SELF_CONTAINED_CUDA}\n```", 0.5)
             return AgentResult(model_key, True, "plan", 0.5)
@@ -456,7 +456,7 @@ class TestRouteLinkerShortCircuit:
                               max_seconds=0, fast_path=False)
 
         called = [c.args[0] for c in mock_call.call_args_list]
-        assert "glm" not in called, f"GLM analyst ran on a link error: {called}"
+        assert "kimi27" not in called, f"Kimi analyst ran on a link error: {called}"
         assert called.count("deepseek") == 1, f"a re-plan fired: {called}"
         assert any("[linker]" in c for c in result["changes"])
 
@@ -568,13 +568,13 @@ class TestRefineBudgetGuard:
                    for c in result["changes"]), result["changes"]
 
         # Exactly one coder call: the initial port. The refine was never dispatched.
-        kimi = [c for c in mock_call.call_args_list if c.args[0] == "kimi27"]
-        assert len(kimi) == 1, f"a refine was dispatched anyway: {len(kimi)} calls"
+        glm_calls = [c for c in mock_call.call_args_list if c.args[0] == "glm"]
+        assert len(glm_calls) == 1, f"a refine was dispatched anyway: {len(glm_calls)} calls"
 
     @patch.object(ModelRouter, '_call_model')
     def test_refine_call_receives_a_max_seconds_cap(self, mock_call, router):
         def side_effect(model_key, *a, **k):
-            if model_key == "kimi27":
+            if model_key == "glm":
                 return AgentResult(model_key, True,
                                    f"```cpp\n{SELF_CONTAINED_CUDA}\n```", 0.5)
             return AgentResult(model_key, True, '{"fixes": []}', 0.5)
@@ -588,16 +588,16 @@ class TestRefineBudgetGuard:
         router.route(SELF_CONTAINED_CUDA, [], max_iterations=2, verifier=verifier,
                      kernel_name="test_refinecap", max_seconds=180, fast_path=False)
 
-        kimi = [c for c in mock_call.call_args_list if c.args[0] == "kimi27"]
-        assert len(kimi) >= 2, "no refine happened"
-        refine = kimi[1]
+        glm_calls = [c for c in mock_call.call_args_list if c.args[0] == "glm"]
+        assert len(glm_calls) >= 2, "no refine happened"
+        refine = glm_calls[1]
         assert refine.kwargs.get("max_seconds") is not None
         assert refine.kwargs["max_seconds"] <= 180 - COMPILE_RESERVE_SECONDS
 
     @patch.object(ModelRouter, '_call_model')
     def test_unlimited_budget_leaves_the_refine_uncapped(self, mock_call, router):
         def side_effect(model_key, *a, **k):
-            if model_key == "kimi27":
+            if model_key == "glm":
                 return AgentResult(model_key, True,
                                    f"```cpp\n{SELF_CONTAINED_CUDA}\n```", 0.5)
             return AgentResult(model_key, True, '{"fixes": []}', 0.5)
@@ -611,6 +611,6 @@ class TestRefineBudgetGuard:
         router.route(SELF_CONTAINED_CUDA, [], max_iterations=2, verifier=verifier,
                      kernel_name="test_refineunl", max_seconds=0, fast_path=False)
 
-        kimi = [c for c in mock_call.call_args_list if c.args[0] == "kimi27"]
-        assert len(kimi) >= 2
-        assert kimi[1].kwargs.get("max_seconds") is None
+        glm_calls = [c for c in mock_call.call_args_list if c.args[0] == "glm"]
+        assert len(glm_calls) >= 2
+        assert glm_calls[1].kwargs.get("max_seconds") is None

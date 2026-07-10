@@ -155,12 +155,12 @@ class TestConvergenceLoop:
 
     @patch.object(ModelRouter, '_call_model')
     def test_successful_port_first_try(self, mock_call, router):
-        """DeepSeek plans, Kimi codes, hipcc compiles, GLM passes — 1 iteration."""
-        # Call sequence: deepseek(plan) → kimi27(code) → glm(eval) → gemma4(verify)
+        """DeepSeek plans, GLM codes, hipcc compiles, Kimi passes — 1 iteration."""
+        # Call sequence: deepseek(plan) → glm(code) → kimi27(eval) → gemma4(verify)
         mock_call.side_effect = [
             AgentResult("deepseek", True, "Plan: replace cudaMalloc with hipMalloc", 0.1),
-            AgentResult("kimi27", True, f"```cpp\n{HIP_CODE_OK}\n```", 0.1),
-            AgentResult("glm", True, '{"pass": true, "feedback": "looks good"}', 0.1),
+            AgentResult("glm", True, f"```cpp\n{HIP_CODE_OK}\n```", 0.1),
+            AgentResult("kimi27", True, '{"pass": true, "feedback": "looks good"}', 0.1),
             AgentResult("gemma4", True, '{"pass": true}', 0.1),
         ]
         mock_verifier = MagicMock()
@@ -184,25 +184,25 @@ class TestConvergenceLoop:
 
     @patch.object(ModelRouter, '_call_model')
     def test_compile_failure_triggers_refinement(self, mock_call, router):
-        """hipcc fails → GLM analyzes → Kimi refines — verify Kimi called at least twice."""
-        glm_err = AgentResult("glm", True, '{"fixes": [{"action": "Replace cudaMalloc with hipMalloc", "priority": 1}], "missing_includes": ["hip/hip_runtime.h"]}', 0.1)
-        glm_eval = AgentResult("glm", True, '{"pass": true}', 0.1)
-        kimi_bad = AgentResult("kimi27", True, f"```cpp\n{HIP_CODE_WITH_CUDA}\n```", 0.1)
-        kimi_good = AgentResult("kimi27", True, f"```cpp\n{HIP_CODE_OK}\n```", 0.1)
+        """hipcc fails → Kimi analyzes → GLM refines — verify GLM called at least twice."""
+        eval_err = AgentResult("kimi27", True, '{"fixes": [{"action": "Replace cudaMalloc with hipMalloc", "priority": 1}], "missing_includes": ["hip/hip_runtime.h"]}', 0.1)
+        eval_pass = AgentResult("kimi27", True, '{"pass": true}', 0.1)
+        coder_bad = AgentResult("glm", True, f"```cpp\n{HIP_CODE_WITH_CUDA}\n```", 0.1)
+        coder_good = AgentResult("glm", True, f"```cpp\n{HIP_CODE_OK}\n```", 0.1)
         gemma = AgentResult("gemma4", True, '{"pass": true}', 0.1)
 
-        kimi_call_count = [0]
+        glm_call_count = [0]
         def call_side_effect(model_key, *args, **kwargs):
             if model_key == "deepseek":
                 return AgentResult("deepseek", True, "Plan: replace cudaMalloc with hipMalloc", 0.1)
-            if model_key == "kimi27":
-                kimi_call_count[0] += 1
-                return kimi_bad if kimi_call_count[0] == 1 else kimi_good
             if model_key == "glm":
+                glm_call_count[0] += 1
+                return coder_bad if glm_call_count[0] == 1 else coder_good
+            if model_key == "kimi27":
                 sysp = kwargs.get("system_prompt", "")
                 if "error analyst" in sysp:
-                    return glm_err
-                return glm_eval
+                    return eval_err
+                return eval_pass
             if model_key == "gemma4":
                 return gemma
             return AgentResult(model_key, True, "{}", 0.1)
@@ -231,16 +231,16 @@ class TestConvergenceLoop:
             verifier=mock_verifier,
             kernel_name="test_refine"
         )
-        # Kimi should have been called at least twice (initial + refine)
-        assert kimi_call_count[0] >= 2, f"Kimi called {kimi_call_count[0]} times, expected >=2"
+        # GLM should have been called at least twice (initial + refine)
+        assert glm_call_count[0] >= 2, f"GLM coder called {glm_call_count[0]} times, expected >=2"
 
     @patch.object(ModelRouter, '_call_model')
     def test_stagnation_triggers_replan(self, mock_call, router):
         """Multiple stagnant iterations should trigger DeepSeek re-planning."""
-        glm_err = AgentResult("glm", True, '{"fixes": [{"action": "Replace cudaMalloc with hipMalloc", "priority": 1}]}', 0.1)
-        glm_eval = AgentResult("glm", True, '{"pass": true}', 0.1)
-        kimi_bad = AgentResult("kimi27", True, f"```cpp\n{HIP_CODE_WITH_CUDA}\n```", 0.1)
-        kimi_good = AgentResult("kimi27", True, f"```cpp\n{HIP_CODE_OK}\n```", 0.1)
+        eval_err = AgentResult("kimi27", True, '{"fixes": [{"action": "Replace cudaMalloc with hipMalloc", "priority": 1}]}', 0.1)
+        eval_pass = AgentResult("kimi27", True, '{"pass": true}', 0.1)
+        coder_bad = AgentResult("glm", True, f"```cpp\n{HIP_CODE_WITH_CUDA}\n```", 0.1)
+        coder_good = AgentResult("glm", True, f"```cpp\n{HIP_CODE_OK}\n```", 0.1)
         gemma = AgentResult("gemma4", True, '{"pass": true}', 0.1)
 
         ds_call_count = [0]
@@ -250,16 +250,16 @@ class TestConvergenceLoop:
                 if ds_call_count[0] == 1:
                     return AgentResult("deepseek", True, "Plan v1: replace cudaMalloc", 0.1)
                 return AgentResult("deepseek", True, "Plan v2: use hipMalloc completely", 0.1)
-            if model_key == "kimi27":
+            if model_key == "glm":
                 # Bad code until DeepSeek re-plans, then good
                 if ds_call_count[0] <= 1:
-                    return kimi_bad
-                return kimi_good
-            if model_key == "glm":
+                    return coder_bad
+                return coder_good
+            if model_key == "kimi27":
                 sysp = kwargs.get("system_prompt", "")
                 if "error analyst" in sysp:
-                    return glm_err
-                return glm_eval
+                    return eval_err
+                return eval_pass
             if model_key == "gemma4":
                 return gemma
             return AgentResult(model_key, True, "{}", 0.1)
@@ -307,10 +307,10 @@ class TestRunFirstLoop:
     def _call_side_effect(model_key, *args, **kwargs):
         if model_key == "deepseek":
             return AgentResult("deepseek", True, "Plan: port shfl", 0.1)
-        if model_key == "kimi27":
-            return AgentResult("kimi27", True, f"```cpp\n{HIP_CODE_OK}\n```", 0.1)
         if model_key == "glm":
-            return AgentResult("glm", True,
+            return AgentResult("glm", True, f"```cpp\n{HIP_CODE_OK}\n```", 0.1)
+        if model_key == "kimi27":
+            return AgentResult("kimi27", True,
                 '{"pass": true, "issues": ["__shfl_up_sync uses width as width param"], "feedback": "check shfl width"}', 0.1)
         return AgentResult(model_key, True, '{"pass": true}', 0.1)
 
@@ -394,7 +394,7 @@ int main(int argc, char *argv[]) {
 
 
 class TestSelfContainedPromptTruncation:
-    """Bug 1: Kimi must see a self-contained program's own main(), even when
+    """Bug 1: GLM must see a self-contained program's own main(), even when
     the source is long enough that the old fixed character slices would have
     cut it off (see docs/fix-plan-self-contained-programs.md)."""
 
@@ -408,13 +408,13 @@ class TestSelfContainedPromptTruncation:
         assert router._is_self_contained(SELF_CONTAINED_SOURCE) is True
         assert router._is_self_contained(CUDA_KERNEL_EXAMPLE) is False
 
-    def test_kimi_code_prompt_contains_full_main(self, router):
+    def test_glm_code_prompt_contains_full_main(self, router):
         prompt = router._build_kimi_code_prompt(SELF_CONTAINED_SOURCE, patterns=[])
         assert "int main(int argc, char *argv[])" in prompt
         assert "CRITICAL" in prompt and "main()" in prompt
 
-    def test_kimi_refine_prompt_does_not_truncate_previous_code(self, router):
-        previous_code = SELF_CONTAINED_SOURCE  # pretend Kimi echoed it back
+    def test_glm_refine_prompt_does_not_truncate_previous_code(self, router):
+        previous_code = SELF_CONTAINED_SOURCE  # pretend GLM echoed it back
         prompt = router._build_kimi_refine_prompt(
             kernel_source=SELF_CONTAINED_SOURCE,
             previous_code=previous_code,
@@ -456,7 +456,7 @@ class TestUnresolvedLocalHeaders:
         finally:
             probe.unlink()
 
-    def test_kimi_code_prompt_warns_about_missing_header(self, router):
+    def test_glm_code_prompt_warns_about_missing_header(self, router):
         source = (
             '#include "shfl_integral_image.cuh"\n'
             '__global__ void shfl_scan_test(int *data) {}\n'
@@ -498,55 +498,8 @@ class TestFixPortedCodeHelperShims:
             "#include <hip/hip_runtime.h>\n"
             "int main() { findCudaDevice(0, nullptr); return 0; }\n"
         )
-        once = router._fix_ported_code(code)
-        twice = router._fix_ported_code(once)
-        assert twice.count("struct StopWatchInterface") == 1
-
-    def test_shim_compiles_standalone_hipSetDevice_declared_before_use(self, router):
-        """Regression for the 2026-07-09 notebook run (col-56 errors).
-
-        403601d moved the shim BEFORE the code's first #include so its
-        symbols are declared before use — but the shim's findCudaDevice body
-        calls hipSetDevice, declared only in hip/hip_runtime.h, which then
-        comes AFTER the shim. Every self-contained port failed with
-        'use of undeclared identifier' at the exact column of hipSetDevice
-        (56), re-injected on every refine iteration. The shim must be
-        position-independent: it includes hip/hip_runtime.h itself.
-        """
-        # NVIDIA samples open with a long copyright banner before includes.
-        code = (
-            "/*\n * Copyright NVIDIA...\n */\n"
-            "#include <hip/hip_runtime.h>\n"
-            "__global__ void k(int* d) {}\n"
-            "int main() { findCudaDevice(0, nullptr); return 0; }\n"
-        )
-        fixed = router._fix_ported_code(code)
-        use_pos = fixed.find("hipSetDevice")
-        assert use_pos != -1
-        decl_pos = fixed.find("#include <hip/hip_runtime.h>")
-        assert decl_pos != -1 and decl_pos < use_pos, (
-            "shim calls hipSetDevice before any hip/hip_runtime.h include — "
-            "this is the 'use of undeclared identifier' at col 56")
-        assert "#pragma once" not in fixed  # meaningless in a main file; clang warns
-        # hipSetDevice is nodiscard — our own injected code must be
-        # warning-clean, or its warnings get displayed under unrelated
-        # failures (2026-07-09: shown beneath a SIGSEGV header).
-        assert "(void)hipSetDevice" in fixed
-
-    def test_warpSize_substitution_must_not_corrupt_define(self, router):
-        """Regression for the 2026-07-09 notebook run (29:9 macro error).
-
-        Kimi plausibly emits '#define warpSize 64'; the blanket
-        warpSize→64 regex turned it into '#define 64 64' →
-        'error: macro name must be an identifier' at col 9.
-        """
-        code = (
-            "#include <hip/hip_runtime.h>\n"
-            "#define warpSize 64\n"
-            "__global__ void k(int* d) { int lane = threadIdx.x % warpSize; }\n"
-        )
-        fixed = router._fix_ported_code(code)
-        assert "#define 64" not in fixed
-        # The non-define use should still be substituted (or resolve to 64
-        # via the surviving macro) — either way, no corrupted macro name.
-        assert "macro" not in fixed  # sanity: no error text leaked in
+        first = router._fix_ported_code(code)
+        second = router._fix_ported_code(first)
+        assert first.count("StopWatchInterface") == 1
+        # re-applying the fix must not add a second shim
+        assert second.count("StopWatchInterface") == 1

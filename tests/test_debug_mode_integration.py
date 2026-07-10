@@ -73,19 +73,19 @@ class FakeVerifier:
 
 
 def _fake_models(coder_outputs):
-    """Build a _call_model_impl that replays *coder_outputs* for kimi27."""
+    """Build a _call_model_impl that replays *coder_outputs* for glm."""
     state = {"i": 0}
 
     def impl(self, model_key, prompt, system_prompt="", prefill="",
              max_seconds=None, max_tokens_override=None):
         if model_key == "deepseek":
             return AgentResult("deepseek", True, "Plan:\n1. 64-bit mask", 0.8, 120, 3800.0)
-        if model_key == "kimi27":
+        if model_key == "glm":
             i = min(state["i"], len(coder_outputs) - 1)
             state["i"] += 1
-            return AgentResult("kimi27", True, coder_outputs[i], 0.7, 900, 12000.0)
-        if model_key == "glm":
-            return AgentResult("glm", True,
+            return AgentResult("glm", True, coder_outputs[i], 0.7, 900, 12000.0)
+        if model_key == "kimi27":
+            return AgentResult("kimi27", True,
                                '{"pass":true,"issues":[],"feedback":"ok"}', 0.9, 300, 5000.0)
         return AgentResult(model_key, False, "", 0.0)
     return impl

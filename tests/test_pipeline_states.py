@@ -149,13 +149,13 @@ def _plan_result():
     return AgentResult("deepseek", True, "Plan: swap cuda* for hip*", 0.1)
 
 
-def _glm_pass():
-    return AgentResult("glm", True, '{"pass": true, "feedback": "ok"}', 0.1)
+def _eval_pass():
+    return AgentResult("kimi27", True, '{"pass": true, "feedback": "ok"}', 0.1)
 
 
-def _glm_err_analysis():
+def _eval_err_analysis():
     return AgentResult(
-        "glm", True,
+        "kimi27", True,
         '{"fixes": [{"action": "swap cudaMalloc for hipMalloc", "priority": 1}], '
         '"missing_includes": ["hip/hip_runtime.h"]}',
         0.1,
@@ -166,8 +166,8 @@ def _gemma_pass():
     return AgentResult("gemma4", True, '{"pass": true}', 0.1)
 
 
-def _kimi(source):
-    return AgentResult("kimi27", True, f"```cpp\n{source}\n```", 0.1)
+def _coder(source):
+    return AgentResult("glm", True, f"```cpp\n{source}\n```", 0.1)
 
 
 class TestStructuralReject:
@@ -189,10 +189,10 @@ class TestStructuralReject:
         def dispatch(model_key, *args, **kwargs):
             if model_key == "deepseek":
                 return _plan_result()
-            if model_key == "kimi27":
-                return _kimi(HIP_CODE_STRUCTURAL_BAD)
             if model_key == "glm":
-                return _glm_pass()
+                return _coder(HIP_CODE_STRUCTURAL_BAD)
+            if model_key == "kimi27":
+                return _eval_pass()
             if model_key == "gemma4":
                 return _gemma_pass()
             return AgentResult(model_key, True, "{}", 0.1)
@@ -232,12 +232,12 @@ class TestStructuralReject:
         (regex-hipified original source), which is unrelated — the invariant
         is that the truncation marker never reaches the compiler."""
         def dispatch(model_key, *args, **kwargs):
-            if model_key == "kimi27":
-                return _kimi(HIP_CODE_STRUCTURAL_BAD)
+            if model_key == "glm":
+                return _coder(HIP_CODE_STRUCTURAL_BAD)
             if model_key == "deepseek":
                 return _plan_result()
-            if model_key == "glm":
-                return _glm_pass()
+            if model_key == "kimi27":
+                return _eval_pass()
             return AgentResult(model_key, True, "{}", 0.1)
 
         mock_call.side_effect = dispatch
@@ -275,13 +275,13 @@ class TestStructuralReject:
         deepseek_calls = []
 
         def dispatch(model_key, *args, **kwargs):
-            if model_key == "kimi27":
-                return _kimi(HIP_CODE_STRUCTURAL_BAD)
+            if model_key == "glm":
+                return _coder(HIP_CODE_STRUCTURAL_BAD)
             if model_key == "deepseek":
                 deepseek_calls.append(kwargs.get("system_prompt", ""))
                 return _plan_result()
-            if model_key == "glm":
-                return _glm_pass()
+            if model_key == "kimi27":
+                return _eval_pass()
             return AgentResult(model_key, True, "{}", 0.1)
 
         mock_call.side_effect = dispatch
@@ -309,16 +309,16 @@ class TestStructuralReject:
         refine_prompts = []
 
         def dispatch(model_key, *args, **kwargs):
-            if model_key == "kimi27":
+            if model_key == "glm":
                 # First call is initial code; subsequent are refines. The
                 # refine prompt is the first positional arg after model_key.
                 if args:
                     refine_prompts.append(args[0])
-                return _kimi(HIP_CODE_STRUCTURAL_BAD)
+                return _coder(HIP_CODE_STRUCTURAL_BAD)
             if model_key == "deepseek":
                 return _plan_result()
-            if model_key == "glm":
-                return _glm_pass()
+            if model_key == "kimi27":
+                return _eval_pass()
             return AgentResult(model_key, True, "{}", 0.1)
 
         mock_call.side_effect = dispatch
@@ -352,14 +352,14 @@ class TestCompileFailure:
         def dispatch(model_key, *args, **kwargs):
             if model_key == "deepseek":
                 return _plan_result()
-            if model_key == "kimi27":
-                # A structurally-valid but semantically-broken port
-                return _kimi(HIP_CODE_OK.replace("hip/hip_runtime.h", "cuda_runtime.h"))
             if model_key == "glm":
+                # A structurally-valid but semantically-broken port
+                return _coder(HIP_CODE_OK.replace("hip/hip_runtime.h", "cuda_runtime.h"))
+            if model_key == "kimi27":
                 sysp = kwargs.get("system_prompt", "")
                 if "error analyst" in sysp:
-                    return _glm_err_analysis()
-                return _glm_pass()
+                    return _eval_err_analysis()
+                return _eval_pass()
             return AgentResult(model_key, True, "{}", 0.1)
 
         mock_call.side_effect = dispatch
@@ -398,10 +398,10 @@ class TestCompileSuccess:
         def dispatch(model_key, *args, **kwargs):
             if model_key == "deepseek":
                 return _plan_result()
-            if model_key == "kimi27":
-                return _kimi(HIP_CODE_OK)
             if model_key == "glm":
-                return _glm_pass()
+                return _coder(HIP_CODE_OK)
+            if model_key == "kimi27":
+                return _eval_pass()
             if model_key == "gemma4":
                 return _gemma_pass()
             return AgentResult(model_key, True, "{}", 0.1)
@@ -444,9 +444,9 @@ class TestTimeout:
         def dispatch(model_key, *args, **kwargs):
             if model_key == "deepseek":
                 return _plan_result()
-            # Simulate a failed Kimi call so route() enters the timeout arm
-            if model_key == "kimi27":
-                return AgentResult("kimi27", False, "", 0.0)
+            # Simulate a failed GLM code gen call so route() enters the timeout arm
+            if model_key == "glm":
+                return AgentResult("glm", False, "", 0.0)
             return AgentResult(model_key, True, "{}", 0.1)
 
         mock_call.side_effect = dispatch

@@ -381,14 +381,14 @@ class TestFastPath:
 class TestAdaptiveTokens:
     def test_small_kernel_gets_far_less_than_the_ceiling(self):
         n = ModelRouter._compute_adaptive_max_tokens("x" * 2000)
-        assert n < MODEL_CATALOG["kimi27"]["max_tokens"]
+        assert n < MODEL_CATALOG["glm"]["max_tokens"]
 
     def test_floor_protects_tiny_kernels_from_truncation(self):
         assert ModelRouter._compute_adaptive_max_tokens("int main(){}") == 2048
 
     def test_large_kernel_clamps_to_the_catalog_ceiling(self):
         n = ModelRouter._compute_adaptive_max_tokens("x" * 200_000)
-        assert n == MODEL_CATALOG["kimi27"]["max_tokens"]
+        assert n == MODEL_CATALOG["glm"]["max_tokens"]
 
     def test_override_never_raises_the_catalog_ceiling(self, router):
         seen = []
@@ -464,12 +464,12 @@ class TestPreprocessedSourcePrompts:
         assert "reintroduced CUDA symbols" in p
         assert "cudaMalloc" in p
 
-    def test_route_passes_the_draft_and_adaptive_tokens_to_every_kimi_call(self, router):
+    def test_route_passes_the_draft_and_adaptive_tokens_to_every_glm_call(self, router):
         """The three edits the source prompt asked for: initial port, refine, retry."""
         seen = []
 
         def side_effect(model_key, prompt, **k):
-            if model_key == "kimi27":
+            if model_key == "glm":
                 seen.append(k.get("max_tokens_override"))
                 return AgentResult(model_key, True, f"```cpp\n{HIP_OK}\n```", 0.5)
             return AgentResult(model_key, True, '{"fixes": []}', 0.5)
@@ -480,11 +480,11 @@ class TestPreprocessedSourcePrompts:
 
         with patch.object(ModelRouter, '_call_model', side_effect=side_effect):
             router.route(CUDA_SRC, [], max_iterations=2, verifier=v,
-                         kernel_name="test_kimitokens", max_seconds=0)
+                         kernel_name="test_glmtokens", max_seconds=0)
 
         assert len(seen) >= 2, "expected an initial port and at least one refine"
-        assert all(t is not None for t in seen), "a kimi call lacked max_tokens_override"
-        assert all(t <= MODEL_CATALOG["kimi27"]["max_tokens"] for t in seen)
+        assert all(t is not None for t in seen), "a glm call lacked max_tokens_override"
+        assert all(t <= MODEL_CATALOG["glm"]["max_tokens"] for t in seen)
 
 
 # ── P0: phase budgets — no phase may starve the ones behind it ───────────
@@ -633,10 +633,13 @@ class TestPhaseBudgets:
         call — the very case its "falling back to raw errors" branch exists for —
         raised UnboundLocalError and took the whole run down."""
         def side_effect(model_key, *a, **k):
-            if model_key == "kimi27":
-                return AgentResult(model_key, True, f"```cpp\n{HIP_OK}\n```", 0.5)
             if model_key == "glm":
-                return AgentResult(model_key, False, "", 0.0)   # analyst call fails
+                return AgentResult(model_key, True, f"```cpp\n{HIP_OK}\n```", 0.5)
+            if model_key == "kimi27":
+                sysp = k.get("system_prompt", "")
+                if "error analyst" in sysp:
+                    return AgentResult(model_key, False, "", 0.0)   # analyst call fails
+                return AgentResult(model_key, True, '{"pass": true}', 0.5)
             return AgentResult(model_key, True, "plan", 0.5)
 
         verifier = MagicMock()
@@ -788,10 +791,10 @@ class TestRouteTimeout:
         code_B = HIP_OTHER
 
         def side_effect(model_key, *a, **k):
-            if model_key == "kimi27":
-                # 1st kimi call = initial port (A); 2nd = the refine (B)
-                kimi_calls = [c for c in mock_call.call_args_list if c[0][0] == "kimi27"]
-                code = code_A if len(kimi_calls) <= 1 else code_B
+            if model_key == "glm":
+                # 1st glm call = initial port (A); 2nd = the refine (B)
+                glm_calls = [c for c in mock_call.call_args_list if c[0][0] == "glm"]
+                code = code_A if len(glm_calls) <= 1 else code_B
                 return AgentResult(model_key, True, f"```cpp\n{code}\n```", 0.5)
             return AgentResult(model_key, True, '{"pass": false, "issues": ["shfl width"]}', 0.5)
 
@@ -858,7 +861,7 @@ class TestRouteTimeout:
         # DeepSeek plans fine; Kimi returns the failed AgentResult that _call_model
         # produces when the budget is gone.
         def side_effect(model_key, *a, **k):
-            if model_key == "kimi27":
+            if model_key == "glm":
                 return AgentResult(model_key, False, "", 0.0)
             return AgentResult(model_key, True, "a plan", 0.5)
 
@@ -970,7 +973,7 @@ class TestTwoLayerFix:
         """iter1 compiles + crashes → Kimi rewrites → iter2 fails to compile.
         The rewrite must be thrown away and the frozen base returned."""
         def side_effect(model_key, *a, **k):
-            if model_key == "kimi27":
+            if model_key == "glm":
                 # first call = initial port (compiles), second = the bad rewrite
                 code = HIP_OK if mock_call.call_count <= 2 else HIP_OTHER
                 return AgentResult(model_key, True, f"```cpp\n{code}\n```", 0.5)

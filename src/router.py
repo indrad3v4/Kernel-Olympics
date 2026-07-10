@@ -321,10 +321,10 @@ MODEL_CATALOG = {
     },
     "gemma4": {
         "id": "accounts/fireworks/models/gemma-4-31b-it",  # Fireworks hosted
-        "fallback_id": "accounts/fireworks/models/deepseek-v4-flash",  # unavailable on this account
+        "fallback_id": "accounts/fireworks/models/deepseek-v4-pro",  # unavailable on this account
         "local_id": "gemma-4-31b-it",  # Model name when served via local vLLM
         "role": "verifier",          # final verification
-        "strength": "Verification — local vLLM on MI300X if available, else Fireworks (falls back to DeepSeek flash)",
+        "strength": "Verification — local vLLM on MI300X if available, else Fireworks (falls back to DeepSeek v4 Pro)",
         "cost_per_1k": 0.0,
         "local_first": True,     # Try localhost:8000 first, then Fireworks, then fallback
         "max_tokens": 1024,
@@ -877,10 +877,10 @@ class ModelRouter:
         return False
 
     @staticmethod
-    def _compute_adaptive_max_tokens(source: str, model_key: str = "kimi27") -> int:
+    def _compute_adaptive_max_tokens(source: str, model_key: str = "glm") -> int:
         """Scale the coder's output budget to the kernel it must emit.
 
-        kimi27 asks for 16384 tokens on every call. A 2k-char kernel cannot use
+        glm (coder) asks for 16384 tokens on every call. A 2k-char kernel cannot use
         them, but the request still reserves capacity and the model still drifts
         toward filling the space. Budget for the source round-tripping back out,
         plus the JSON wrapper and escaping overhead, then clamp.
@@ -2763,7 +2763,7 @@ class ModelRouter:
                 result["changes"].append("[deepseek] Planning FAILED — proceeding without plan")
 
         # ── Phase 2: Kimi CODES the initial port ──
-        if on_phase: on_phase("code", "Kimi K2.7", "generating HIP port from plan")
+        if on_phase: on_phase("code", "GLM-5.2", "generating HIP port from plan")
         # TRIZ #24 / Bug 1: self-contained-program detection and the "preserve
         # main()" instruction now both live inside _build_kimi_code_prompt
         # itself (which also stops truncating the source out from under that
@@ -2779,8 +2779,8 @@ class ModelRouter:
         # Output tokens are the coder's latency. Size the budget to the kernel.
         adaptive_tokens = self._compute_adaptive_max_tokens(hipified_source or kernel_source)
         self._debug_stage = "03_translation"
-        code = self._call_model("kimi27", kimi_prompt,
-                                system_prompt=SYSTEM_PROMPTS.get("kimi27", ""),
+        code = self._call_model("glm", kimi_prompt,
+                                system_prompt=SYSTEM_PROMPTS.get("glm", ""),
                                 max_seconds=code_cap,
                                 max_tokens_override=adaptive_tokens)
         self._debug_stage = ""
@@ -3665,7 +3665,7 @@ class ModelRouter:
                     # root cause is a symbol that is not there. It answers anyway.
                     if (compile_errs and iteration < max_iterations
                             and not all_harness_origin and not linker_only):
-                        if on_phase: on_phase("analyze", "GLM-5.2",
+                        if on_phase: on_phase("analyze", "Kimi K2.7",
                             f"analyzing compile errors for Kimi (iter {iteration})")
                         print(f"║  │  🔍 GLM analyzing {len(compile_errs)} compile errors for Kimi{'':<30}║")
                         glm_err_prompt = self._build_glm_error_analysis_prompt(
@@ -3675,7 +3675,7 @@ class ModelRouter:
                             self_contained=self._is_self_contained(kernel_source))
                         self._debug_stage = "10_evaluation"
                         glm_err = self._call_model(
-                            "glm", glm_err_prompt,
+                            "kimi27", glm_err_prompt,
                             system_prompt=SYSTEM_PROMPTS.get("kimi_error_analyst", ""),
                             prefill='{"fixes":'  # TRIZ #9: force JSON
                         )
@@ -3906,13 +3906,13 @@ class ModelRouter:
                     max_iterations=max_iterations,
                     regex_changelog=result.get("regex_changelog"),
                 )
-                if on_phase: on_phase("evaluate", "GLM-5.2", f"semantic eval (attempt {iteration}/{max_iterations}, compile passed)")
+                if on_phase: on_phase("evaluate", "Kimi K2.7", f"semantic eval (attempt {iteration}/{max_iterations}, compile passed)")
                 result["changes"].append(
-                    f"[glm] Evaluating code (attempt {iteration}/{max_iterations}, compile passed)")
+                    f"[kimi27] Evaluating code (attempt {iteration}/{max_iterations}, compile passed)")
                 self._debug_stage = "10_evaluation"
                 evaluator = self._call_model(
-                    "glm", eval_prompt,
-                    system_prompt=SYSTEM_PROMPTS.get("glm", ""),
+                    "kimi27", eval_prompt,
+                    system_prompt=SYSTEM_PROMPTS.get("kimi27", ""),
                     prefill='{"pass":'  # TRIZ #9: force JSON start, prevent prose
                 )
                 self._debug_stage = ""
@@ -4130,7 +4130,7 @@ class ModelRouter:
                     print(f"║  │  ⏱ BUDGET: too little left to refine — stopping cleanly{'':<8}║")
                     break
 
-                if on_phase: on_phase("refine", "Kimi K2.7", f"refining with {feedback_label} (iter {iteration}→{iteration+1})")
+                if on_phase: on_phase("refine", "GLM-5.2", f"refining with {feedback_label} (iter {iteration}→{iteration+1})")
                 # TRIZ #15: Evolve prompt based on compile error patterns
                 evolved = opt.evolve_prompt(result.get("compile_errors", []))
                 # version_id already carries its own "v" ("v2"), and this is the
@@ -4157,8 +4157,8 @@ class ModelRouter:
                                       iteration=iteration)
                 self._debug_stage = "03_translation"
                 refine = self._call_model(
-                    "kimi27", refine_prompt,
-                    system_prompt=SYSTEM_PROMPTS.get("kimi27", ""),
+                    "glm", refine_prompt,
+                    system_prompt=SYSTEM_PROMPTS.get("glm", ""),
                     max_seconds=refine_cap,
                     max_tokens_override=adaptive_tokens,
                 )
@@ -4223,22 +4223,22 @@ class ModelRouter:
                         result["abort_reason"] = "pipeline_timeout"
                         result["iterations_used"] = iteration
                         result["changes"].append(
-                            f"[kimi27] Refinement failed (iteration {iteration}) and "
+                            f"[glm] Refinement failed (iteration {iteration}) and "
                             f"{deadline.remaining():.0f}s remain — no room to retry. Keeping "
                             f"the previous code.")
                         break
                     result["changes"].append(
-                        f"[kimi27] Refinement failed (iteration {iteration}), retrying with 1.5x timeout...")
+                        f"[glm] Refinement failed (iteration {iteration}), retrying with 1.5x timeout...")
                     self.debug.count("refine_retries")
                     self.debug.event("refine_retry", iteration=iteration,
                                      reason="refine call failed — 1.5x timeout retry")
                     # S4: Retry once with increased timeout — API failures are transient
-                    original_timeout = MODEL_CATALOG["kimi27"]["timeout"]
-                    MODEL_CATALOG["kimi27"]["timeout"] = int(original_timeout * 1.5)
+                    original_timeout = MODEL_CATALOG["glm"]["timeout"]
+                    MODEL_CATALOG["glm"]["timeout"] = int(original_timeout * 1.5)
                     self._debug_stage = "03_translation"
                     retry_refine = self._call_model(
-                        "kimi27", refine_prompt,
-                        system_prompt=SYSTEM_PROMPTS.get("kimi27", ""),
+                        "glm", refine_prompt,
+                        system_prompt=SYSTEM_PROMPTS.get("glm", ""),
                         max_seconds=retry_cap,
                         max_tokens_override=adaptive_tokens,
                     )
