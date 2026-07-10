@@ -12,6 +12,7 @@ import subprocess
 import json
 import os
 import re
+import sys
 import atexit
 import shutil
 import tempfile
@@ -19,6 +20,14 @@ import logging
 from pathlib import Path
 from typing import Dict, Optional, Any
 from dataclasses import dataclass
+
+# debug_session lives at the src/ root. Seed sys.path so importing this module
+# in isolation (a bare `from verification.verifier import ...` in a test) works
+# the same way it does under main.py, which seeds src/ itself.
+_SRC_ROOT = Path(__file__).resolve().parent.parent
+if str(_SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(_SRC_ROOT))
+from debug_session import DebugSession, compiler_version as _compiler_version
 
 # ── Spec directory (relative to this file) ──────────────────────────
 _SPEC_DIR = Path(__file__).parent / "specs"
@@ -46,6 +55,9 @@ class VerificationAgent:
         self.offload_arch = os.environ.get("AMD_OFFLOAD_ARCH", "gfx942")
         self._hipcc_available = self._check_hipcc()
         self._spec_cache: Dict[str, dict] = {}
+        # Phase 11: Debug Mode. Always a session object — a null one until the
+        # router attaches a live one — so _compile() never branches on it.
+        self.debug = DebugSession.disabled()
 
         # Persistent build directory — reuse across verify() calls
         env_build_dir = os.environ.get("VERIFIER_BUILD_DIR")
@@ -56,6 +68,34 @@ class VerificationAgent:
             self.build_dir = Path(tempfile.mkdtemp(prefix="verifier_build_"))
             # Register cleanup for temp dirs created by mkdtemp
             atexit.register(self.cleanup)
+
+    # ── Debug Mode plumbing ─────────────────────────────────────────
+
+    def attach_debug_session(self, session) -> None:
+        """Route this agent's compiler artifacts into *session*.
+
+        Called by ``ModelRouter.route()`` when Debug Mode is on. The verifier
+        owns the only place the exact hipcc argv exists, so it must write the
+        compiler stage itself rather than hand a summary back to the router.
+        """
+        self.debug = session
+
+    def detach_debug_session(self) -> None:
+        """Stop recording. A verifier outlives any one translation attempt."""
+        self.debug = DebugSession.disabled()
+
+    def _iteration_hint(self, kernel_name: str) -> int:
+        """Best-effort iteration number for labeling compiler artifacts.
+
+        The verifier is not told which loop iteration it is serving. Rather than
+        thread that through four call sites for a debug label, we count compiles
+        per kernel — which is the same number for every purpose a reader has.
+        """
+        counter = getattr(self, "_compile_counts", None)
+        if counter is None:
+            counter = self._compile_counts = {}
+        counter[kernel_name] = counter.get(kernel_name, 0) + 1
+        return counter[kernel_name]
 
     def cleanup(self):
         """Remove the temporary build directory if it was auto-created."""
@@ -767,8 +807,10 @@ class VerificationAgent:
         points to the full, untruncated, unstripped output on disk.
         """
         output_bin = build_dir / kernel_name
+        iteration = self._iteration_hint(kernel_name) if self.debug.enabled else 0
 
         if self._hipcc_available:
+            cmd = []
             try:
                 if on_progress: on_progress(30, "hipcc starting")
                 # Sanitize kernel_name to prevent command injection
@@ -776,11 +818,11 @@ class VerificationAgent:
                 output_bin = build_dir / safe_kernel_name
                 # Always use list-form subprocess (no shell=True) to prevent injection
                 if on_progress: on_progress(40, "hipcc compiling")
+                cmd = [self._hipcc_path, "-o", str(output_bin), str(harness_file),
+                       "-std=c++17", "-O2", f"--offload-arch={self.offload_arch}",
+                       "-ferror-limit=5"]
                 result = subprocess.run(
-                    [self._hipcc_path, "-o", str(output_bin), str(harness_file),
-                     "-std=c++17", "-O2", f"--offload-arch={self.offload_arch}",
-                     "-ferror-limit=5"],
-                    capture_output=True, text=True, timeout=60,
+                    cmd, capture_output=True, text=True, timeout=60,
                     cwd=str(build_dir)
                 )
                 if on_progress: on_progress(65, "hipcc finished")
@@ -789,8 +831,36 @@ class VerificationAgent:
                 shortened = "\n".join(
                     self._shorten_error_line(line, build_dir) for line in raw_output.splitlines()
                 )
+                # Debug Mode: the exact argv, the resolved environment, the
+                # compiler's own version, and the COMPLETE stdout/stderr. The
+                # `shortened` copy above is for display; nothing truncated is
+                # what gets persisted here.
+                if self.debug.enabled:
+                    self.debug.log_compile(
+                        command=cmd, stdout=result.stdout, stderr=result.stderr,
+                        returncode=result.returncode, cwd=str(build_dir),
+                        compiler_version=_compiler_version(self._hipcc_path),
+                        source_path=str(harness_file),
+                        source_text=self._read_text_safely(harness_file),
+                        diagnostics=[l for l in raw_output.splitlines() if "error:" in l],
+                        artifacts=([str(output_bin)] if output_bin.exists() else []),
+                        iteration=iteration, kernel_name=kernel_name,
+                        offload_arch=self.offload_arch,
+                        compile_log_path=log_path,
+                    )
                 return result.returncode == 0, shortened, log_path
             except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+                if self.debug.enabled:
+                    self.debug.log_compile(
+                        command=cmd, stdout="", stderr=str(e), returncode=None,
+                        cwd=str(build_dir),
+                        compiler_version=_compiler_version(self._hipcc_path),
+                        source_path=str(harness_file),
+                        source_text=self._read_text_safely(harness_file),
+                        diagnostics=[f"{type(e).__name__}: {e}"],
+                        iteration=iteration, kernel_name=kernel_name,
+                        failure_mode=type(e).__name__,
+                    )
                 manual_dir = Path.cwd() / "ported_kernels"
                 manual_dir.mkdir(parents=True, exist_ok=True)
                 manual_path = manual_dir / f"{kernel_name}.hip.cpp"
@@ -823,7 +893,28 @@ class VerificationAgent:
                 f"Then run: /tmp/{kernel_name}"
             )
             log_path = self._write_compile_log(build_dir, kernel_name, msg)
+            # "hipcc is absent" is a compiler-stage fact, and a debug session
+            # that silently omits it looks identical to one where the compile
+            # was never attempted.
+            if self.debug.enabled:
+                self.debug.log_compile(
+                    command=[], stdout="", stderr=msg, returncode=None,
+                    cwd=str(build_dir), compiler_version="",
+                    source_path=str(harness_file),
+                    source_text=self._read_text_safely(harness_file),
+                    diagnostics=["hipcc not available on this host"],
+                    iteration=iteration, kernel_name=kernel_name,
+                    failure_mode="hipcc_not_found",
+                )
             return False, msg, log_path
+
+    @staticmethod
+    def _read_text_safely(path: Path) -> str:
+        """Read *path* for a debug artifact. A read failure is never fatal."""
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
 
     def _run(self, build_dir: Path, kernel_name: str) -> tuple:
         """Run the compiled HIP kernel.
