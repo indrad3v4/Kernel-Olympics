@@ -94,7 +94,7 @@ function addTitleBar(s, text) {
   s.addShape(pres.shapes.RECTANGLE, {
     x: 0, y: 5.2, w: 10, h: 0.425, fill: { color: C.accent },
   });
-  s.addText("github.com/indrad3v4/Kernel-Olympics  •  endearing-rebirth.up.railway.app", {
+  s.addText("github.com/indrad3v4/Kernel-Olympics  •  kernel-olympics-production.up.railway.app", {
     x: 0.3, y: 5.22, w: 9.4, h: 0.4,
     fontSize: 10, fontFace: "Calibri", color: "FFFFFF", align: "center", valign: "middle", margin: 0,
   });
@@ -661,7 +661,7 @@ function addTitleBar(s, text) {
     x: 5.2, y: 2.8, w: 4.0, h: 0.5, fill: { color: C.card },
     shadow: { type: "outer", color: "000000", blur: 8, offset: 3, angle: 135, opacity: 0.3 },
   });
-  s.addText("endearing-rebirth.up.railway.app", {
+  s.addText("kernel-olympics-production.up.railway.app", {
     x: 5.4, y: 2.8, w: 3.8, h: 0.5,
     fontSize: 13, fontFace: "Calibri", color: C.text, valign: "middle", margin: 0,
   });

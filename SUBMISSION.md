@@ -11,7 +11,7 @@
 | Asset | Link | Status |
 |-------|------|--------|
 | GitHub Repo | https://github.com/indrad3v4/Kernel-Olympics | ✅ |
-| Live Demo | https://endearing-rebirth.up.railway.app | 🚧 Building |
+| Live Demo | https://kernel-olympics-production.up.railway.app | 🚧 Building |
 | Demo Video | *Not required by scoring bot* | — |
 | Slide Deck | `slides/KernelOlympics_Deck.pdf` | ✅ Built & Pushed |
 
@@ -103,7 +103,7 @@ A 4-LLM agentic loop (DeepSeek → GLM-5.2 → Kimi-K2.7 → Gemma) that:
 **Project Name:** Kernel Olympics  
 **Track:** Track 3 — Unicorn  
 **GitHub URL:** https://github.com/indrad3v4/Kernel-Olympics  
-**Demo URL:** https://endearing-rebirth.up.railway.app  
+**Demo URL:** https://kernel-olympics-production.up.railway.app  
 
 ---
 
