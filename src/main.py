@@ -45,6 +45,7 @@ from risk_classifier.classifier import RiskClassifier
 from pattern_memory.memory import PatternMemory
 from porting_agent.agent import PortingAgent
 from router import ModelRouter
+from debug_session import DebugSession
 from verification.verifier import VerificationAgent
 from verification.safe_writer import safe_write_source
 from verification.lexical import validate_lexical as _validate_lexical
@@ -233,9 +234,13 @@ class Display:
 class KernelOlympics:
     """Orchestrates the full CUDA→ROCm migration pipeline."""
 
-    def __init__(self, fresh: bool = False, silent: bool = False):
+    def __init__(self, fresh: bool = False, silent: bool = False,
+                 debug: bool = False):
         self.fresh = fresh
         self.silent = silent
+        # Phase 11: Debug Mode. Off unless --debug or the environment asks for
+        # it; when off the pipeline pays nothing for it.
+        self.debug = debug
         self.disp = Display(silent=silent)
         self.scanner = Scanner()
         self.classifier = RiskClassifier()
@@ -310,6 +315,15 @@ class KernelOlympics:
                 if not source:
                     continue
 
+                # Phase 11: one debug session spans the WHOLE attempt for this
+                # kernel — the translation loop AND the authoritative verify()
+                # compile that follows it. main.py creates it, so main.py
+                # finalizes it (see ModelRouter.route's ownership rule); a
+                # summary written when route() returned would omit the very
+                # compile that decides PASSED vs FAILED.
+                dbg = DebugSession.create(Path(cr["file"]).stem,
+                                          enabled=(self.debug or None))
+
                 # Pass classifier findings so store/retrieve key on the SAME
                 # full-source pattern signature (source is truncated on store).
                 cached = self.memory.retrieve(source, findings=cr.get("findings", []))
@@ -330,9 +344,19 @@ class KernelOlympics:
                         "from_cache": True,
                         "llm_time_s": 0
                     }
+                    # A cache hit means no translation happened. Say so, rather
+                    # than leaving the trace to imply the models were consulted.
+                    dbg.log_input(source, classifier_results=cr,
+                                  patterns=cr.get("findings", []))
+                    dbg.count("pattern_cache_hits")
+                    dbg.transition("CACHE_HIT",
+                                   reason=f"served verified pattern {cached['id']} "
+                                          f"— no LLM call, no translation",
+                                   validation_result=True)
                 else:
                     pipeline_state["llm_calls"] += 1
                     self.disp.llm_call()
+                    dbg.count("pattern_cache_misses")
                     # Show which verifier is actually being used
                     import urllib.request
                     gemma_online = False
@@ -375,7 +399,8 @@ class KernelOlympics:
                         source, cr.get("findings", []),
                         on_phase=_on_phase,
                         verifier=self.verifier,
-                        kernel_name=Path(cr['file']).stem
+                        kernel_name=Path(cr['file']).stem,
+                        debug_session=dbg,
                     )
                     # Close out the LAST phase with its duration
                     if _phase_state["phase"] is not None:
@@ -399,7 +424,16 @@ class KernelOlympics:
                     llm_elapsed = time.perf_counter() - t0
                     pipeline_state["total_cost"] += port_result.get("cost", 0)
                     if not port_result.get("ported_code"):
+                        # The orchestrator produced nothing. The template porter is
+                        # a different code path entirely, and the source it emits is
+                        # what verify() will compile — so the trace must not imply
+                        # the loop produced it.
+                        dbg.transition("TEMPLATE_FALLBACK",
+                                       reason="orchestrator returned no code — "
+                                              "porting mechanically without an LLM")
                         port_result = self.porting_agent.port_kernel(source)
+                        dbg.write_text("03_translation", "template_fallback.hip.cpp",
+                                       port_result.get("ported_code", ""))
                         pipeline_state["total_cost"] += port_result.get("cost", 0)
                         llm_elapsed = time.perf_counter() - t0
                     # Show orchestrator loop details
@@ -467,12 +501,21 @@ class KernelOlympics:
                 ct = threading.Thread(target=_compile_bar, daemon=True)
                 ct.start()
 
-                ver_result = self.verifier.verify(
-                    hip_source=port_result.get("ported_code", source),
-                    cuda_reference_output=reference_output,
-                    kernel_name=Path(cr['file']).stem,
-                    on_progress=_compile_progress
-                )
+                # The authoritative compile+run+diff. Its hipcc invocation is the
+                # one that decides PASSED vs FAILED, so it is recorded into the
+                # same session as the translation that produced the code.
+                if dbg.enabled:
+                    self.verifier.attach_debug_session(dbg)
+                    dbg.transition("VERIFICATION", reason="authoritative compile + run + diff")
+                try:
+                    ver_result = self.verifier.verify(
+                        hip_source=port_result.get("ported_code", source),
+                        cuda_reference_output=reference_output,
+                        kernel_name=Path(cr['file']).stem,
+                        on_progress=_compile_progress
+                    )
+                finally:
+                    self.verifier.detach_debug_session()
 
                 _compile_stop.set()
                 ct.join(timeout=1)
@@ -668,6 +711,27 @@ class KernelOlympics:
                                 verified=False,
                             )
                             print(f"║  {'📦 Quarantined fallback code — resume only, not served on hits':<64}║")
+
+                # ── Phase 11: close this kernel's debug session ──
+                # Everything is now recorded: the translation loop, the
+                # authoritative verify() compile, and the final verdict. The
+                # summary is written last so it can describe all of it.
+                if dbg.enabled:
+                    passed = ver_result.get("passed", False)
+                    dbg.transition("SUCCESS" if passed else "FAILURE",
+                                   reason=verification_failure_label(ver_result)
+                                          if not passed else "verified against CUDA reference",
+                                   validation_result=passed)
+                    if not passed:
+                        dbg.snapshot_failure(
+                            reason=f"verification failed: {verification_failure_label(ver_result)}",
+                            context={"verification": ver_result,
+                                     "abort_reason": port_result.get("abort_reason")})
+                    summary = dbg.finalize({**port_result, "verification": ver_result,
+                                            "compile_passed": ver_result.get("compile_success")})
+                    print(f"║  🐞 Debug session → {bold(str(dbg.dir)):<47}║")
+                    if summary:
+                        print(f"║  🐞 Summary       → {dim(str(summary)):<47}║")
             else:
                 self.disp.file_done(Path(cr['file']).name, f"{cr.get('risk_level')} — no porting needed", ok=True)
 
@@ -913,6 +977,13 @@ def main():
     parser.add_argument("--reset", action="store_true", help="With --demo, clear pattern memory before running")
     parser.add_argument("--fresh", action="store_true", help="Start with an empty pattern memory (clears the cache DB before running)")
     parser.add_argument("--doctor", action="store_true", help="Run pre-flight environment check and exit")
+    parser.add_argument("--debug", action="store_true",
+                        help="Enable Debug Mode: persist every intermediate artifact of "
+                             "every pipeline stage to debug/session_<ts>_<kernel>/ so a "
+                             "failed translation can be diagnosed offline. Also enabled "
+                             "by KERNEL_OLYMPICS_DEBUG=1.")
+    parser.add_argument("--debug-dir", default=None,
+                        help="Root directory for debug sessions (default: ./debug)")
     parser.add_argument("--nvidia-sample", type=str, nargs="?",
                         const="cpp/2_Concepts_and_Techniques/shfl_scan/shfl_scan.cu",
                         help="Download and test a sample from NVIDIA/cuda-samples (default: shfl_scan)")
@@ -923,6 +994,12 @@ def main():
     parser.add_argument("--interval", type=int, default=5,
                         help="Poll interval in seconds (default: 5)")
     args = parser.parse_args()
+
+    # --debug-dir only means anything with a session to put there, but setting
+    # it via the environment is how DebugSession.create() reads it, so the flag
+    # is translated here rather than threaded through four call signatures.
+    if args.debug_dir:
+        os.environ["KERNEL_OLYMPICS_DEBUG_DIR"] = args.debug_dir
 
     if args.doctor:
         return doctor()
@@ -936,6 +1013,7 @@ def main():
             interval=args.interval,
             reference_dir=args.reference,
             fresh=args.fresh,
+            debug=args.debug,
         )
 
     if not args.input and not args.nvidia_sample:
@@ -974,7 +1052,7 @@ def main():
                 print(red(f"  ✗ No local copy either. Download manually and save to sample_kernels/cuda/"))
                 return 1
 
-    ko = KernelOlympics(fresh=args.fresh)
+    ko = KernelOlympics(fresh=args.fresh, debug=args.debug)
     report = ko.run(args.input, args.reference)
 
     if report.get("error") == "no_input":
@@ -1236,7 +1314,8 @@ def _process_single_file(ko: "KernelOlympics", file_path: str,
 
 def run_daemon(watch_dir: str, interval: int = 5,
                reference_dir: str = "sample_kernels/reference",
-               fresh: bool = False, state_path: str | None = None):
+               fresh: bool = False, state_path: str | None = None,
+               debug: bool = False):
     """Watch *watch_dir* for new/edited .cu files and process them automatically."""
     global _SHUTDOWN_REQUESTED
     _SHUTDOWN_REQUESTED = False
@@ -1245,7 +1324,7 @@ def run_daemon(watch_dir: str, interval: int = 5,
     signal.signal(signal.SIGTERM, _daemon_signal_handler)
 
     state = DaemonState(state_path or _DAEMON_STATE_FILE)
-    ko = KernelOlympics(fresh=fresh, silent=True)
+    ko = KernelOlympics(fresh=fresh, silent=True, debug=debug)
 
     watch = Path(watch_dir)
     if not watch.is_dir():

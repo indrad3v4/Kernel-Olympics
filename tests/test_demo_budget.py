@@ -1041,10 +1041,20 @@ class TestBannerSingleSource:
 
     def test_run_daemon_still_requests_silence(self):
         """Pins the caller, not just the callee: if run_daemon() ever stops
-        passing silent=True, the test above silently stops protecting anything."""
+        passing silent=True, the test above silently stops protecting anything.
+
+        Matched on the ``silent=True`` keyword inside run_daemon's
+        KernelOlympics(...) call rather than on the whole argument list — the
+        constructor legitimately grows keywords (``debug=`` landed in Phase 11)
+        and a literal full-call pin would fail on every one of them while
+        protecting nothing extra.
+        """
+        import re as _re
         src = Path(main.__file__).read_text(encoding="utf-8")
         daemon_body = src.split("def run_daemon(", 1)[1]
-        assert "KernelOlympics(fresh=fresh, silent=True)" in daemon_body
+        call = _re.search(r"KernelOlympics\(([^)]*)\)", daemon_body)
+        assert call, "run_daemon() no longer constructs KernelOlympics"
+        assert "silent=True" in call.group(1)
 
 
 # ── P2: prompt versioning ────────────────────────────────────────────────

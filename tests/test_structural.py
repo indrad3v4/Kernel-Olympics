@@ -5,7 +5,44 @@ import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
-from verification.structural import validate_structure, extract_top_level_functions
+from verification.structural import (
+    validate_structure, extract_top_level_functions, strip_comments,
+)
+
+
+class TestStripComments:
+    """Blanks comments, keeps string literals, preserves offsets.
+
+    The literal-preserving variant exists because a preprocessor directive
+    carries its payload inside a string: blanking `"foo.cuh"` turns
+    `#include "foo.cuh"` into `#include "        "`, which no rule can read.
+    """
+
+    def test_line_comment_is_blanked(self):
+        assert strip_comments("int x; // note\n").rstrip() == "int x;"
+
+    def test_block_comment_is_blanked(self):
+        assert strip_comments("int /* c */ x;").split() == ["int", "x;"]
+
+    def test_string_literals_survive(self):
+        assert strip_comments('#include "foo.cuh"\n') == '#include "foo.cuh"\n'
+
+    def test_a_comment_marker_inside_a_string_is_not_a_comment(self):
+        src = 'const char* url = "http://example.com"; int x;'
+        assert strip_comments(src) == src
+
+    def test_length_and_newlines_are_preserved(self):
+        src = "a // comment\nb /* x */ c\n"
+        out = strip_comments(src)
+        assert len(out) == len(src)
+        assert out.count("\n") == src.count("\n")
+
+    def test_escaped_quote_inside_a_string_does_not_end_it(self):
+        src = 'char* s = "a\\"// not a comment"; int x;'
+        assert strip_comments(src) == src
+
+    def test_empty_input(self):
+        assert strip_comments("") == ""
 
 
 SRC = '''

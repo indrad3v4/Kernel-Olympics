@@ -22,6 +22,12 @@ __pycache__/
 # Runs (per-invocation reproducibility logs)
 runs/
 
+# Debug Mode sessions (--debug). These hold raw model responses, full prompts and
+# the original kernel source — a session directory is a diagnostic artifact for
+# the developer who produced it, never a commit. The blanket *.json rule above
+# does not cover the .txt/.jsonl/.md/.diff/.cu artifacts a session also writes.
+debug/
+
 # Environment
 .env
 .venv/

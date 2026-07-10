@@ -47,6 +47,55 @@ python3 src/main.py --input sample_kernels/cuda/warp_reduce.cu
 python3 src/main.py --input sample_kernels/cuda/new_kernel.cu
 ```
 
+## 🐞 Debug Mode
+
+When a translation fails, you should never have to re-run the pipeline — three
+LLM calls and a few minutes — just to see *why*. Pass `--debug` and every
+intermediate artifact of every stage is written to a session directory:
+
+```bash
+python3 src/main.py --input sample_kernels/cuda/warp_reduce.cu --debug
+# → debug/session_<timestamp>_<kernel>/
+```
+
+Read `summary.md` first. It gives the state-machine timeline, the retry history,
+the validation outcomes, a probable root cause and a recommended next action —
+and it names the artifact backing each claim, so you can disagree with it by
+opening one file.
+
+```
+debug/session_20260710T093713_warp_reduce/
+├── summary.md            human-readable post-mortem  ← start here
+├── metrics.json          per-stage timings, tokens, cost, retry counts
+├── state_trace.jsonl     every state transition, with elapsed time and reason
+├── timeline.jsonl        every retry event, generation, compile and patch
+├── manifest.jsonl        append-only index of every artifact written
+├── 01_input/             original CUDA, classifier findings, hipify preprocessing
+├── 02_planning/          raw planner responses, parsed plans, prompts
+├── 03_translation/       every generation, raw + extracted + discarded reasoning
+├── 04_extraction/        strategy used, parser confidence, what was thrown away
+├── 05_lexical/           prose/markdown/placeholder detection, pass-fail decision
+├── 06_structural/        braces, symbol preservation, structural score
+├── 07_symbols/           CUDA vs HIP symbol tables and the diff between them
+├── 08_static_analysis/   pre-compile findings (residual CUDA, warp-32 hazards)
+├── 09_compiler/          exact hipcc argv, environment, version, FULL stdout/stderr
+├── 10_evaluation/        raw evaluator responses, parsed diagnostics, confidence
+├── 11_patches/           every repair iteration: before, after, unified diff
+└── 12_failure/           self-contained failure package
+```
+
+Guarantees: **append-only** (no generation, patch or response is ever
+overwritten), **never truncated** (compiler output and raw model responses are
+written verbatim), **deterministic** (artifacts are numbered by a monotonic
+sequence, not a clock, so two runs are diffable), and **provider-independent**.
+
+Debug Mode is off by default and costs the pipeline nothing when disabled. It
+can also be enabled with `KERNEL_OLYMPICS_DEBUG=1`, and rooted elsewhere with
+`--debug-dir` or `KERNEL_OLYMPICS_DEBUG_DIR`.
+
+> Session directories contain raw prompts, raw model responses and your kernel
+> source. They are gitignored — treat them as local diagnostic artifacts.
+
 ## Why This Matters
 
 - **AMD** gets enterprise adoption unblocked — the software gap closes
