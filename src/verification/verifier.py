@@ -325,25 +325,29 @@ class VerificationAgent:
                         scalar_overrides[p["name"]] = vals[scalar_idx]
                     scalar_idx += 1
 
-        # Build input setup lines
-        input_lines = []
-        if linear_ramp:
-            input_lines.append(
-                f"    std::vector<{elem_type}> input({input_count});"
-            )
-            input_lines.append(
-                f"    for (int i = 0; i < {input_count}; i++) input[i] = static_cast<{elem_type}>(i + 1);"
-            )
-        else:
-            input_lines.append(
-                f"    std::vector<{elem_type}> input({input_count}, "
-                f"static_cast<{elem_type}>({default_val}));"
-            )
-
-        # Build output buffer
-        output_lines = [
-            f"    std::vector<{elem_type}> output({input_count}, 0);"
-        ]
+        # Build per-param host buffer declarations
+        # Each pointer param gets its own std::vector host buffer
+        host_buf_lines = []
+        for p in params:
+            if p["direction"] == "scalar":
+                continue
+            pname = p["name"]
+            ptype = p["type"]
+            pexpr = p.get("size_expr", str(input_count))
+            if pexpr != str(input_count):
+                pexpr = f"static_cast<int>({pexpr})"
+            else:
+                pexpr = str(input_count)
+            if linear_ramp:
+                host_buf_lines.append(f"    std::vector<{elem_type}> {pname}({pexpr});")
+                host_buf_lines.append(
+                    f"    for (size_t i = 0; i < {pexpr}; i++) {pname}[i] = static_cast<{elem_type}>(i + 1);"
+                )
+            else:
+                host_buf_lines.append(
+                    f"    std::vector<{elem_type}> {pname}({pexpr}, "
+                    f"static_cast<{elem_type}>({default_val}));"
+                )
 
         # Build variable declarations for pointer params
         decl_lines = []
@@ -376,16 +380,16 @@ class VerificationAgent:
                 alloc_lines.append(
                     f"    hipMalloc(&d_{name}, {size_expr} * sizeof({elem_type}));"
                 )
-                if direction == "in":
-                    memcpy_h2d_lines.append(
-                        f"    hipMemcpy(d_{name}, {name}.data(), "
-                        f"{size_expr} * sizeof({elem_type}), hipMemcpyHostToDevice);"
-                    )
-                else:
-                    memcpy_d2h_lines.append(
-                        f"    hipMemcpy({name}.data(), d_{name}, "
-                        f"{size_expr} * sizeof({elem_type}), hipMemcpyDeviceToHost);"
-                    )
+                # Always do H2D copy for pointer params (seed input data)
+                memcpy_h2d_lines.append(
+                    f"    hipMemcpy(d_{name}, {name}.data(), "
+                    f"{size_expr} * sizeof({elem_type}), hipMemcpyHostToDevice);"
+                )
+                # Always do D2H copy for pointer params (readback for verification)
+                memcpy_d2h_lines.append(
+                    f"    hipMemcpy({name}.data(), d_{name}, "
+                    f"{size_expr} * sizeof({elem_type}), hipMemcpyDeviceToHost);"
+                )
                 free_lines.append(f"    hipFree(d_{name});")
                 kernel_args.append(f"d_{name}")
 
@@ -393,17 +397,22 @@ class VerificationAgent:
         dynamic_smem = spec.get("dynamic_shared_mem", 0)
         dsmem_suffix = f", {dynamic_smem}" if dynamic_smem else ""
 
-        # Build print / output format
+        # Build print / output format — read from last pointer param's host buffer
+        # (convention: the last pointer param is the output buffer)
+        readback_buf = "output_verify"
+        for p in params:
+            if p["direction"] != "scalar":
+                readback_buf = p["name"]
         print_lines = []
         if out.get("format") == "int_per_line":
             for i in range(readback_count):
                 print_lines.append(
-                    f'        std::cout << output[{i}] << std::endl;'
+                    f'        std::cout << {readback_buf}[{i}] << std::endl;'
                 )
         else:
             for i in range(readback_count):
                 print_lines.append(
-                    f'        std::cout << std::fixed << output[{i}] << std::endl;'
+                    f'        std::cout << std::fixed << {readback_buf}[{i}] << std::endl;'
                 )
 
         # Build parameter and kernel-call string
@@ -429,9 +438,7 @@ class VerificationAgent:
 
         for line in scalar_init_lines:
             lines.append(line)
-        for line in input_lines:
-            lines.append(line)
-        for line in output_lines:
+        for line in host_buf_lines:
             lines.append(line)
         for line in decl_lines:
             lines.append(line)
