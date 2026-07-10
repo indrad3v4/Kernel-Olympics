@@ -203,6 +203,51 @@ class VerificationAgent:
 
     # ── Spec-driven harness generation ──────────────────────────────
 
+    @staticmethod
+    def _strip_to_device_code(source: str) -> str:
+        """Return only the ``__global__``/``__device__`` function definitions.
+
+        Defensive extractor for DEVICE_SUBSET ports: a model that ignores the
+        "drop the host driver" instruction leaks ``int main()`` and host helpers
+        (``CPUverify``, ``shuffle_simple_test`` …) that reference unportable SDK
+        symbols. Embedding that under the synthesized harness both duplicates
+        ``main`` and drags the unresolved symbols back in. Keeping only the
+        device functions lets the spec harness compile the kernel it targets.
+
+        Brace-matched so a device function body with nested blocks/strings is
+        not truncated at the first ``}``. Returns "" when no device function is
+        found (caller then falls back to the raw source rather than an empty
+        harness).
+        """
+        lines = source.splitlines()
+        extracted = []
+        in_kernel = False
+        brace_depth = 0
+        seen_open = False  # a K&R signature puts '{' on the *next* line — don't
+                           # close the function before its opening brace appears.
+        for line in lines:
+            stripped = line.lstrip()
+            if not in_kernel and ("__global__" in stripped or "__device__" in stripped):
+                in_kernel = True
+                seen_open = False
+                extracted.append(line)
+                brace_depth += line.count("{") - line.count("}")
+                if line.count("{"):
+                    seen_open = True
+                    if brace_depth <= 0:
+                        in_kernel = False
+                        extracted.append("")
+                continue
+            if in_kernel:
+                extracted.append(line)
+                brace_depth += line.count("{") - line.count("}")
+                if line.count("{"):
+                    seen_open = True
+                if seen_open and brace_depth <= 0:
+                    in_kernel = False
+                    extracted.append("")
+        return "\n".join(extracted).strip()
+
     def _generate_harness(self, kernel_name: str, test_input: str,
                           ported_kernel_source: str) -> tuple:
         """
@@ -235,6 +280,16 @@ class VerificationAgent:
         spec = self.load_spec(kernel_name)
         if spec is not None and spec.get("port_mode") == "WHOLE_PROGRAM":
             return ported_kernel_source, 1, len(ported_kernel_source.splitlines())
+
+        # DEVICE_SUBSET: the spec is authoritative — the port is meant to contain
+        # ONLY device functions, driven by the synthesized spec harness. A model
+        # that leaks the original main()/host driver (unportable SDK code) must
+        # NOT hijack the self-contained early-return below; that recompiles the
+        # exact broken driver the harness exists to replace. Strip any leaked
+        # host code and always build the spec harness.
+        if spec is not None and spec.get("port_mode") == "DEVICE_SUBSET":
+            device_only = self._strip_to_device_code(ported_kernel_source)
+            return self._harness_from_spec(spec, device_only or ported_kernel_source)
 
         if re.search(r'^\s*int\s+main\s*\(', ported_kernel_source, re.MULTILINE):
             return ported_kernel_source, 1, len(ported_kernel_source.splitlines())
@@ -435,6 +490,14 @@ class VerificationAgent:
             '',
             'int main() {',
         ]
+
+        # A spec may reference the input element count symbolically as ``count``
+        # in a param's ``size_expr`` (e.g. size_expr: "count"). That identifier
+        # is otherwise undefined in the harness — declare it. Skip if a scalar
+        # param is already literally named ``count`` (it would collide).
+        if any(p.get("size_expr") == "count" for p in params) and \
+                not any(p["name"] == "count" for p in params):
+            lines.append(f'    const int count = {input_count};')
 
         for line in scalar_init_lines:
             lines.append(line)

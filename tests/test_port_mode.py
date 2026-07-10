@@ -115,6 +115,71 @@ class TestPortModeComputation:
         return PortMode.WHOLE_PROGRAM
 
 
+class TestComputePortModeReal:
+    """Regression tests for ModelRouter._compute_port_mode itself.
+
+    The original implementation compared the source against itself
+    (``_unsatisfied_main_calls(main, source, source)``), so its dropped-symbol
+    set was always empty and it could NEVER return DEVICE_SUBSET — every full
+    NVIDIA sample was ported WHOLE_PROGRAM and timed out trying to reproduce
+    unportable host code.
+    """
+
+    @staticmethod
+    def _router():
+        import os
+        os.environ.setdefault("OPENROUTER_API_KEY", "test")
+        try:
+            import sys
+            sys.path.insert(0, "src")
+            from router import ModelRouter
+        except Exception:  # pragma: no cover - import chain unavailable
+            pytest.skip("router import chain unavailable")
+        return ModelRouter
+
+    def test_real_nvidia_sample_is_device_subset(self):
+        """A self-contained program that includes an unvendored local header
+        (shfl_integral_image.cuh) or a CUDA-SDK helper header must be DEVICE_SUBSET."""
+        ModelRouter = self._router()
+        src = Path("sample_kernels/cuda/nvidia_shfl_scan.cu").read_text(encoding="utf-8")
+        assert ModelRouter._compute_port_mode(src) == PortMode.DEVICE_SUBSET
+
+    def test_sdk_helper_header_triggers_device_subset(self):
+        ModelRouter = self._router()
+        src = (
+            "#include <helper_cuda.h>\n"
+            "__global__ void k(int* d){ int t = threadIdx.x; d[t] = t; }\n"
+            "int main(){ int* p; cudaMalloc(&p, 4); k<<<1,1>>>(p); return 0; }\n"
+        )
+        assert ModelRouter._compute_port_mode(src) == PortMode.DEVICE_SUBSET
+
+    def test_plain_self_contained_stays_whole_program(self):
+        """No missing headers, no SDK helpers -> WHOLE_PROGRAM (unchanged)."""
+        ModelRouter = self._router()
+        src = (
+            "#include <stdio.h>\n"
+            "__global__ void k(int* d){ int t = threadIdx.x; d[t] = t; }\n"
+            "int main(){ int* p; cudaMalloc(&p, 4); k<<<1,1>>>(p); return 0; }\n"
+        )
+        assert ModelRouter._compute_port_mode(src) == PortMode.WHOLE_PROGRAM
+
+    def test_no_main_is_whole_program(self):
+        ModelRouter = self._router()
+        src = "__global__ void k(int* d){ int t = threadIdx.x; d[t] = t; }\n"
+        assert ModelRouter._compute_port_mode(src) == PortMode.WHOLE_PROGRAM
+
+    def test_spec_port_mode_override(self):
+        """A hand-tagged spec port_mode overrides the computed heuristic."""
+        ModelRouter = self._router()
+
+        class _FakeVerifier:
+            def load_spec(self, name):
+                return {"port_mode": "DEVICE_SUBSET"}
+
+        assert ModelRouter._spec_port_mode("anything", _FakeVerifier()) == PortMode.DEVICE_SUBSET
+        assert ModelRouter._spec_port_mode("anything", None) is None
+
+
 class TestHarnessGeneration:
     """Verify _generate_harness respects port_mode from spec."""
 
