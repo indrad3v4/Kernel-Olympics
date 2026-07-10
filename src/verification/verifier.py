@@ -28,6 +28,7 @@ _SRC_ROOT = Path(__file__).resolve().parent.parent
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
 from debug_session import DebugSession, compiler_version as _compiler_version
+from verification.spec_parser import PORT_MODE_DEVICE_SUBSET
 
 # ── Spec directory (relative to this file) ──────────────────────────
 _SPEC_DIR = Path(__file__).parent / "specs"
@@ -216,8 +217,21 @@ class VerificationAgent:
         Self-contained programs (source already defining ``int main(``) are
         returned as-is — wrapping a second driver/``main`` around a complete
         program is what caused the harness to redefine ``main`` and shadow
-        the program's own logic (e.g. ``nvidia_shfl_scan.cu``, a full NVIDIA
-        sample, not a bare kernel snippet).
+        the program's own logic.
+
+        DEVICE_SUBSET is the one exception, and it is authoritative: when
+        ``spec["port_mode"] == "DEVICE_SUBSET"`` (see
+        ``verification.spec_parser.determine_port_mode``), this method ALWAYS
+        synthesizes a harness via :meth:`_harness_from_spec`, even if the ported
+        text happens to contain its own ``main(`` (e.g. a coder that ignored its
+        instructions, or a stale restore). The two consumers of the old
+        ``self_contained`` flag used to answer two different questions off the
+        same bit — "does the source have a main()?" (coder prompt) vs "should I
+        expect the port to supply its own main()?" (this method) — and
+        port_mode is the single answer both now share. Absent port_mode
+        entirely (every spec written before this contract existed), behavior
+        is unchanged: ``self_contained: true`` alone still returns the ported
+        source as-is, exactly as before.
 
         Returns (harness_text, kernel_line_start, kernel_line_end): the
         1-indexed, inclusive line range within *harness_text* that
@@ -227,17 +241,20 @@ class VerificationAgent:
         """
         import re
 
-        # ── TRIZ #24 (Intermediary): Check spec FIRST for self-contained flag ──
-        # The spec was auto-generated from the ORIGINAL CUDA source which
-        # definitively tells us whether this is a full program or a bare
-        # kernel. Kimi may strip int main() during porting, making the regex
-        # check below unreliable. The spec is the authoritative source.
         spec = self.load_spec(kernel_name)
-        if spec is not None and spec.get("self_contained", False):
-            return ported_kernel_source, 1, len(ported_kernel_source.splitlines())
+        device_subset = spec is not None and spec.get("port_mode") == PORT_MODE_DEVICE_SUBSET
 
-        if re.search(r'^\s*int\s+main\s*\(', ported_kernel_source, re.MULTILINE):
-            return ported_kernel_source, 1, len(ported_kernel_source.splitlines())
+        if not device_subset:
+            # ── TRIZ #24 (Intermediary): Check spec FIRST for self-contained flag ──
+            # The spec was auto-generated from the ORIGINAL CUDA source which
+            # definitively tells us whether this is a full program or a bare
+            # kernel. Kimi may strip int main() during porting, making the regex
+            # check below unreliable. The spec is the authoritative source.
+            if spec is not None and spec.get("self_contained", False):
+                return ported_kernel_source, 1, len(ported_kernel_source.splitlines())
+
+            if re.search(r'^\s*int\s+main\s*\(', ported_kernel_source, re.MULTILINE):
+                return ported_kernel_source, 1, len(ported_kernel_source.splitlines())
 
         if spec is not None:
             return self._harness_from_spec(spec, ported_kernel_source)
@@ -258,9 +275,11 @@ class VerificationAgent:
         "no spec" warning.
         """
         import re
-        if re.search(r'^\s*int\s+main\s*\(', ported_kernel_source, re.MULTILINE):
+        spec = self.load_spec(kernel_name)
+        device_subset = spec is not None and spec.get("port_mode") == PORT_MODE_DEVICE_SUBSET
+        if not device_subset and re.search(r'^\s*int\s+main\s*\(', ported_kernel_source, re.MULTILINE):
             return
-        if self.load_spec(kernel_name) is not None:
+        if spec is not None:
             return
         print(f"║ ⚠️ No spec for '{kernel_name}' — using generic 256-element harness "
               f"(assumes a (float*, float*, int) signature launched <<<4,64>>>). "
@@ -549,6 +568,67 @@ class VerificationAgent:
             "signal": self._signal_name(exit_code),
             "benchmark_us": benchmark,
         }
+
+    def quick_syntax_check(self, hip_source: str, kernel_name: str = "test_kernel") -> Dict:
+        """Part C7: a syntax-only pass, between the structural gate and a real
+        compile.
+
+        Brace/paren balance (the structural gate) does not catch "no viable
+        conversion from", a missing ';', or a malformed declaration — hipcc
+        rediscovers those at full compile-and-link cost. ``-fsyntax-only``
+        (hipcc wraps clang, which supports it) does the same parse without
+        codegen or linking — materially faster than :meth:`quick_compile_check`
+        on a large translation unit, though still real compiler invocation, not
+        a heuristic.
+
+        Returns ``{"available": bool, "syntax_ok": bool, "errors": [...],
+        "compile_output": str, "latency_ms": float}``. ``available`` is False
+        (with ``syntax_ok`` also False, never a bare pass) when hipcc is not
+        installed on this host — callers must check ``available`` before
+        treating a failure as a real defect, exactly as every other hipcc-gated
+        check in this class already does.
+        """
+        if not self._hipcc_available:
+            return {"available": False, "syntax_ok": False, "errors": [],
+                    "compile_output": "hipcc not available — syntax check skipped",
+                    "latency_ms": 0.0}
+
+        import time as _time
+        t0 = _time.perf_counter()
+
+        kernel_build_dir = self.build_dir / f"loop_{kernel_name}"
+        kernel_build_dir.mkdir(parents=True, exist_ok=True)
+
+        # Same harness the real compile will see — a syntax pass that checked a
+        # DIFFERENT translation unit would be answering the wrong question.
+        harness, _start, _end = self._generate_harness(kernel_name, "", hip_source)
+        harness_file = kernel_build_dir / f"syntax_{kernel_name}.cpp"
+        harness_file.write_text(harness, encoding="utf-8")
+
+        try:
+            result = subprocess.run(
+                [self._hipcc_path, "-fsyntax-only", "-std=c++17",
+                 f"--offload-arch={self.offload_arch}", "-ferror-limit=5",
+                 str(harness_file)],
+                capture_output=True, text=True, timeout=30,
+                cwd=str(kernel_build_dir),
+            )
+            raw_output = result.stdout + result.stderr
+            shortened = "\n".join(
+                self._shorten_error_line(line, kernel_build_dir)
+                for line in raw_output.splitlines())
+            errors = [l.strip()[:200] for l in shortened.splitlines()
+                     if "error:" in l and "in instantiation of" not in l
+                     and "required from" not in l]
+            latency_ms = (_time.perf_counter() - t0) * 1000.0
+            return {"available": True, "syntax_ok": result.returncode == 0,
+                    "errors": errors[:8], "compile_output": shortened[:2000],
+                    "latency_ms": round(latency_ms, 1)}
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+            latency_ms = (_time.perf_counter() - t0) * 1000.0
+            return {"available": True, "syntax_ok": False, "errors": [str(e)],
+                    "compile_output": f"syntax check failed to run: {e}",
+                    "latency_ms": round(latency_ms, 1)}
 
     def quick_compile_check(self, hip_source: str, kernel_name: str = "test_kernel",
                             on_progress=None) -> Dict:

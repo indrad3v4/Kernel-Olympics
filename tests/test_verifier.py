@@ -145,6 +145,14 @@ def test_generate_harness_skips_wrapping_when_source_has_main():
     harness produced two main() definitions -> 'redefinition of main', and
     every downstream compile error was then unattributable to the ported
     code (see docs/fix-plan-harness-and-diagnostics.md, Bug 2).
+
+    Uses a synthetic kernel_name with no spec on disk. nvidia_shfl_scan itself
+    now carries a real "port_mode": "DEVICE_SUBSET" spec (see
+    tests/test_port_mode.py) — for THAT kernel this exact source (main() calling
+    a kernel whose driver depends on an unvendored header) is precisely the bug
+    Part A fixes, so it must NOT be returned as-is anymore. This test's actual
+    subject is the generic, no-spec-override behavior, which is unrelated to
+    that kernel and unaffected by port_mode.
     """
     agent = VerificationAgent()
     source = (
@@ -154,7 +162,8 @@ def test_generate_harness_skips_wrapping_when_source_has_main():
         "    return 0;\n"
         "}\n"
     )
-    harness, kernel_start, kernel_end = agent._generate_harness("nvidia_shfl_scan", "", source)
+    harness, kernel_start, kernel_end = agent._generate_harness(
+        "generic_self_contained_kernel", "", source)
     assert harness == source
     assert harness.count("int main(") == 1
     assert kernel_start == 1

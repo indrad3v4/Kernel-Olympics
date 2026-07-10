@@ -15,6 +15,75 @@ from pathlib import Path
 from typing import Optional
 
 _SPEC_DIR = Path(__file__).parent / "specs"
+_SAMPLE_KERNELS_DIR = Path(__file__).resolve().parent.parent.parent / "sample_kernels"
+
+# Anchored so a comment or string literal containing "int main(" mid-line
+# can't false-positive — mirrors the two anchored call sites in verifier.py.
+_MAIN_RE = re.compile(r'^\s*int\s+main\s*\(', re.MULTILINE)
+
+# A locally-included (quoted, not <...>) header that a full NVIDIA sample may
+# depend on but this repo never vendored.
+_LOCAL_INCLUDE_RE = re.compile(r'#include\s*"([^"]+\.(?:cuh|h|hpp))"')
+
+# ── PortMode: the single decision "can this source be ported as a whole
+# program, or only its device-side subset?" ─────────────────────────────────
+#
+# A self-contained NVIDIA sample's main() may call a host-side helper whose
+# implementation lives only in a header this repo never vendored (e.g.
+# shfl_integral_image.cuh). Two consumers used to answer two DIFFERENT
+# questions off the same "self_contained" flag: the coder prompt asked "does
+# this source have a main()?" (yes → reproduce it) while the verifier's
+# harness generator asked "should I expect the port to supply its own
+# main()?" (also yes, because self_contained said so) — and neither asked
+# "CAN the port supply a working main() at all?" When it can't, the pipeline
+# ends up with a translation unit that has neither the original driver (the
+# coder was told to drop the call it can't satisfy) nor a synthesized harness
+# (the verifier assumed one wasn't needed). port_mode is the single answer
+# both consumers now share.
+PORT_MODE_WHOLE_PROGRAM = "WHOLE_PROGRAM"
+PORT_MODE_DEVICE_SUBSET = "DEVICE_SUBSET"
+
+
+def is_self_contained(source: str) -> bool:
+    """True when *source* defines its own ``int main(`` at file scope."""
+    return bool(_MAIN_RE.search(source))
+
+
+def unresolved_local_headers(source: str) -> list[str]:
+    """Quoted local ``.cuh``/``.h``/``.hpp`` includes in *source* that don't
+    exist anywhere under ``sample_kernels/`` in this repo.
+
+    A full NVIDIA sample may depend on a project-specific header (e.g.
+    ``shfl_integral_image.cuh``) that was never vendored into this repo. Any
+    function whose implementation lives only in that header is an unresolvable
+    dependency: the coder cannot port code it cannot see, and inventing a stub
+    would silently change program behavior.
+
+    This is the canonical implementation — ``router.ModelRouter`` delegates to
+    it rather than keeping its own copy, so the portability decision below and
+    the coder's "must be DROPPED" instruction can never independently drift.
+    """
+    missing = []
+    for m in _LOCAL_INCLUDE_RE.finditer(source):
+        fname = m.group(1)
+        if not list(_SAMPLE_KERNELS_DIR.rglob(Path(fname).name)):
+            missing.append(fname)
+    return missing
+
+
+def determine_port_mode(source: str) -> str:
+    """The single portability decision, computed once from the original source.
+
+    DEVICE_SUBSET only when the source is self-contained AND depends on a
+    local header this repo cannot resolve — i.e. only when "port main() as a
+    whole program" is not merely undesired but actually impossible. Every
+    other source (bare kernel snippets, and self-contained programs whose
+    dependencies all resolve) stays WHOLE_PROGRAM, which is the pipeline's
+    existing, already-tested behavior.
+    """
+    if is_self_contained(source) and unresolved_local_headers(source):
+        return PORT_MODE_DEVICE_SUBSET
+    return PORT_MODE_WHOLE_PROGRAM
 
 # CUDA → HIP type mapping for spec generation
 _CUDA_TO_HIP_TYPES = {
@@ -214,16 +283,24 @@ def generate_spec_from_source(kernel_name: str, source: str) -> Optional[dict]:
     # Bug 4: anchored so a comment or string literal containing "int main("
     # mid-line can't false-positive (the two call sites in verifier.py that
     # this flag feeds already anchor the same check with ^ + MULTILINE).
-    self_contained = bool(re.search(r'^\s*int\s+main\s*\(', source, re.MULTILINE))
+    self_contained = is_self_contained(source)
+    port_mode = determine_port_mode(source)
+    spec["port_mode"] = port_mode
     if self_contained:
         spec["self_contained"] = True
-        # launch/input_setup/output_readback are dead config for a
-        # self-contained program: _generate_harness() (verifier.py) returns
-        # the ported source unwrapped and never consults them. Leaving
-        # fabricated values here — a hardcoded (float*,float*,int) launch
-        # guess for a kernel whose real params are (int*,int,int*) — is
-        # misleading config a future reader would reasonably trust.
-        return spec
+        if port_mode != PORT_MODE_DEVICE_SUBSET:
+            # launch/input_setup/output_readback are dead config for a
+            # WHOLE_PROGRAM self-contained program: _generate_harness()
+            # (verifier.py) returns the ported source unwrapped and never
+            # consults them. Leaving fabricated values here — a hardcoded
+            # (float*,float*,int) launch guess for a kernel whose real params
+            # are (int*,int,int*) — is misleading config a future reader
+            # would reasonably trust.
+            return spec
+        # DEVICE_SUBSET: the port will NOT supply its own main(), so the
+        # verifier DOES need a synthesized harness — fall through to the
+        # same launch/input_setup/output_readback generation a bare kernel
+        # snippet gets, below.
 
     # Generate launch config
     spec["launch"] = _guess_grid_block()

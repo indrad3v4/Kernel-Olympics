@@ -1,25 +1,24 @@
 {
   "kernel_name": "nvidia_shfl_scan",
   "kernel_function": "shfl_scan_test",
-  "description": "Auto-generated spec for nvidia_shfl_scan",
+  "description": "NVIDIA shfl_scan sample. main()/shuffle_simple_test()/shuffle_integral_image_test() depend on unvendored helper_cuda.h, helper_functions.h and shfl_integral_image.cuh and are intentionally NOT ported (see port_mode). Only the two __global__ kernels (shfl_scan_test, uniform_add) are ported and verified via a synthesized harness that invokes shfl_scan_test directly.",
+  "port_mode": "DEVICE_SUBSET",
+  "self_contained": true,
   "params": [
     {
-      "name": "data",
+      "name": "input",
       "type": "int*",
-      "direction": "in",
-      "size_expr": "count"
+      "direction": "in"
     },
     {
       "name": "width",
       "type": "int",
-      "direction": "scalar",
-      "size_expr": "count"
+      "direction": "scalar"
     },
     {
-      "name": "partial_sums",
+      "name": "output",
       "type": "int*",
-      "direction": "in",
-      "size_expr": "count"
+      "direction": "out"
     }
   ],
   "launch": {
@@ -29,19 +28,20 @@
       "z": 1
     },
     "block": {
-      "x": 64,
+      "x": 256,
       "y": 1,
       "z": 1
     }
   },
   "input_setup": {
-    "count": 512,
-    "default_value": 1.0
+    "count": 1024,
+    "default_value": 1
   },
   "output_readback": {
     "count": 4,
-    "element_type": "float",
-    "format": "float_per_line"
+    "element_type": "int",
+    "format": "int_per_line"
   },
-  "self_contained": true
+  "kernel_args_override": "64",
+  "dynamic_shared_mem": 16
 }

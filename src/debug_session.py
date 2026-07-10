@@ -1436,3 +1436,135 @@ def compiler_version(hipcc_path: str) -> str:
         out = ""
     _version_cache[hipcc_path] = out
     return out
+
+
+# ── Replay: consume a recorded session without a new LLM call ──────────────
+#
+# Debug Mode records; this replays. Given a session directory and a generation
+# number, re-run the SAME text-level gates (extraction, lexical, structural)
+# against the RECORDED raw response — no network call, no model, no cost. Two
+# uses: verify a gate fix against a real captured failure for free and
+# repeatably, and act as a forcing function on the artifact contract — if a
+# stage cannot be replayed from its own recorded input alone, that stage was
+# secretly depending on context nothing declared.
+#
+# Deliberately narrow: only the deterministic, pure-text stages replay (no
+# LLM calls to replay them against, by construction). The compiler stage is
+# NOT replayed here — hipcc's own determinism is the compiler's problem, and
+# 09_compiler/ already keeps the exact command, environment and version for a
+# human to reproduce that step manually if needed.
+
+def _find_artifact(session_dir: "str | Path", stage: str, contains: str) -> Optional[Path]:
+    """The single, sequence-numbered file in *stage* whose name contains
+    *contains*, or None. Raises nothing — a missing artifact is a normal
+    outcome for a generation that never reached that stage (e.g. a lexical
+    reject has no structural report)."""
+    stage_dir = Path(session_dir) / stage
+    if not stage_dir.is_dir():
+        return None
+    matches = sorted(p for p in stage_dir.glob(f"*{contains}*") if p.is_file())
+    return matches[0] if matches else None
+
+
+def replay_generation(session_dir: "str | Path", generation: int) -> Dict:
+    """Re-validate one recorded generation with zero new LLM calls.
+
+    Reads ``03_translation/*gen{generation:03d}*_raw_response.txt`` back from
+    disk and re-runs extraction → lexical → structural against it, exactly as
+    ``router._postprocess_port`` did the first time. Returns a dict with the
+    replayed verdicts and, where the original artifacts are present, a
+    ``matches_recorded`` comparison per stage — ``False`` there means either
+    the code under test has changed since the session was recorded, or the
+    recorded artifact and the replay disagree for a reason worth investigating.
+
+    Raises ``FileNotFoundError`` if the raw response for *generation* was never
+    recorded (wrong generation number, or a session from before this stage
+    existed) — a caller asking to replay something that was never captured
+    should see that plainly, not a silently empty result.
+    """
+    from verification.extraction import extract_code
+    from verification.lexical import validate_lexical
+    from verification.structural import validate_structure
+    # The SAME extraction fallback chain _postprocess_port uses — not just the
+    # v2 extractor. Replaying only the v2 extractor's verdict, when the
+    # original run fell through to the legacy regex fallback (as it does for
+    # anything the v2 extractor rejects outright), would silently validate a
+    # DIFFERENT string than the one hipcc/the structural gate actually saw —
+    # a replay that quietly checks a different algorithm than the one it
+    # claims to reproduce is worse than no replay at all.
+    from router import ModelRouter as _Router
+
+    session_dir = Path(session_dir)
+    gen_tag = f"gen{generation:03d}"
+
+    translation_dir = session_dir / STAGE_TRANSLATION
+    # log_generation() names this file "..._{gen_tag}_iter{N}_raw_response.txt";
+    # a direct glob for that exact suffix — not _find_artifact's looser
+    # substring match — is what keeps this from also matching the extracted
+    # code / report.json siblings the same generation writes alongside it.
+    candidates = sorted(translation_dir.glob(f"*{gen_tag}*_raw_response.txt")) \
+        if translation_dir.is_dir() else []
+    if not candidates:
+        raise FileNotFoundError(
+            f"no raw response recorded for generation {generation} under {translation_dir}")
+    raw_path = candidates[0]
+
+    raw_response = raw_path.read_text(encoding="utf-8")
+
+    original_cu_paths = sorted((session_dir / STAGE_INPUT).glob("*original.cu")) \
+        if (session_dir / STAGE_INPUT).is_dir() else []
+    original_source = (original_cu_paths[0].read_text(encoding="utf-8")
+                       if original_cu_paths else "")
+
+    extraction = extract_code(raw_response)
+    code = extraction.code if extraction.ok else _Router._extract_code(raw_response)
+    # Both gates run unconditionally on whatever `code` is — including empty —
+    # exactly as _postprocess_port does; validate_lexical/validate_structure
+    # both handle an empty string as a real (rejecting) verdict, not a case to
+    # special-case around. The try/except mirrors _postprocess_port's own
+    # defensive handling: a validator bug must not take down a replay either.
+    try:
+        lexical = validate_lexical(code)
+    except Exception:
+        lexical = None
+    structural = (validate_structure(original_source, code)
+                 if original_source else None)
+
+    result: Dict[str, Any] = {
+        "session_dir": str(session_dir),
+        "generation": generation,
+        "raw_response_path": str(raw_path),
+        "replayed": {
+            "extraction_ok": extraction.ok,
+            "extraction_strategy": extraction.strategy,
+            "lexical_ok": (lexical.ok if lexical is not None else None),
+            "lexical_reason": (lexical.reason() if lexical is not None else "no code to validate"),
+            "structural_ok": (structural.ok if structural is not None else None),
+            "structural_reason": (structural.reason() if structural is not None else "no original source recorded"),
+        },
+        "recorded": {},
+        "matches_recorded": {},
+        "llm_calls_made": 0,  # the whole point: always zero
+    }
+
+    lex_artifact = _find_artifact(session_dir, STAGE_LEXICAL, gen_tag)
+    if lex_artifact is not None:
+        try:
+            recorded_lex = json.loads(lex_artifact.read_text(encoding="utf-8"))
+            result["recorded"]["lexical_pass"] = recorded_lex.get("pass")
+            result["matches_recorded"]["lexical"] = (
+                recorded_lex.get("pass") == result["replayed"]["lexical_ok"])
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    struct_artifact = _find_artifact(session_dir, STAGE_STRUCTURAL, gen_tag)
+    if struct_artifact is not None:
+        try:
+            recorded_struct = json.loads(struct_artifact.read_text(encoding="utf-8"))
+            result["recorded"]["structural_pass"] = recorded_struct.get("pass")
+            result["matches_recorded"]["structural"] = (
+                recorded_struct.get("pass") == result["replayed"]["structural_ok"])
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return result
