@@ -374,7 +374,7 @@ CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explan
         strategy for this model has been exhausted — the caller then moves
         to the next model, never straight to the template fallback.
         """
-        timeout = 60 if is_primary else 15
+        timeout = 120 if is_primary else 30
         messages = [
             {"role": "system", "content": self.SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
