@@ -1,5 +1,5 @@
 """
-Porting Agent — uses Fireworks API to fix CUDA→ROCm porting issues.
+Porting Agent - uses Fireworks API to fix CUDA->ROCm porting issues.
 
 Input: flagged kernel + surrounding context + any retrieved similar pattern
 Model: Fireworks API (AMD-hosted catalog)
@@ -7,11 +7,13 @@ Output: ported code + confidence score + explanation of the fix
 
 Confidence-gated: if confidence < threshold, flag for human review.
 
-Every code path here that returns a ``ported_code`` field routes the string
-through :func:`verification.extraction.extract_code` (to strip prose /
-markdown / JSON wrappers) and then :func:`verification.lexical.validate_lexical`
-(to reject reasoning at top level).  A response that fails either gate is
-NEVER returned as ``ported_code`` — the caller sees ``rejected: True`` and
+The LLM is prompted to return a strict JSON object with a ``ported_code``
+string field.  The response is parsed as JSON, then the extracted
+``ported_code`` value is routed through
+:func:`verification.lexical.validate_lexical` (to reject reasoning at
+top level).  Prose in the ``explanation`` / ``changes`` metadata fields
+never reaches the lexical gate.  A response that fails the gate is NEVER
+returned as ``ported_code`` — the caller sees ``rejected: True`` and
 the raw response in a diagnostic field instead.
 """
 
@@ -32,13 +34,12 @@ from pathlib import Path
 _SRC_ROOT = Path(__file__).resolve().parent.parent
 if str(_SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(_SRC_ROOT))
-from verification.extraction import extract_code as _extract_code_v2
 from verification.lexical import validate_lexical as _validate_lexical
 # router.ModelRouter._fix_ported_code is the comprehensive CUDA→HIP header/API
 # rewriter (cuda_runtime.h→hip/hip_runtime.h, cudaMalloc→hipMalloc, etc.).
 # Reused here so the template fallback below can never emit CUDA headers —
 # it previously ran only the wavefront32→64 fixups and left includes alone.
-from router import ModelRouter as _ModelRouter
+from router import Deadline, ModelRouter as _ModelRouter
 
 
 class FailureType:
@@ -151,8 +152,9 @@ PORTING RULES (follow all that apply):
 12. Lane identification: if (lane_id < 32) → if (lane_id < 64) for wavefront boundary
 13. __shfl_sync (basic shuffle) — mask and lane count must be adjusted for wavefront64
 
-OUTPUT FORMAT — STRICT JSON (no prose, no extra text):
-Respond with a single JSON object inside a ```json markdown code block.
+OUTPUT FORMAT — STRICT JSON (no markdown fence, no extra text):
+Respond with a single JSON object. NO markdown code block (no ```json ... ```).
+Your response must START WITH '{' (opening brace of the JSON object).
 The JSON object must have EXACTLY these four fields:
 
 {
@@ -163,16 +165,14 @@ The JSON object must have EXACTLY these four fields:
 }
 
 EXAMPLE:
-```json
 {
   "ported_code": "__global__ void vec_add(float* a, float* b, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) a[i] += b[i]; }",
   "confidence": 88,
   "changes": ["Replaced warp32 hardcodes with WAVEFRONT_SIZE (64)", "Changed __syncwarp() to __syncthreads()"],
   "explanation": "Ported warp-32 kernel to wavefront-64 HIP by replacing hardcoded 32 with WAVEFRONT_SIZE and fixing sync primitives."
 }
-```
 
-CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explanation before it, no summary after it. If I cannot parse valid JSON from your response, the pipeline fails.
+CRITICAL: Return ONLY the JSON object. No introductory text, no explanation before it, no summary after it. If I cannot parse valid JSON from your response, the pipeline fails.
 """
 
     # ✅ VERIFIED WORKING on Fireworks API (tested, confirmed):
@@ -253,13 +253,20 @@ CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explan
     _BACKOFF_BASE_SECONDS = 1.0
 
     _REASONING_RECOVERY_PROMPT = (
-        "Your previous response contained analysis instead of code.\n\n"
-        "Return ONLY the complete HIP source file.\n\n"
-        "Do not include explanations.\n\n"
-        "Do not include Markdown.\n\n"
-        "Do not include reasoning.\n\n"
-        "Return a complete compilable translation unit."
+        "Your previous response contained analysis or malformed output.\n\n"
+        "Return ONLY a JSON object with these fields:\n"
+        "  - \"ported_code\": the full HIP kernel source code (string)\n"
+        "  - \"confidence\": rubric-based confidence score (integer 0-100)\n"
+        "  - \"changes\": list of change descriptions (array of strings)\n"
+        "  - \"explanation\": short explanation of the fix (string)\n\n"
+        "NO markdown fence. NO extra text. Your response must start with '{'.\n"
+        "If your response is not valid JSON, the pipeline fails."
     )
+
+    # JSON prefill — forces the model to start with the ported_code field.
+    # This is prepended before the user message in _post_chat so the model
+    # sees the opening of a JSON object and continues from there.
+    _PREFILL = '{"ported_code":'
 
     _STATUS_ICONS = {
         "ok": "✅", "retry": "🔁", "recovery": "🩹", "exhausted": "🛑",
@@ -285,15 +292,22 @@ CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explan
     def _post_chat(self, model: str, messages: list, timeout: float):
         """One raw Fireworks chat-completion call.
 
-        Returns ``(content, call_cost, latency_ms)``. Raises on any
-        transport/HTTP failure — the caller classifies and decides whether
-        to retry.
+        Adds a JSON prefill message to force the model to start with the
+        ``ported_code`` field.  Returns ``(content, call_cost, latency_ms)``
+        where *content* is the full reconstructed JSON text (prefill prefix
+        + model continuation).  Raises on any transport/HTTP failure — the
+        caller classifies and decides whether to retry.
         """
         import urllib.request
         import json as _json
+        # Append assistant prefill so the model continues from
+        # ``{"ported_code":"``, guaranteeing a JSON-shaped output.
+        prefilled = messages + [
+            {"role": "assistant", "content": self._PREFILL},
+        ]
         data = _json.dumps({
             "model": model,
-            "messages": messages,
+            "messages": prefilled,
             "temperature": 0.1,
             "max_tokens": 2048,
         }).encode()
@@ -310,7 +324,9 @@ CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explan
             raw_body = resp.read()
         latency_ms = (time.perf_counter() - t0) * 1000.0
         result = json.loads(raw_body)
-        content = result["choices"][0]["message"]["content"]
+        model_content = result["choices"][0]["message"]["content"]
+        # Reconstruct the full response: prefill + model continuation
+        content = self._PREFILL + model_content
         usage = result.get("usage", {})
         tokens_used = (
             usage.get("total_tokens", 0)
@@ -321,60 +337,73 @@ CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explan
         return content, call_cost, latency_ms
 
     def _try_extract(self, content: str):
-        """Run the full extraction pipeline against one LLM response.
+        """Extract ported_code from the LLM's JSON response.
 
-        Strategy order: (1) JSON object with a ``ported_code`` field, (2)
-        markdown-fenced ```cpp/```c++/```hip/```cuda blocks and JSON-field
-        variants (via :func:`verification.extraction.extract_code`), (3) a
-        sliding raw-text window anchored on ``#include``/``__global__``/
-        ``namespace``/``template``, with conversational prose stripped by
-        the legacy stripper. Only after every strategy fails is this
-        classified as an extraction failure.
+        JSON-with-``ported_code`` is the ONLY accepted shape.  The prefill
+        in ``_post_chat`` already ensures the response starts with
+        ``{"ported_code":...`` so we parse it directly.
+
+        The lexical gate (``_gate_code``) runs ONLY on the extracted
+        ``ported_code`` string value — prose in ``explanation`` / ``changes``
+        metadata fields can never fail the port.
 
         Returns ``(fixed_code, parsed_json_or_None, failure_type_or_None, note)``.
         """
         if not content or not content.strip():
             return None, None, FailureType.EMPTY_RESPONSE, "empty response body"
 
-        # Strategy 1: JSON object with a ported_code field.
-        parsed = self._extract_json_from_text(content)
-        if parsed and "ported_code" in parsed:
-            fixed = self._fix_ported_code(parsed["ported_code"])
-            ok, reason = self._gate_code(fixed)
-            if ok:
-                return fixed, parsed, None, "json-field"
-            failure = (FailureType.REASONING_ONLY if "reasoning" in reason.lower()
-                      else FailureType.PARTIAL_CODE)
-            return None, None, failure, f"json-field rejected by lexical gate: {reason}"
+        # Parse the prefill-shaped response as JSON.
+        parsed: Optional[Dict] = None
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            return None, None, FailureType.INVALID_JSON, (
+                f"JSON parse failed (prefill reconstructed): "
+                f"content starts with {content[:80]!r}"
+            )
 
-        # Strategy 2/3: fenced cpp/c++/hip blocks, raw #include/__global__/
-        # namespace/template window, conversational-text stripping.
-        extraction = _extract_code_v2(content)
-        code_text = (extraction.code or "").strip()
-        if not code_text:
-            code_text = self._extract_code_from_text(content)
-        if code_text:
-            fixed = self._fix_ported_code(code_text)
-            ok, reason = self._gate_code(fixed)
-            if ok:
-                return fixed, None, None, f"text-extract:{extraction.strategy}"
-            failure = (FailureType.REASONING_ONLY if "reasoning" in reason.lower()
-                      else FailureType.EXTRACTION_FAILURE)
-            return None, None, failure, f"text-extract rejected by lexical gate: {reason}"
+        if not isinstance(parsed, dict) or "ported_code" not in parsed:
+            return None, None, FailureType.INVALID_JSON, (
+                "JSON parsed but missing 'ported_code' field"
+            )
 
-        if parsed is not None:
-            return None, None, FailureType.INVALID_JSON, "JSON parsed but had no ported_code field"
-        return None, None, FailureType.EXTRACTION_FAILURE, "no code-shaped block found (markdown/JSON/raw-window all failed)"
+        code = parsed["ported_code"]
+        if not isinstance(code, str) or not code.strip():
+            return None, None, FailureType.EMPTY_RESPONSE, (
+                "ported_code field is empty or not a string"
+            )
+
+        fixed = self._fix_ported_code(code)
+        ok, reason = self._gate_code(fixed)
+        if ok:
+            return fixed, parsed, None, "json-field"
+        failure = (FailureType.REASONING_ONLY if "reasoning" in reason.lower()
+                  else FailureType.PARTIAL_CODE)
+        return None, None, failure, (
+            f"ported_code rejected by lexical gate: {reason}"
+        )
 
     def _attempt_model(self, model: str, user_prompt: str, is_primary: bool,
-                       infra_failures: List[Dict]) -> Optional[Dict]:
+                       infra_failures: List[Dict],
+                       deadline: Optional[Deadline] = None) -> Optional[Dict]:
         """Try one model end-to-end, with retry and reasoning-recovery.
+
+        When *deadline* is provided, the per-request timeout is clamped to
+        the remaining wall clock (minus a safety margin) so it cannot
+        overrun the shared pipeline budget.
 
         Returns a result dict on success, or ``None`` once every recovery
         strategy for this model has been exhausted — the caller then moves
         to the next model, never straight to the template fallback.
         """
+        # Clamp timeout to remaining deadline if available, with a 5s
+        # safety margin so we never issue a request that cannot round-trip.
         timeout = 120 if is_primary else 30
+        if deadline is not None:
+            remaining = deadline.remaining()
+            if remaining is not None:
+                clamped = max(0.0, remaining - 5.0)
+                timeout = min(timeout, max(0.0, clamped))
         messages = [
             {"role": "system", "content": self.SYSTEM_PROMPT},
             {"role": "user", "content": user_prompt},
@@ -410,20 +439,14 @@ CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explan
                     self._log_event(model, status="ok", note=note, attempt=attempt,
                                     final="accepted — recovery/retry not needed" if attempt == 1
                                           else "accepted after recovery")
-                    if parsed:
-                        parsed["ported_code"] = fixed
-                        parsed["cost"] = call_cost
-                        parsed.setdefault("confidence", self._rubric_score_extracted(fixed))
-                        parsed.setdefault("changes", [])
-                        parsed.setdefault("explanation", "")
-                        return parsed
-                    return {
-                        "ported_code": fixed,
-                        "confidence": self._rubric_score_extracted(fixed),
-                        "changes": ["LLM returned text without valid JSON — extracted code block"],
-                        "explanation": "Code extracted from LLM text output",
-                        "cost": call_cost,
-                    }
+                    # With the new JSON-only contract, parsed is always set
+                    # when fixed is set (no more raw-text extraction).
+                    parsed["ported_code"] = fixed
+                    parsed["cost"] = call_cost
+                    parsed.setdefault("confidence", self._rubric_score_extracted(fixed))
+                    parsed.setdefault("changes", [])
+                    parsed.setdefault("explanation", "")
+                    return parsed
 
                 self._record_health(model, failure_type=failure_type, latency_ms=latency_ms)
                 last_failure_type, last_note = failure_type, note
@@ -464,8 +487,13 @@ CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explan
         return None
 
     def port_kernel(self, source_code: str, context: str = "",
-                    cached_pattern: Optional[Dict] = None) -> Dict:
-        """Port a CUDA kernel to ROCm/HIP using LLM."""
+                    cached_pattern: Optional[Dict] = None,
+                    deadline: Optional[Deadline] = None) -> Dict:
+        """Port a CUDA kernel to ROCm/HIP using LLM.
+
+        When *deadline* is provided and expired/exhausted, the LLM cascade
+        is skipped entirely and the template fallback is used immediately.
+        """
 
         # TRIZ: Fix source code BEFORE any LLM/template processing
         fixed_source = self._fix_ported_code(source_code)
@@ -490,6 +518,21 @@ CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explan
         if not self.api_key or self.api_key == "test":
             return self._template_port(fixed_source, cached_pattern)
 
+        # Shared-budget shortcut: if deadline is exhausted or near-empty,
+        # skip the LLM cascade and go straight to template fallback.
+        # This prevents the second engine from burning 200s on calls
+        # that cannot possibly succeed within the remaining wall clock.
+        if deadline is not None:
+            remaining = deadline.remaining()
+            if remaining is not None and remaining < 5.0:
+                result = self._template_port(fixed_source, cached_pattern)
+                if "ported_code" in result:
+                    result["ported_code"] = self._fix_ported_code(result["ported_code"])
+                result["used_fallback"] = True
+                result["template_only"] = True
+                result["failure_classification"] = "infrastructure"
+                return result
+
         # Health-ordered fallback list: self.model always goes first (it is
         # the configured preference), the rest are tried in order of THIS
         # session's observed reliability rather than a fixed static list —
@@ -501,11 +544,22 @@ CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explan
         infra_failures: List[Dict] = []
         for model in models_to_try:
             result = self._attempt_model(model, user_prompt, is_primary=(model == primary),
-                                         infra_failures=infra_failures)
+                                         infra_failures=infra_failures, deadline=deadline)
             if result is not None:
                 result["failure_classification"] = None
                 result["used_fallback"] = False
                 return result
+
+            # EXTRACTION_FAILURE and other non-transient format rejections
+            # mean "this model cannot comply with the format contract" —
+            # surface immediately rather than burning the fallback budget
+            # on another model that is equally incapable of extracting code.
+            if infra_failures:
+                last_failure = infra_failures[-1].get("failure_type")
+                if last_failure and not FailureType.is_transient(last_failure):
+                    print(f"║ 🛑 Model '{model}' failed with non-transient "
+                          f"{last_failure} — format rejection, stopping cascade")
+                    break
 
         # Every model — with retries and reasoning-recovery follow-ups —
         # failed to produce usable code. This is the ONLY point at which the
@@ -812,16 +866,61 @@ CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explan
             print(f"║ ⚠️ Mask fix: {before} found, {after} remaining (regex issue!)")
         return code
 
+    @staticmethod
+    def _extract_device_code(source_code: str) -> tuple[str, str]:
+        """Split source into device kernel code and host code.
+
+        Returns (device_code, host_code) where device_code contains only
+        __global__ / __device__ kernel definitions and their supporting
+        declarations.  Host code (main(), CPUverify(), includes, etc.) is
+        returned separately and appended back after template transforms
+        so line-by-line regex substitutions only touch the kernel.
+        """
+        import re
+        lines = source_code.split('\n')
+        device_lines: list[str] = []
+        host_lines: list[str] = []
+        in_device = False
+        depth = 0
+        # Heuristic: treat lines as "device" when inside a __global__ or
+        # __device__ function definition, or inside a supporting struct /
+        # declaration block that appears right before one.
+        for line in lines:
+            stripped = line.strip()
+            if not in_device:
+                # Check for kernel / device function start
+                if re.search(r'(?:__global__|__device__|__host__\s+__device__)\s+void\s+\w+\s*\(', stripped):
+                    in_device = True
+                    depth = 0
+                    device_lines.append(line)
+                    continue
+                # Still host
+                host_lines.append(line)
+            else:
+                device_lines.append(line)
+                # Track brace depth to detect end of function
+                depth += stripped.count('{') - stripped.count('}')
+                if depth <= 0 and stripped.endswith('}'):
+                    in_device = False
+        return '\n'.join(device_lines), '\n'.join(host_lines)
+
     def _template_port(self, source_code: str,
                        cached_pattern: Optional[Dict] = None) -> Dict:
-        """Template-based porting for when API is unavailable (demo fallback)."""
+        """Template-based porting for when API is unavailable (demo fallback).
 
+        Only applies warp32→wavefront64 transformations to the device kernel
+        code; host code (main(), CPUverify(), includes) is preserved as-is.
+        """
         import re
         changes = []
-        lines = source_code.split('\n')
+        has_added_wave64_shfl = False
+
+        # Split into device kernel and host code so template transforms
+        # only touch actual kernel code, not host wrappers.
+        device_code, host_code = self._extract_device_code(source_code)
+        lines = device_code.split('\n')
         result_lines = []
         wavefront_header_added = False
-        has_added_wave64_shfl = False
 
         # Template transformations (only on non-comment lines)
         shared_32_re = re.compile(r'(__shared__[^;]*?\[\s*)32(\s*\])')
@@ -993,6 +1092,21 @@ CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explan
                 if "shuffle loop bound" not in str(changes):
                     changes.append("shuffle scan loop bound offset < 32 → offset < WAVEFRONT_SIZE (6 steps for wavefront64)")
 
+            # Fix 15: blockDim.x / warpSize → guard against width-1 on wavefront64.
+            # On wavefront64, blockDim.x / 64 = 1 when blockDim.x = 64, which
+            # causes __shfl_up_sync to use width=1 → lane -1 → LDS OOB → SIGSEGV.
+            if re.search(
+                r'(?:int|unsigned|unsigned\s+int)\s+\w+\s*=\s*blockDim\s*\.\s*x\s*/\s*(?:warpSize|WARP_SIZE|32)\b',
+                line,
+            ):
+                line = re.sub(
+                    r'(\w+)\s*=\s*(blockDim\s*\.\s*x\s*/\s*(?:warpSize|WARP_SIZE|32))',
+                    r'\1 = max(\2, 2u)',
+                    line,
+                )
+                if "blockDim width guard" not in str(changes):
+                    changes.append("blockDim.x/warpSize width guarded with max(..., 2u) for wavefront64 (prevents width-1 SIGSEGV)")
+
 
             # Track what changed
             if line != original:
@@ -1021,6 +1135,10 @@ CRITICAL: Return ONLY the ```json ... ``` block. No introductory text, no explan
 
         # Fix 9: Add wavefront awareness header (unless already present or first line has it)
         code = '\n'.join(result_lines)
+        # Recombine device kernel with untouched host code so includes,
+        # main(), and CPUverify() stay intact.
+        if host_code.strip():
+            code = code + '\n\n// --- Host code (preserved as-is) ---\n' + host_code
         if "#define WAVEFRONT_SIZE 64" not in code:
             code = "#define WAVEFRONT_SIZE 64  // AMD GPU wavefront size\n" + code
             changes.append("Added #define WAVEFRONT_SIZE 64 header")

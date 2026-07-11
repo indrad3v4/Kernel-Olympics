@@ -431,7 +431,11 @@ class KernelOlympics:
                         dbg.transition("TEMPLATE_FALLBACK",
                                        reason="orchestrator returned no code — "
                                               "porting mechanically without an LLM")
-                        port_result = self.porting_agent.port_kernel(source)
+                        # Share the router's deadline so the porting agent
+                        # does not start a fresh 210s budget; if the deadline
+                        # is exhausted it goes straight to template fallback.
+                        port_result = self.porting_agent.port_kernel(
+                            source, deadline=self.router._deadline)
                         dbg.write_text("03_translation", "template_fallback.hip.cpp",
                                        port_result.get("ported_code", ""))
                         pipeline_state["total_cost"] += port_result.get("cost", 0)
