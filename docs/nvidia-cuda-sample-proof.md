@@ -10,7 +10,7 @@
 | Step | Status | Details |
 |------|--------|---------|
 | Scan | ✅ | Coverage: 0% (no hipify-clang) |
-| Classify | ✅ | **RED** — shfl_up_sync (high), warp_size_constant × 2 (medium) |
+| Classify | ✅ | **YELLOW** — shfl_up_sync (medium), warp_size_constant × 2 (medium) |
 | Memory | ✅ | 0 cached (first run) |
 | Port | ✅ | GLM(planner) → Kimi K2.7(coder) → DeepSeek(verifier) — 25%, 12s |
 | Verify | ⏳ | Pending — run `scripts/verify_on_amd_gpu.py` on AMD Developer Cloud |
@@ -21,7 +21,7 @@
 nvidia_shfl_scan.cu: 
   [medium] L253: warp_size_constant
   [medium] L280: warp_size_constant  
-  [high]   L78:  shfl_up_sync
+  [medium] L78:  shfl_up_sync
 ```
 
 ## Key Takeaway
