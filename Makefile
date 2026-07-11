@@ -15,6 +15,9 @@ KERNEL_NAME   ?= $(shell basename "$(CU_FILE)" .cu)
 PORTED        := ported_kernels/$(KERNEL_NAME).hip.cpp
 BINARY        := /tmp/$(KERNEL_NAME)_proof
 PROOF         := /tmp/proof_harness.hip.cpp
+GH_USER       ?= indrad3v4
+GH_REPO       ?= Kernel-Olympics
+GH_BRANCH     ?= main
 
 # ── Virtual environment ---------------------------------------
 .venv:
@@ -91,18 +94,42 @@ speed-demo: .venv  ## Run speed‑comparison demo: LLM vs cache
 
 speed-demo-reset: .venv  ## Speed demo with fresh cache
 	$(PYTHON) -m src.main --demo --reset
-debug:  ## Debug artifacts enabled
-	$(MAKE) pipeline FLAGS="--debug"
 
-push:  ## git add -A + commit + push (interactive)
-	git add -A && git commit -m "$(MSG)" && git push origin main
-	@echo "✅ Pushed to GitHub"
+# ── GitHub sync ------------------------------------------------
+
+pull:  ## git pull latest from GitHub
+	git pull origin $(GH_BRANCH)
+	@echo "  ✅ $(GH_BRANCH) synced from github.com/$(GH_USER)/$(GH_REPO)"
+
+push:  ## git add -A + commit + push (use MSG="message")
+	git add -A && git commit -m "$(MSG)" && git push origin $(GH_BRANCH)
+	@echo "  ✅ Pushed to github.com/$(GH_USER)/$(GH_REPO)"
+
+sync: pull push  ## Pull latest, then push local changes
+
+# ── First-time setup ------------------------------------------
+
+setup:  ## Clone repo + venv + install (one-shot on new machine)
+	git clone https://github.com/$(GH_USER)/$(GH_REPO).git /tmp/$(GH_REPO) 2>/dev/null; \
+	if [ -d /tmp/$(GH_REPO) ]; then \
+	    rsync -a /tmp/$(GH_REPO)/ .; rm -rf /tmp/$(GH_REPO); \
+	fi; \
+	git pull origin $(GH_BRANCH)
+	$(MAKE) install
+	@echo "  ✅ $(GH_REPO) ready on this machine"
+
+reclone:  ## Full re-clone (zaps local changes)
+	rm -rf .git .venv
+	git clone https://github.com/$(GH_USER)/$(GH_REPO).git /tmp/$(GH_REPO) && \
+	rsync -a --remove-source-files /tmp/$(GH_REPO)/ . && \
+	rm -rf /tmp/$(GH_REPO) && \
+	$(MAKE) install
+	@echo "  ✅ Fresh clone of $(GH_REPO)"
 
 # ── Deployment -------------------------------------------------
 
-push-to-cation:  ## Push to AMD workspace (cation) via SSH
-	git push origin main
-	ssh cation "cd /workspace/Kernel-Olympics && git pull origin main"
+push-to-cation: pull  ## Push to AMD workspace (cation) via SSH
+	ssh cation "cd /workspace/Kernel-Olympics && git pull origin $(GH_BRANCH)"
 	@echo "  ✅ cation synced to origin/main"
 
 # ── Debug / daemon ---------------------------------------------
@@ -155,12 +182,25 @@ help:  ## Show this help menu
 	@printf '\n  \033[1mUtility\033[0m\n'
 	@printf '    \033[1;34m%-16s\033[0m %s\n' "clean"        "Remove artifacts"
 	@printf '    \033[1;34m%-16s\033[0m %s\n' "clean-all"    "+ remove .venv + ported kernels"
-	@printf '    \033[1;34m%-16s\033[0m %s\n' "watch"        "Daemon mode (auto-process)"
-	@printf '    \033[1;34m%-16s\033[0m %s\n' "debug"        "Debug artifacts enabled"
-	@printf '    \033[1;34m%-16s\033[0m %s\n' "push"         "git add -A + commit + push"
+	@printf '    \033[1;34m%-16s\033[0m %s\n' "setup"        "Full first-time setup on new machine"
+	@printf '    \033[1;34m%-16s\033[0m %s\n' "reclone"      "Fresh clone (zaps local changes)"
+	@printf '\n  \033[1mGitHub sync\033[0m\n'
+	@printf '    \033[1;34m%-16s\033[0m %s\n' "pull"         "git pull latest from GitHub"
+	@printf '    \033[1;34m%-16s\033[0m %s\n' "push"         "git add+commit+push (MSG=...)"
+	@printf '    \033[1;34m%-16s\033[0m %s\n' "sync"         "pull then push (two-way sync)"
+	@printf '    \033[1;34m%-16s\033[0m %s\n' "push-to-cation" "Pull here, pull on AMD workspace"
+	@printf '\n  \033[1mWatch & debug\033[0m\n'
+	@printf '    \033[1;34m%-16s\033[0m %s\n' "debug"   "Debug artifacts saved"
+	@printf '    \033[1;34m%-16s\033[0m %s\n' "watch"   "Daemon mode (auto-process)"
 	@printf '\n  \033[2mExamples:\033[0m\n'
 	@printf '    make pipeline                       # Full cycle (default kernel)\n'
 	@printf '    make pipeline CU_FILE=path/to/x.cu  # Full cycle (any kernel)\n'
 	@printf '    make demo                           # Recordable demo\n'
 	@printf '    make test                           # 665 unit tests\n'
-	@printf '    make port-all                       # Port every sample\n\n'
+	@printf '    make port-all                       # Port every sample\n'
+	@printf '    make pull                           # git pull from GitHub\n'
+	@printf '    make push MSG="my fix"              # add + commit + push\n'
+	@printf '    make setup                          # Clone + install (new machine)\n'
+	@printf '    make reclone                        # Fresh clone from scratch\n'
+	@printf '    make push-to-cation                 # Sync to AMD workspace\n'
+	@printf '    make debug CU_FILE=path/to/x.cu     # Debug artifacts only\n\n'
