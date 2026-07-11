@@ -8,7 +8,7 @@
 ### 2. State in submission:
 - "Verified via real compilation + execution on AMD MI300X"
 - "Gemma Prize ($6,000) eligible — Gemma 4 attempted on AMD GPU via vLLM (fallback: DeepSeek verified)"
-- "3-model MOA: GLM(planner) → Kimi K2.7(coder) → Gemma 4/DeepSeek(verifier)"
+- "4-model MOA: DeepSeek v4 Pro(planner) → GLM-5.2(coder) → Kimi K2.7(evaluator) + Gemma 4/DeepSeek(verifier fallback)"
 
 ### 3. Add "vs static analysis" section
 Their verify = syntax check. Our verify = real hipcc compile + MI300X run + numeric diff.

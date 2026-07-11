@@ -4,7 +4,10 @@ Terminal recording script for the **Kernel Olympics AMD Track 3** submission vid
 
 Shows the **multi-agent loop architecture**: **CUDA kernel → SCAN → PLAN → PORT → EVAL → VERIFY → PASS on real AMD GPU**.
 
-> ⚠️ **Integrity note:** The demo runs REAL commands on REAL AMD hardware. Nothing is simulated, nothing is faked. The VERIFY stage's device-only proof retry is implemented in `src/verification/verifier.py` — the fallback happens automatically inside the orchestration loop, not via an external cron agent.
+> **Integrity note:** The demo runs REAL commands on REAL AMD hardware.
+> Nothing is simulated, nothing is faked. The VERIFY stage's device-only proof
+> retry is implemented in `src/verification/verifier.py` — the fallback happens
+> automatically inside the orchestration loop, not via an external agent.
 
 ---
 
@@ -59,14 +62,15 @@ INPUT CUDA → SCAN → PLAN → PORT → EVAL → VERIFY → REPORT
                      v4                K2.7    + AMD GPU
 ```
 
-When VERIFY's full-harness compile fails (unportable SDK host code), it automatically retries with a **device-only proof**:
+When VERIFY's full-harness compile fails (unportable SDK host code), it
+automatically retries with a **device-only proof** inside the loop:
 
-1. `_strip_to_device_code()` — extract device functions from ported source
+1. `_strip_to_device_code()` — extract device functions
 2. `_fix_hip_intrinsics()` — convert `__shfl_up_sync` → `__shfl_up`
 3. `_try_device_only_proof()` — generate minimal harness, re-compile
 4. If compile succeeds → **run on real AMD GPU** → correctness check
 
-All inside the multi-agent loop. No cron jobs, no external watchers, no human intervention.
+No cron jobs. No external watchers. No human in the middle.
 
 ---
 

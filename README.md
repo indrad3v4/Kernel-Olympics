@@ -21,9 +21,7 @@ AMD's #1 adoption blocker isn't hardware — it's software migration friction.
 **One kernel at a time.** We scan, classify, auto-port, compile, and verify CUDA→ROCm migration on real AMD hardware.
 
 ```
-Submit CUDA kernel → Scanner (up to ~96.7% coverage with hipify-clang; "unknown" without it) → Risk classifier (5 warp/wavefront patterns)
-  → Pattern memory (trigram index, 0.2ms) → Porting agent (Fireworks API or template)
-    → Verify on AMD GPU (real hipcc) → Report (Gemma-generated)
+Submit CUDA kernel → Risk classifier (RED/YELLOW/GREEN based on warp/wavefront patterns) → Pattern memory (trigram index, 0.2ms) → 4-model MOA (DeepSeek plans → GLM ports → Kimi validates → Gemma/DeepSeek verifies) → Verify on AMD GPU (real hipcc + run + numeric diff)
 ```
 
 **Demo:** `python3 src/main.py --input sample_kernels/cuda/warp_reduce.cu`
@@ -35,7 +33,7 @@ Submit CUDA kernel → Scanner (up to ~96.7% coverage with hipify-clang; "unknow
 | Coverage | ~80% (syntax only) | **Pattern-aware** — catches warp/wavefront divergence |
 | Verification | Manual | **Auto-compile + run + diff** on AMD GPU |
 | Memory | Stateless | **Trigram cache** — cache hits skip the LLM (0.2ms). Up to ~60,000× vs a simulated 12s LLM baseline; real ratio measured with a live API key |
-| Report | None | **Gemma-generated** plain-English summary |
+| LLM Pipeline | None | **4-model MOA** — DeepSeek(planner) → GLM(coder) → Kimi(evaluator) + Gemma/DeepSeek(verifier) |
 
 ## 🚀 Try it
 
