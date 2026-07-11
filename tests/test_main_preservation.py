@@ -424,6 +424,15 @@ class TestRouteLinkerShortCircuit:
         verifier._run.return_value = (True, "42\n", 0, 0)
         verifier._signal_name.return_value = ""
 
+        # gemma4 returns {\"pass\": true} so the in-loop Gemma gate passes
+        mock_call_side = mock_call.side_effect
+
+        def gemma_aware_side_effect(model_key, *a, **k):
+            if model_key == "gemma4":
+                return AgentResult(model_key, True, '{"pass": true}', 0.5)
+            return mock_call_side(model_key, *a, **k)
+
+        mock_call.side_effect = gemma_aware_side_effect
         result = router.route(SELF_CONTAINED_CUDA, [], max_iterations=4,
                               verifier=verifier, kernel_name="test_mainlink",
                               max_seconds=0, fast_path=False)

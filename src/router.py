@@ -3854,6 +3854,7 @@ class ModelRouter:
             compile_failed_this_iter = False
             run_crashed_this_iter = False  # RUN-FIRST: set by the in-loop run check below
             replanned_this_iter = False
+            gemma_rejected_this_iter = False
             glm_analysis = None
             linker_only = False
             # Compile-branch locals. Previously bound ONLY inside the compile-fail
@@ -5004,24 +5005,78 @@ class ModelRouter:
                         "- WAVEFRONT_SIZE 64\n"
                     )
 
-            # ── Step 3: Convergence check ───────────────────────────────────
-            # Converged when: compile passed AND the binary RAN AND GLM passed.
-            # RUN-FIRST: a compile-pass + GLM-pass on a binary that SIGSEGVs is
-            # not convergence — the 2026-07-09 run shipped exactly that.
+            # ── Step 3: Convergence check ── Gemma 4 gate inside the loop ──
+            # Converged when: compile passed AND the binary RAN AND GLM passed
+            # AND Gemma 4 verification passes. If Gemma rejects, trigger a
+            # DeepSeek re-plan and continue iterating.
             if parsed is not None and parsed.get("pass", False) and not run_crashed_this_iter and oracle_passed:
-                verify_success = True
-                verify_passed = True
-                result["changes"].append(
-                    f"[glm] Passed semantic evaluation (iteration {iteration})")
-                # Compile already passed (we only ran GLM because it did),
-                # or there's no verifier (GLM pass is sufficient in that case).
-                # oracle_passed is also required when an oracle is available
-                # (Fix 3: correctness gates convergence, not just compile success).
-                result["orchestrator_passed"] = True
-                self.debug.transition(
-                    "SUCCESS", reason="compile + run + semantic evaluation + oracle all passed",
-                    validation_result=True, iteration=iteration)
-                break  # Truly converged — compile + run + GLM + oracle all passed
+                # ── Gemma 4 verification gate ──
+                gemma_prompt = self._build_glm_evaluate_prompt(
+                    result["ported_code"], patterns,
+                    regex_changelog=result.get("regex_changelog"),
+                )
+                self._debug_stage = "10_evaluation"
+                if on_phase: on_phase("verify", "Gemma 4", "Gemma 4 → DeepSeek v4 Pro fallback")
+                verify = self._call_model("gemma4", gemma_prompt,
+                                          system_prompt=SYSTEM_PROMPTS.get("glm", ""))
+                self._debug_stage = ""
+                if verify.success:
+                    verify_success = verify_success or True
+                    verify_passed = verify_passed or True
+                    result["model_used"] = "gemma4"
+                    last_call = self.call_log[-1] if self.call_log else {}
+                    verify_source = last_call.get("source", "fireworks")
+                    source_label = ("local vLLM (AMD GPU)" if "local" in verify_source else (
+                        "DeepSeek v4 Pro fallback (Gemma unavailable)" if "fallback" in verify_source
+                        else "Fireworks API"))
+                    try:
+                        gemma_parsed = json.loads(verify.output)
+                        if gemma_parsed.get("pass", False):
+                            result["changes"].append(
+                                f"[gemma4] Verified — no issues found ({source_label})")
+                            result["orchestrator_passed"] = True
+                            self.debug.transition(
+                                "SUCCESS", reason="compile + run + GLM + Gemma all passed",
+                                validation_result=True, iteration=iteration)
+                            break  # Truly converged — Gemma passed
+                        else:
+                            issues = gemma_parsed.get("issues", [])
+                            result["changes"].append(
+                                f"[gemma4] Issues found ({source_label}): {'; '.join(issues[:3])}")
+                            evaluator_feedback = (
+                                "GEMMA 4 VERIFICATION FAILED (iteration {}) — the code compiles "
+                                "and passes GLM semantic eval, but Gemma found issues:\n{}\n"
+                                "Re-plan the port strategy to address these."
+                            ).format(iteration, '\n'.join(f"- {i}" for i in issues[:5]))
+                    except (json.JSONDecodeError, TypeError):
+                        if "PASS" in verify.output.upper()[:10]:
+                            result["changes"].append(
+                                f"[gemma4] Verified — no issues found ({source_label})")
+                            result["orchestrator_passed"] = True
+                            self.debug.transition(
+                                "SUCCESS", reason="compile + run + GLM + Gemma all passed",
+                                validation_result=True, iteration=iteration)
+                            break  # Truly converged — Gemma passed
+                        else:
+                            result["changes"].append(
+                                f"[gemma4] Issues found ({source_label}): {verify.output[:200]}")
+                            evaluator_feedback = (
+                                "GEMMA 4 VERIFICATION FAILED (iteration {}):\n{}\n"
+                                "Re-plan the port strategy to address these."
+                            ).format(iteration, verify.output[:500])
+                else:
+                    last_call = self.call_log[-1] if self.call_log else {}
+                    fb_source = last_call.get("source", "")
+                    if "fallback" in fb_source and "error" in last_call:
+                        result["changes"].append(
+                            "[gemma4] Gemma 4 unavailable — fallback DeepSeek v4 Pro also failed")
+                    else:
+                        result["changes"].append(
+                            "[gemma4] Verification unavailable (local vLLM + Fireworks both failed)")
+                # Gemma rejected or unavailable — fall through to DeepSeek re-plan
+                gemma_rejected_this_iter = True
+                # Log it and let the loop continue with a fresh plan
+                print(f"║  │  🔄 Gemma: code rejected — triggering DeepSeek re-plan{'':<14}║")
 
             # ── Step 4: Kimi refines with whatever feedback we have ──────────
             # If compile failed → feedback = compile errors (set in Step 1)
@@ -5051,7 +5106,9 @@ class ModelRouter:
             # code — GLM's semantic findings (which flagged __shfl_up_sync
             # width before the 2026-07-09 segfault, and were discarded here)
             # plus the crash info become the refine feedback instead.
-            if not compile_failed_this_iter and parsed is not None and not run_crashed_this_iter and oracle_passed:
+            # ⚠  Gemma rejection bypass: if Gemma verified and rejected the code,
+            # we must NOT break here — fall through to the DeepSeek re-plan below.
+            if not compile_failed_this_iter and parsed is not None and not run_crashed_this_iter and oracle_passed and not gemma_rejected_this_iter:
                 if not parsed.get("pass", False):
                     result["changes"].append(
                         f"[glm] Iteration {iteration}: semantic issues found but "
@@ -5071,6 +5128,45 @@ class ModelRouter:
                         + "\n".join(f"- {i}" for i in glm_issues[:5])
                         + (f"\n{glm_fb[:400]}" if glm_fb else "")
                     )
+
+            # ── Gemma rejection → DeepSeek re-plan ────────────────────────
+            # When Gemma 4 rejects code that GLM passed, the semantic issues
+            # need a different porting strategy. Re-plan from DeepSeek-v4-pro
+            # and skip the Kimi refine step.
+            if gemma_rejected_this_iter and iteration < max_iterations:
+                if on_phase: on_phase("plan", "DeepSeek-v4-pro",
+                    f"re-plan from Gemma rejection (iter {iteration})")
+                replan_prompt = (
+                    f"GEMMA 4 VERIFICATION FAILED on your previous port (iteration {iteration}).\n"
+                    f"The code compiles and passes GLM semantic evaluation, but Gemma 4 found issues.\n\n"
+                    f"GEMMA FEEDBACK:\n{evaluator_feedback[:2000]}\n\n"
+                    f"CURRENT HIP CODE:\n```hip\n{result.get('ported_code', '')[:3000]}\n```\n\n"
+                    f"ORIGINAL CUDA:\n```cuda\n{kernel_source[:3000]}\n```\n\n"
+                    "Produce a DIFFERENT porting strategy from the previous plan. "
+                    "Focus on the semantic issues Gemma identified. "
+                    "Be specific about which kernel parts need different handling."
+                )
+                self._debug_stage = "02_planning"
+                re_plan = self._call_model(
+                    "deepseek", replan_prompt,
+                    system_prompt=SYSTEM_PROMPTS.get("deepseek", ""),
+                )
+                self._debug_stage = ""
+                replan_count += 1
+                self.debug.count("replans")
+                self.debug.transition(
+                    "REPLAN", reason=f"Gemma rejection (iter {iteration})",
+                    validation_result=re_plan.success, iteration=iteration,
+                    replan_count=replan_count)
+                if re_plan.success:
+                    deepseek_plan_output = re_plan.output
+                    result["changes"].append(
+                        f"[gemma→deepseek] Re-plan from Gemma rejection (iter {iteration}, "
+                        f"replan_count={replan_count})")
+                    print(f"║  │  🧠 DeepSeek-v4-pro re-plan from Gemma rejection "
+                          f"({len(re_plan.output)} chars){'':<8}║")
+                # Skip Kimi refine — the new plan drives the next iteration
+                continue
 
             if iteration < max_iterations:
                 # Loop back: Kimi refines with feedback
@@ -5306,17 +5402,11 @@ class ModelRouter:
             print(f"║  │  💡 To force more loops: increase --iter or "
                   f"fix the underlying strategy{'':<4}║")
 
-        # ── Phase 4: Gemma 4 final verification ──
-        # Gemma 4 here is deliberate, not a fallback for GLM: it is the only entry in
-        # MODEL_CATALOG with local_first=True, so this phase runs on the MI300X's own
-        # vLLM when one is up and costs nothing. GLM-5.2 remains the in-loop evaluator
-        # and error analyst; the two roles never swap. It reuses SYSTEM_PROMPTS["glm"]
-        # because the task — "judge this HIP kernel, answer in JSON" — is the same one.
-        #
-        # When the budget is already spent this call returns a failed AgentResult in
-        # ~0s (_call_model checks deadline.exhausted() first), which is why a timed-out
-        # run still shows a "final verification 0.0s" line.
-        if result["ported_code"]:
+        # ── Phase 4: Gemma 4 final verification (post-loop fallback) ──
+        # Only runs when Gemma was NOT already verified inside the iteration
+        # loop (max_iterations, timeout, or other abort).  When the loop
+        # converged via Gemma, verify_passed is already True and we skip it.
+        if result["ported_code"] and not verify_passed:
             if on_phase: on_phase("verify", "Gemma 4", "Gemma 4 → DeepSeek v4 Pro fallback")
             gemma_prompt = self._build_glm_evaluate_prompt(
                 result["ported_code"], patterns,
