@@ -310,7 +310,7 @@ class KernelOlympics:
         total_llm_time = 0.0
 
         for cr in classifier_results:
-            if cr.get("risk_level") == "red":
+            if cr.get("risk_level") != "green":
                 source = file_sources.get(cr["file"], "")
                 if not source:
                     continue
