@@ -7,7 +7,7 @@
 
 ### 2. State in submission:
 - "Verified via real compilation + execution on AMD MI300X"
-- "Eligible for Gemma Prize ($6,000) — Gemma 4 runs on AMD GPU via vLLM"
+- "Gemma Prize ($6,000) eligible — Gemma 4 attempted on AMD GPU via vLLM (fallback: DeepSeek verified)"
 - "3-model MOA: GLM(planner) → Kimi K2.7(coder) → Gemma 4/DeepSeek(verifier)"
 
 ### 3. Add "vs static analysis" section
@@ -43,7 +43,7 @@ Upload to lablab
 @team judge feedback received. Priorities:
 1. Submit on lablab NOW — nothing else matters
 2. In submission: state "real AMD GPU compilation + execution, not static analysis"
-3. In submission: state "Gemma Prize eligible"
+3. In submission: state "Gemma Prize eligible (attempting AMD GPU verifier; DeepSeek fallback deployed)"
 4. If time: test against 1 file from NVIDIA/cuda-samples
 5. If double time: wrap dashboard in simple HTML page
 
