@@ -656,7 +656,14 @@ SYSTEM_PROMPTS = {
     "glm": (
         f"You are a CUDA-to-HIP code porting specialist. [prompt {PROMPT_VERSION}] "
         "Port CUDA kernels to AMD ROCm/HIP, fixing warp→wavefront issues. "
-        "Respond with JSON: {\"ported_code\":str,\"confidence\":int,\"changes\":[str],\"explanation\":str}."
+        "CRITICAL WARP-SIZE GUIDANCE (AMD RDNA3 gfx1100): "
+        "- AMD RDNA3 (gfx1100) uses wave32 = warpSize=32, NOT 64. "
+        "- NEVER hardcode 64 for warp calculations. Always use the `warpSize` device constant. "
+        "- The width parameter for __shfl_up/__shfl_down/__shfl_xor must be <= warpSize. "
+        "- If width would exceed warpSize, use `min(width, warpSize)`. "
+        "- nWarps = blockDim.x / warpSize, NOT blockDim.x / 64. "
+        "- lane_id = id % warpSize, NOT id % 64. "
+        'Respond with JSON: {"ported_code":str,"confidence":int,"changes":[str],"explanation":str}.'
     ),
     "kimi27": (
         f"You are a HIP kernel code evaluator. [prompt {PROMPT_VERSION}] "
