@@ -798,8 +798,10 @@ class VerificationAgent:
 
         # Step 3: Compile with hipcc (20→70%)
         if on_progress: on_progress(25, "starting hipcc compilation")
+        arch = self._resolve_offload_arch(spec)
         compile_ok, compile_out, compile_log_path = self._compile(
-            harness_file, kernel_build_dir, kernel_name, on_progress=on_progress
+            harness_file, kernel_build_dir, kernel_name,
+            on_progress=on_progress, offload_arch=arch,
         )
         if on_progress: on_progress(70, "compilation complete" if compile_ok else "compilation failed")
         result["compile_success"] = compile_ok
@@ -839,6 +841,28 @@ class VerificationAgent:
             result["passed"] = False
             return result
 
+        # Step 4b: Determinism check — run the same binary a second time on the
+        # same input. Kernels with unsynchronised writes to shared memory or
+        # unordered atomic reductions typically produce different outputs
+        # between runs. A bit-identical rerun is a necessary (not sufficient)
+        # signal that the migration preserved barrier/sync semantics.
+        # Skipped when spec opts out (deterministic=False) or the first run
+        # produced no output at all.
+        deterministic = True
+        if run_output and (not spec or spec.get("deterministic", True)):
+            run_ok2, run_output2, _bench2, _exit2 = self._run(kernel_build_dir, kernel_name)
+            if run_ok2 and run_output2 != run_output:
+                deterministic = False
+                result["passed"] = False
+                result["determinism"] = {
+                    "ok": False,
+                    "reason": "Two runs on the same input produced different outputs — "
+                              "likely race on shared memory or unordered reduction.",
+                }
+                if on_progress: on_progress(100, "determinism failed")
+                return result
+        result["determinism"] = {"ok": deterministic}
+
         # Step 5: Diff against reference (90→100%)
         if on_progress: on_progress(95, "diffing against CUDA reference")
         ref_text = cuda_reference_output
@@ -850,9 +874,11 @@ class VerificationAgent:
                 print(f"║ ⚠️ Could not read spec reference file: {e}")
 
         if ref_text:
-            diff_ok, diff_report = self._diff(run_output, ref_text)
+            atol, rtol = self._tolerances(spec)
+            diff_ok, diff_report = self._diff(run_output, ref_text, atol=atol, rtol=rtol)
             result["output_match"] = diff_ok
             result["diff_report"] = diff_report[:500] if diff_report else ""
+            result["tolerance"] = {"atol": atol, "rtol": rtol}
             result["passed"] = diff_ok
         else:
             result["output_match"] = True
@@ -894,8 +920,42 @@ class VerificationAgent:
                 return line[len(prefix):]
         return line
 
+    @staticmethod
+    def _write_compile_commands(build_dir: Path, harness_file: Path,
+                                argv: list) -> Path:
+        """Write a ``compile_commands.json`` describing this build.
+
+        Standard clang compilation-database format (a JSON array of
+        ``{directory, file, arguments}`` objects). One entry per
+        harness compile — sufficient for Clang tools like ``clangd`` or a
+        future AST-based rewriter to open the harness with the same flags
+        hipcc actually used.
+
+        Returns the path to the emitted file.
+        """
+        cdb_path = build_dir / "compile_commands.json"
+        entry = {
+            "directory": str(build_dir),
+            "file": str(harness_file),
+            "arguments": list(argv),
+        }
+        cdb_path.write_text(json.dumps([entry], indent=2), encoding="utf-8")
+        return cdb_path
+
+    def _resolve_offload_arch(self, spec: Optional[dict]) -> str:
+        """Precedence: spec['target_arch'] > env AMD_OFFLOAD_ARCH > gfx942.
+
+        The instance default (self.offload_arch) already resolves env vs the
+        gfx942 fallback. Spec override wins because a kernel author knows the
+        arch it was tuned for; a spec that hard-codes gfx90a should not silently
+        drift to gfx942 on a machine whose env didn't set the var.
+        """
+        if spec and isinstance(spec.get("target_arch"), str) and spec["target_arch"]:
+            return spec["target_arch"]
+        return self.offload_arch
+
     def _compile(self, harness_file: Path, build_dir: Path, kernel_name: str,
-                 on_progress=None) -> tuple:
+                 on_progress=None, offload_arch: Optional[str] = None) -> tuple:
         """Compile HIP kernel with hipcc.
 
         on_progress: optional callback(percent: int, stage: str) — called
@@ -917,9 +977,18 @@ class VerificationAgent:
                 output_bin = build_dir / safe_kernel_name
                 # Always use list-form subprocess (no shell=True) to prevent injection
                 if on_progress: on_progress(40, "hipcc compiling")
+                arch = offload_arch or self.offload_arch
                 cmd = [self._hipcc_path, "-o", str(output_bin), str(harness_file),
-                       "-std=c++17", "-O2", f"--offload-arch={self.offload_arch}",
+                       "-std=c++17", "-O2", f"--offload-arch={arch}",
                        "-ferror-limit=5"]
+                # Emit compile_commands.json next to the harness so Clang-based
+                # tooling (clangd, hipify-clang, or a future AST-repair stage)
+                # sees the exact flags this build used. Best-effort — a failure
+                # to write the JSON must never break the compile.
+                try:
+                    self._write_compile_commands(build_dir, harness_file, cmd)
+                except Exception as e:
+                    print(f"║ ⚠️ compile_commands.json write failed: {e}")
                 result = subprocess.run(
                     cmd, capture_output=True, text=True, timeout=60,
                     cwd=str(build_dir)
@@ -944,7 +1013,7 @@ class VerificationAgent:
                         diagnostics=[l for l in raw_output.splitlines() if "error:" in l],
                         artifacts=([str(output_bin)] if output_bin.exists() else []),
                         iteration=iteration, kernel_name=kernel_name,
-                        offload_arch=self.offload_arch,
+                        offload_arch=arch,
                         compile_log_path=log_path,
                     )
                 return result.returncode == 0, shortened, log_path
@@ -1040,8 +1109,43 @@ class VerificationAgent:
                 return False, str(e), None, None
         return False, "Binary not found — compile step may have failed.", None, None
 
-    def _diff(self, actual_output: str, expected_output: str) -> tuple:
-        """Compare actual output against CUDA reference output."""
+    # Default tolerances for kernels whose spec omits them. atol handles the
+    # near-zero region; rtol scales with magnitude. Chosen so exact-integer
+    # kernels (histogram, scan) still match byte-for-byte.
+    _DEFAULT_ATOL = 1e-5
+    _DEFAULT_RTOL = 0.0
+
+    def _tolerances(self, spec: Optional[dict]) -> tuple:
+        """Resolve (atol, rtol) for numerical diff.
+
+        Spec keys, in order of precedence:
+          - ``tolerance: {atol: <float>, rtol: <float>}`` — explicit
+          - ``atol`` / ``rtol`` at top level — flat form
+          - default ``(1e-5, 0.0)`` — matches pre-existing behavior
+        """
+        if not spec:
+            return self._DEFAULT_ATOL, self._DEFAULT_RTOL
+        tol = spec.get("tolerance") if isinstance(spec.get("tolerance"), dict) else None
+        if tol:
+            atol = float(tol.get("atol", self._DEFAULT_ATOL))
+            rtol = float(tol.get("rtol", self._DEFAULT_RTOL))
+        else:
+            atol = float(spec.get("atol", self._DEFAULT_ATOL))
+            rtol = float(spec.get("rtol", self._DEFAULT_RTOL))
+        return atol, rtol
+
+    def _diff(self, actual_output: str, expected_output: str,
+              atol: float = None, rtol: float = None) -> tuple:
+        """Compare actual output against CUDA reference output.
+
+        Passes when ``|a - e| <= atol + rtol * max(|a|, |e|)`` element-wise.
+        ``atol`` defaults to 1e-5 (pre-existing behavior), ``rtol`` to 0.
+        """
+        if atol is None:
+            atol = self._DEFAULT_ATOL
+        if rtol is None:
+            rtol = self._DEFAULT_RTOL
+
         if not actual_output or not expected_output:
             return False, "Missing output data for comparison."
 
@@ -1051,15 +1155,30 @@ class VerificationAgent:
         if actual_lines == expected_lines:
             return True, "Outputs match exactly (byte-for-byte)."
 
-        # Try floating-point tolerant diff
+        # Try floating-point tolerant diff.
         try:
             actual_floats = [float(l) for l in actual_lines if l.strip()]
             expected_floats = [float(l) for l in expected_lines if l.strip()]
             if len(actual_floats) == len(expected_floats):
-                max_diff = max(abs(a - e) for a, e in zip(actual_floats, expected_floats))
-                if max_diff < 1e-5:
-                    return True, f"Outputs match within tolerance (max diff: {max_diff:.2e})."
-                return False, f"Outputs differ (max diff: {max_diff:.4f})."
+                worst_abs = 0.0
+                worst_rel = 0.0
+                worst_idx = -1
+                for i, (a, e) in enumerate(zip(actual_floats, expected_floats)):
+                    diff = abs(a - e)
+                    bound = atol + rtol * max(abs(a), abs(e))
+                    if diff > bound and diff > worst_abs:
+                        worst_abs = diff
+                        worst_rel = diff / max(abs(e), 1e-300) if abs(e) > 0 else float("inf")
+                        worst_idx = i
+                if worst_idx < 0:
+                    max_abs = max(abs(a - e) for a, e in zip(actual_floats, expected_floats))
+                    return True, (f"Outputs match within tolerance "
+                                  f"(atol={atol:.1e}, rtol={rtol:.1e}, "
+                                  f"max abs diff: {max_abs:.2e}).")
+                return False, (f"Outputs differ at index {worst_idx}: "
+                               f"|Δ|={worst_abs:.4g} exceeds "
+                               f"atol+rtol·max = {atol + rtol * max(abs(actual_floats[worst_idx]), abs(expected_floats[worst_idx])):.4g} "
+                               f"(rel={worst_rel:.2%}).")
         except ValueError:
             print("║ ⚠️ Diff: could not parse output lines as floats — falling back to textual diff")
             pass
