@@ -91,6 +91,12 @@ speed-demo: .venv  ## Run speed‑comparison demo: LLM vs cache
 
 speed-demo-reset: .venv  ## Speed demo with fresh cache
 	$(PYTHON) -m src.main --demo --reset
+debug:  ## Debug artifacts enabled
+	$(MAKE) pipeline FLAGS="--debug"
+
+push:  ## git add -A + commit + push (interactive)
+	git add -A && git commit -m "$(MSG)" && git push origin main
+	@echo "✅ Pushed to GitHub"
 
 # ── Deployment -------------------------------------------------
 
@@ -151,7 +157,7 @@ help:  ## Show this help menu
 	@printf '    \033[1;34m%-16s\033[0m %s\n' "clean-all"    "+ remove .venv + ported kernels"
 	@printf '    \033[1;34m%-16s\033[0m %s\n' "watch"        "Daemon mode (auto-process)"
 	@printf '    \033[1;34m%-16s\033[0m %s\n' "debug"        "Debug artifacts enabled"
-	@printf '    \033[1;34m%-16s\033[0m %s\n' "push-to-cation" "SSH push to AMD workspace"
+	@printf '    \033[1;34m%-16s\033[0m %s\n' "push"         "git add -A + commit + push"
 	@printf '\n  \033[2mExamples:\033[0m\n'
 	@printf '    make pipeline                       # Full cycle (default kernel)\n'
 	@printf '    make pipeline CU_FILE=path/to/x.cu  # Full cycle (any kernel)\n'
