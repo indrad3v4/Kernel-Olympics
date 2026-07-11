@@ -136,8 +136,8 @@ class RiskClassifier:
 
     def _severity(self, pattern_name: str) -> str:
         """Determine severity of a pattern match."""
-        high_severity = {"shfl_down_sync", "shfl_xor_sync", "shfl_up_sync", "match_all_sync"}
-        medium_severity = {"warp_size_constant", "shared_mem_warp_tiling", "all_any_sync", "activemask", "warp_lane_shift"}
+        high_severity = {"shfl_down_sync", "shfl_xor_sync", "match_all_sync"}
+        medium_severity = {"warp_size_constant", "shared_mem_warp_tiling", "all_any_sync", "activemask", "warp_lane_shift", "shfl_up_sync"}
         if pattern_name in high_severity:
             return "high"
         elif pattern_name in medium_severity:
