@@ -13,7 +13,7 @@
       "name": "width",
       "type": "int",
       "direction": "scalar",
-      "size_expr": "count"
+      "value": 64
     },
     {
       "name": "partial_sums",
@@ -43,6 +43,7 @@
     "element_type": "int",
     "format": "int_per_line"
   },
+  "dynamic_shared_mem": 256,
   "self_contained": true,
   "port_mode": "DEVICE_SUBSET"
 }
