@@ -83,11 +83,11 @@ def test_findings_have_context():
 
 
 def test_severity_mapping():
-    '''High: shfl_down_sync, shfl_xor_sync, shfl_up_sync, match_all_sync. Medium: warp_size, shared_mem, all_any_sync, activemask, warp_lane_shift.'''
+    '''High: shfl_down_sync, shfl_xor_sync, match_all_sync. Medium: warp_size, shared_mem, all_any_sync, activemask, warp_lane_shift, shfl_up_sync.'''
     c = RiskClassifier()
     assert c._severity('shfl_down_sync') == 'high'
     assert c._severity('shfl_xor_sync') == 'high'
-    assert c._severity('shfl_up_sync') == 'high'
+    assert c._severity('shfl_up_sync') == 'medium'
     assert c._severity('match_all_sync') == 'high'
     assert c._severity('warp_size_constant') == 'medium'
     assert c._severity('shared_mem_warp_tiling') == 'medium'
