@@ -13,6 +13,7 @@
       "name": "width",
       "type": "int",
       "direction": "scalar",
+      "size_expr": "count",
       "value": 64
     },
     {
@@ -44,7 +45,7 @@
     "format": "int_per_line"
   },
   "reference_output": "sample_kernels/reference/nvidia_shfl_scan_output.txt",
-  "dynamic_shared_mem": 256,
+  "dynamic_shared_mem": 4,
   "self_contained": true,
   "port_mode": "DEVICE_SUBSET"
 }

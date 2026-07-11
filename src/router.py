@@ -17,6 +17,7 @@ import os
 import socket
 import time
 import uuid
+import hashlib
 import logging
 import urllib.request
 from pathlib import Path
@@ -208,6 +209,79 @@ def _extract_balanced_json(text: str):
 def _strip_trailing_commas(s: str) -> str:
     """Remove trailing commas before } or ] that make JSON invalid."""
     return re.sub(r',\s*([}\]])', r'\1', s)
+
+
+def _strip_trailing_after_json(text: str) -> str:
+    """Remove everything after the last balanced '}' that closes the outermost JSON object."""
+    start = text.find("{")
+    if start < 0:
+        return text
+    depth = 0
+    in_string = False
+    escape = False
+    outermost_close = -1
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                outermost_close = i
+                break
+    if outermost_close >= 0:
+        return text[:outermost_close + 1]
+    return text
+
+
+def _keyword_prose_fallback(raw_text: str) -> dict:
+    """Strategy 5: raw-prose fallback with keyword scoring."""
+    keywords = {
+        "shfl": ["shfl", "__shfl", "shuffle"],
+        "warpSize": ["warpSize", "warp_size", "WARP_SIZE", "warpsize"],
+        "mask": ["mask", "0xffffffff", "0x1f", "0x3f"],
+        "width": ["width"],
+        "shared": ["shared", "__shared__"],
+        "ballot": ["ballot", "__ballot"],
+        "sync": ["__syncthreads", "__syncwarp", "__sync"],
+        "wavefront": ["wavefront", "WAVEFRONT", "wavefront64", "wavefront32"],
+        "lane": ["lane_id", "laneid", "__lane_id"],
+    }
+    counts = {}
+    for kword, patterns in keywords.items():
+        total = 0
+        for pat in patterns:
+            total += len(re.findall(re.escape(pat), raw_text, re.IGNORECASE))
+        if total > 0:
+            counts[kword] = total
+    sorted_kw = sorted(counts.items(), key=lambda x: -x[1])[:3]
+    if not sorted_kw:
+        return {"fixes": [], "summary": "", "_raw": raw_text[:500], "_strategy": "keyword-fallback-empty"}
+    fixes = []
+    for kw, cnt in sorted_kw:
+        fixes.append({
+            "error": f"EVALUATOR MENTIONED: {kw} may need fixing (mentioned {cnt} times)",
+            "root_cause": f"The evaluator highlighted {kw} in its prose analysis ({cnt} mentions) but could not produce structured JSON.",
+            "priority": 50,
+        })
+    kw_list = [k for k, _ in sorted_kw]
+    return {
+        "fixes": fixes,
+        "summary": "Top evaluator keywords: " + ", ".join(kw_list),
+        "_raw": raw_text[:500],
+        "_strategy": "keyword-fallback",
+    }
 
 
 def _extract_arrays_regex(text: str):
@@ -1136,7 +1210,7 @@ class ModelRouter:
         # Events
         code = _tracked_sub(r'\bcudaEvent_t\b', 'hipEvent_t', code, 'cudaEvent_t→hipEvent_t')
         # Device queries
-        code = _tracked_sub(r'\bcudaGetDevice\b', 'hipDeviceGet', code, 'cudaGetDevice→hipDeviceGet')
+        code = _tracked_sub(r'\bcudaGetDevice\b', 'hipGetDevice', code, 'cudaGetDevice→hipDeviceGet')
         # checkCudaErrors macro — stub it out (no HIP equivalent)
         code = _tracked_sub(r'\bcheckCudaErrors\s*\(', '(void)(', code, 'checkCudaErrors→(void)(')
         # cuda_device variable name
@@ -1597,6 +1671,17 @@ class ModelRouter:
                 code = extraction.code
             else:
                 code = self._extract_code(model_output)
+
+        # TRIZ #22: DEVICE_SUBSET defiance guard - strip host code if coder ignored prompt
+        if (port_mode == PortMode.DEVICE_SUBSET.value
+                and code
+                and self._is_self_contained(code)):
+            pre_len = len(code)
+            code = self._strip_to_kernel_only(code)
+            logging.getLogger(__name__).debug(
+                "DEVICE_SUBSET defiance: coder output had int main() - "
+                "stripped to kernel-only (%d chars -> %d chars)",
+                pre_len, len(code) if code else 0)
 
         # Normalize stray markdown fences BEFORE the lexical gate. A leaked
         # ``` line is a formatting artifact, not a portability defect — the
@@ -3318,7 +3403,7 @@ class ModelRouter:
             except (OSError, TypeError, ValueError) as _log_exc:
                 logger.debug("run-dir logging skipped: %s", _log_exc)
 
-            # Debug Mode: the plan is prose by design, so "parsed plan" here is
+        # Debug Mode: the plan is prose by design, so "parsed plan" here is
             # the checklist we can recover from it, and the validation report
             # states plainly that a plan is advisory — it never gates the port.
             if self.debug.enabled:
@@ -3579,6 +3664,7 @@ class ModelRouter:
         replan_count = 0  # Bug 7: how many stagnation re-plans we've already used
         runtime_crash_count = 0  # RUN-FIRST: consecutive compile-pass-but-crash iterations
         kimi_plateau_count = 0  # C1: count consecutive iterations with same error set after Kimi refine
+        code_sha_history = []  # Track SHA to detect oscillation
         # P1 (two-layer SIGSEGV): last code that hipcc accepted. Once set, a refine
         # that breaks compilation is discarded and this is restored (Layer 1).
         frozen_base_code = ""
@@ -3741,6 +3827,25 @@ class ModelRouter:
                                    indent=2), encoding="utf-8")
                 except (OSError, TypeError, ValueError) as _log_exc:
                     logger.debug("run-dir logging skipped: %s", _log_exc)
+
+                # ---- Code-SHA oscillation detection ----
+                code_sha = hashlib.sha256(
+                    result["ported_code"].encode()).hexdigest()[:8]
+                code_sha_history.append(code_sha)
+                if len(code_sha_history) >= 5:
+                    last5 = code_sha_history[-5:]
+                    distinct = set(last5)
+                    if (len(distinct) == 2
+                            and last5[0] == last5[2] == last5[4]
+                            and last5[1] == last5[3]
+                            and last5[0] != last5[1]):
+                        result["changes"].append(
+                            "[oscillation] Code SHA oscillation detected")
+                        print("  |  OSCILLATION: code variants A<->B cycling - aborting")
+                        result["iterations_used"] = iteration
+                        result["abort_reason"] = "oscillation_detected"
+                        break
+
                 if cc["compile_success"]:
                     state.compile_success = True
                     # Compile passed — release the repair reserve so the
@@ -4329,9 +4434,11 @@ class ModelRouter:
                                 raw_glm_json = raw_glm
                             glm_analysis = None
 
-                            # ── Strategy 1: Direct json.loads (strip prose prefix) ──
+                            # ── Strategy 1: Direct json.loads (strip trailing prose) ──
+                            # Pre-strip trailing prose after outermost balanced '}'
+                            trimmed = _strip_trailing_after_json(raw_glm_json)
                             try:
-                                glm_analysis = json.loads(raw_glm_json)
+                                glm_analysis = json.loads(trimmed)
                             except (json.JSONDecodeError, TypeError, ValueError) as e:
                                 logger.debug("GLM error analysis JSON parse failed: %s", e)
 
@@ -4352,8 +4459,30 @@ class ModelRouter:
                                 if first_brace >= 0 and last_brace > first_brace:
                                     glm_analysis = {"fixes": [], "_raw": raw_glm[first_brace:last_brace+1]}
 
+                            # ── Strategy 5: Raw-prose keyword scoring fallback ──
+                            if glm_analysis is None:
+                                glm_analysis = _keyword_prose_fallback(raw_glm)
+
+                            # ── Truncation detection ──
+                            is_truncated = "TRUNCATED" in raw_glm
+                            if is_truncated:
+                                truncated_note = "(note: evaluator output was truncated at max_tokens - analysis may be incomplete)"
+                                if glm_analysis is None:
+                                    glm_analysis = {"fixes": [], "_raw": raw_glm[:500]}
+                                if not glm_analysis.get("fixes"):
+                                    glm_analysis["fixes"] = []
+                                glm_analysis["fixes"].append({
+                                    "error": truncated_note,
+                                    "root_cause": "The evaluator response was truncated because it exceeded the max_tokens limit.",
+                                    "priority": 99,
+                                })
+
+                            if glm_analysis is None:
+                                logger.warning(
+                                    "GLM analysis parse failed - falling back to raw errors")
+
                             # Debug Mode: the raw response is already on disk via
-                            # _call_model; this records what the four parse
+                            # _call_model; this records what the five parse
                             # strategies made of it — the step where a confident
                             # analysis silently becomes an empty one.
                             if self.debug.enabled:
@@ -4366,7 +4495,7 @@ class ModelRouter:
                                     recommended_fixes=(glm_analysis or {}).get("fixes", []),
                                     confidence=(glm_analysis or {}).get("confidence"),
                                     parse_strategy=("failed" if glm_analysis is None
-                                                    else "one of 4 JSON strategies"),
+                                                    else "one of 5 strategies"),
                                     compile_error_count=len(compile_errs),
                                 )
 
@@ -4644,8 +4773,8 @@ class ModelRouter:
                         root_cause=(parsed or {}).get("verdict"),
                         recommended_fixes=(parsed or {}).get("issues", []),
                         confidence=(parsed or {}).get("confidence"),
-                        parse_strategy=("failed — all 4 strategies" if parsed is None
-                                        else "one of 4 JSON strategies"),
+                        parse_strategy=("failed — all 5 strategies" if parsed is None
+                                        else "one of 5 strategies"),
                     )
                     self.debug.transition(
                         "SEMANTIC_EVALUATION",
@@ -5037,7 +5166,8 @@ class ModelRouter:
         # that previously worked), the last ported_code is the broken one. Hand back
         # the furthest-compiling version instead — that is what "return the best
         # compiling code so far" means, and it is what the demo needs to show.
-        if (result.get("abort_reason") in ("pipeline_timeout", "layer2_rejected")
+        if (result.get("abort_reason") in ("pipeline_timeout", "layer2_rejected",
+                                   "hard_stagnation", "oscillation_detected")
                 and best_attempt_code
                 and result["ported_code"] != best_attempt_code):
             result["ported_code"] = best_attempt_code

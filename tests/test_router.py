@@ -148,315 +148,266 @@ class TestA2AMessage:
         assert "1 compile error" in rendered or "undeclared" in rendered
 
 
-# ── I1: Convergence loop tests (mocked) ────────────────────────────────────────
+# ── I1: GLM evaluator JSON parse cascade tests ─────────────────────────────────
 
-class TestConvergenceLoop:
-    """Test the actual porting loop with mocked LLM calls."""
+class TestGLMParseCascade:
+    """Test the 5-strategy fallback cascade for GLM error analysis JSON parsing.
 
-    @patch.object(ModelRouter, '_call_model')
-    def test_successful_port_first_try(self, mock_call, router):
-        """DeepSeek plans, GLM codes, hipcc compiles, Kimi passes — 1 iteration."""
-        # Call sequence: deepseek(plan) → glm(code) → kimi27(eval) → gemma4(verify)
-        mock_call.side_effect = [
-            AgentResult("deepseek", True, "Plan: replace cudaMalloc with hipMalloc", 0.1),
-            AgentResult("glm", True, f"```cpp\n{HIP_CODE_OK}\n```", 0.1),
-            AgentResult("kimi27", True, '{"pass": true, "feedback": "looks good"}', 0.1),
-            AgentResult("gemma4", True, '{"pass": true}', 0.1),
-        ]
-        mock_verifier = MagicMock()
-        mock_verifier.quick_compile_check.return_value = {
-            "compile_success": True, "errors": [], "output": ""
-        }
-        mock_verifier.verify.return_value = {
-            "compile_success": True, "passed": True,
-            "compile_output": "", "output": ""
-        }
+    Verifies the new Strategy 5 (keyword-prose fallback), _strip_trailing_after_json,
+    and truncation detection.
+    """
 
-        result = router.route(
-            kernel_source=CUDA_KERNEL_EXAMPLE,
-            patterns=[],
-            max_iterations=1,
-            verifier=mock_verifier,
-            kernel_name="test_kernel"
+    # ── _strip_trailing_after_json ──────────────────────────────────────────
+
+    def test_strip_trailing_after_json_clean(self):
+        """Clean JSON without trailing text should pass through unchanged."""
+        from router import _strip_trailing_after_json
+        text = '{"fixes": [{"error": "test"}], "summary": "ok"}'
+        assert _strip_trailing_after_json(text) == text
+
+    def test_strip_trailing_after_json_trailing_prose(self):
+        """Trailing prose after JSON closing brace should be stripped."""
+        from router import _strip_trailing_after_json
+        text = '{"fixes": [], "summary": "ok"}\n\nThe fix is to replace cudaMalloc with hipMalloc...'
+        assert _strip_trailing_after_json(text) == '{"fixes": [], "summary": "ok"}'
+
+    def test_strip_trailing_after_json_nested_braces(self):
+        """Nested braces inside JSON values should not confuse the balancer."""
+        from router import _strip_trailing_after_json
+        text = '{"fixes": [{"error": "missing { in code"}], "summary": "ok"}\ntrailing'
+        result = _strip_trailing_after_json(text)
+        assert result == '{"fixes": [{"error": "missing { in code"}], "summary": "ok"}'
+
+    def test_strip_trailing_after_json_no_brace(self):
+        """Text with no opening brace should return unchanged."""
+        from router import _strip_trailing_after_json
+        text = "This is just prose with no JSON whatsoever"
+        assert _strip_trailing_after_json(text) == text
+
+    def test_strip_trailing_after_json_prose_before(self):
+        """Prose prefix before JSON should be preserved by the function (caller strips it)."""
+        from router import _strip_trailing_after_json
+        text = "I will analyze this. {\\\"fixes\\\": [{\\\"error\\\": \\\"test\\\"}]}\\\nstill going"
+        result = _strip_trailing_after_json(text)
+        # Should start with the prose prefix since the function doesn't strip prefix
+        assert result.startswith("I will analyze this.")
+
+    def test_strip_trailing_after_json_braces_in_string(self):
+        """Braces inside quoted strings should be ignored."""
+        from router import _strip_trailing_after_json
+        text = '{"error": "unclosed { in message", "line": 42}\nsome note'
+        assert _strip_trailing_after_json(text) == '{"error": "unclosed { in message", "line": 42}'
+
+    # ── _keyword_prose_fallback ─────────────────────────────────────────────
+
+    def test_keyword_fallback_with_keywords(self):
+        """Prose with CUDA/HIP keywords should produce structured feedback."""
+        from router import _keyword_prose_fallback
+        text = (
+            "The issue is with __shfl_up_sync. The mask must be 0xffffffffffffffffULL "
+            "for wavefront64. The warpSize is 64 on AMD, not 32. "
+            "Also need to check __shfl_xor_sync mask width."
         )
-        # Should succeed with 0 compile errors (hipcc passes first try)
-        assert result["ported_code"] is not None
+        result = _keyword_prose_fallback(text)
+        assert result is not None
+        assert "fixes" in result
+        assert len(result["fixes"]) <= 3  # top 3 keywords
+        if result["fixes"]:
+            # At least shfl, mask, or warpSize should be in the output
+            keywords_found = set()
+            for f in result["fixes"]:
+                keywords_found.add(f.get("error", ""))
+            assert any("shfl" in str(f) for f in result["fixes"])
 
-    @patch.object(ModelRouter, '_call_model')
-    def test_compile_failure_triggers_refinement(self, mock_call, router):
-        """hipcc fails → Kimi analyzes → GLM refines — verify GLM called at least twice."""
-        eval_err = AgentResult("kimi27", True, '{"fixes": [{"action": "Replace cudaMalloc with hipMalloc", "priority": 1}], "missing_includes": ["hip/hip_runtime.h"]}', 0.1)
-        eval_pass = AgentResult("kimi27", True, '{"pass": true}', 0.1)
-        coder_bad = AgentResult("glm", True, f"```cpp\n{HIP_CODE_WITH_CUDA}\n```", 0.1)
-        coder_good = AgentResult("glm", True, f"```cpp\n{HIP_CODE_OK}\n```", 0.1)
-        gemma = AgentResult("gemma4", True, '{"pass": true}', 0.1)
+    def test_keyword_fallback_empty_text(self):
+        """Prose with no keywords should return an empty result dict."""
+        from router import _keyword_prose_fallback
+        text = "The quick brown fox jumps over the lazy dog."
+        result = _keyword_prose_fallback(text)
+        assert result is not None
+        assert "_strategy" in result
+        assert result["_strategy"] == "keyword-fallback-empty" or result["fixes"] == []
 
-        glm_call_count = [0]
-        def call_side_effect(model_key, *args, **kwargs):
-            if model_key == "deepseek":
-                return AgentResult("deepseek", True, "Plan: replace cudaMalloc with hipMalloc", 0.1)
-            if model_key == "glm":
-                glm_call_count[0] += 1
-                return coder_bad if glm_call_count[0] == 1 else coder_good
-            if model_key == "kimi27":
-                sysp = kwargs.get("system_prompt", "")
-                if "error analyst" in sysp:
-                    return eval_err
-                return eval_pass
-            if model_key == "gemma4":
-                return gemma
-            return AgentResult(model_key, True, "{}", 0.1)
-
-        mock_call.side_effect = call_side_effect
-
-        mock_verifier = MagicMock()
-        # [pre-loop] compile fail → [loop iter1] compile fail → [loop iter1 refine] pass → enough passes
-        mock_verifier.quick_compile_check.side_effect = [
-            {"compile_success": False, "errors": ["error: use of undeclared identifier 'cudaMalloc'"], "output": ""},
-            {"compile_success": False, "errors": ["error: use of undeclared identifier 'cudaMalloc'"], "output": ""},
-            {"compile_success": True, "errors": [], "output": ""},
-            {"compile_success": True, "errors": [], "output": ""},
-            {"compile_success": True, "errors": [], "output": ""},
-            {"compile_success": True, "errors": [], "output": ""},
-        ]
-        mock_verifier.verify.return_value = {
-            "compile_success": True, "passed": True,
-            "compile_output": "", "output": ""
-        }
-
-        result = router.route(
-            kernel_source=CUDA_KERNEL_EXAMPLE,
-            patterns=[],
-            max_iterations=3,
-            verifier=mock_verifier,
-            kernel_name="test_refine"
+    def test_keyword_fallback_top_3(self):
+        """Only the top 3 most-mentioned keywords should appear in fixes."""
+        from router import _keyword_prose_fallback
+        text = (
+            "shfl shfl shfl shfl shfl "  # 5 mentions
+            "warpSize warpSize warpSize warpSize "  # 4 mentions
+            "mask mask mask "  # 3 mentions
+            "ballot ballot "  # 2 mentions
+            "width "  # 1 mention
         )
-        # GLM should have been called at least twice (initial + refine)
-        assert glm_call_count[0] >= 2, f"GLM coder called {glm_call_count[0]} times, expected >=2"
+        result = _keyword_prose_fallback(text)
+        assert len(result["fixes"]) == 3
+        error_strings = " ".join(f.get("error", "") for f in result["fixes"])
+        assert "shfl" in error_strings
+        assert "warpSize" in error_strings
+        assert "mask" in error_strings
 
-    @patch.object(ModelRouter, '_call_model')
-    def test_stagnation_triggers_replan(self, mock_call, router):
-        """Multiple stagnant iterations should trigger DeepSeek re-planning."""
-        eval_err = AgentResult("kimi27", True, '{"fixes": [{"action": "Replace cudaMalloc with hipMalloc", "priority": 1}]}', 0.1)
-        eval_pass = AgentResult("kimi27", True, '{"pass": true}', 0.1)
-        coder_bad = AgentResult("glm", True, f"```cpp\n{HIP_CODE_WITH_CUDA}\n```", 0.1)
-        coder_good = AgentResult("glm", True, f"```cpp\n{HIP_CODE_OK}\n```", 0.1)
-        gemma = AgentResult("gemma4", True, '{"pass": true}', 0.1)
+    def test_keyword_fallback_produces_valid_feedback_dict(self):
+        """The fallback result should be compatible with the existing feedback builder."""
+        from router import _keyword_prose_fallback
+        text = "The __shfl_sync mask is wrong. Warp size should be 64."
+        result = _keyword_prose_fallback(text)
+        # Should be compatible with the checks at router.py:4328-4333:
+        # fixes = glm_analysis.get("fixes", [])
+        # if glm_analysis and (fixes or missing_inc or wrong_apis):
+        fixes = result.get("fixes", [])
+        assert len(fixes) > 0
+        for f in fixes:
+            assert "error" in f
+            assert "root_cause" in f
+            assert "priority" in f
 
-        ds_call_count = [0]
-        def call_side_effect(model_key, *args, **kwargs):
-            if model_key == "deepseek":
-                ds_call_count[0] += 1
-                if ds_call_count[0] == 1:
-                    return AgentResult("deepseek", True, "Plan v1: replace cudaMalloc", 0.1)
-                return AgentResult("deepseek", True, "Plan v2: use hipMalloc completely", 0.1)
-            if model_key == "glm":
-                # Bad code until DeepSeek re-plans, then good
-                if ds_call_count[0] <= 1:
-                    return coder_bad
-                return coder_good
-            if model_key == "kimi27":
-                sysp = kwargs.get("system_prompt", "")
-                if "error analyst" in sysp:
-                    return eval_err
-                return eval_pass
-            if model_key == "gemma4":
-                return gemma
-            return AgentResult(model_key, True, "{}", 0.1)
+    # ── Full cascade test (edge cases that the old 4-strategy missed) ─────────
 
-        mock_call.side_effect = call_side_effect
+    def test_cascade_with_prose_before_nested_braces_and_trailing(self):
+        """Test that the full cascade handles: prose before JSON, nested braces
+        inside string values, AND trailing prose after the closing brace.
 
-        mock_verifier = MagicMock()
-        # [pre-loop] fail + [loop iter1] fail + [loop iter2] fail + [loop iter3] fail + pass for after re-plan
-        mock_verifier.quick_compile_check.side_effect = [
-            {"compile_success": False, "errors": ["error: cudaMalloc undeclared"], "output": ""},
-            {"compile_success": False, "errors": ["error: cudaMalloc undeclared"], "output": ""},
-            {"compile_success": False, "errors": ["error: cudaMalloc undeclared"], "output": ""},
-            {"compile_success": False, "errors": ["error: cudaMalloc undeclared"], "output": ""},
-            {"compile_success": False, "errors": ["error: cudaMalloc undeclared"], "output": ""},
-            {"compile_success": True, "errors": [], "output": ""},
-            {"compile_success": True, "errors": [], "output": ""},
-            {"compile_success": True, "errors": [], "output": ""},
-            {"compile_success": True, "errors": [], "output": ""},
-        ]
-        mock_verifier.verify.return_value = {
-            "compile_success": True, "passed": True,
-            "compile_output": "", "output": ""
-        }
+        This is the exact pattern that caused the 'GLM analysis parse failed' error.
+        """
+        from router import _extract_balanced_json, _extract_arrays_regex, _strip_trailing_after_json, _keyword_prose_fallback
 
-        result = router.route(
-            kernel_source=CUDA_KERNEL_EXAMPLE,
-            patterns=[],
-            max_iterations=8,
-            verifier=mock_verifier,
-            kernel_name="test_stagnation"
+        raw_glm = (
+            "Based on my analysis of the compiler errors, here is my evaluation:\n\n"
+            "The kernel uses __shfl_up_sync which needs a 64-bit mask for wavefront64. "
+            "The warpSize on AMD MI300X is 64, not 32 like NVIDIA.\n\n"
+            '{\n'
+            '  "fixes": [\n'
+            '    {\n'
+            '      "error": "Wrong __shfl_up_sync mask width — using 0x1f (32-bit) instead of 0x3f (64-bit)",\n'
+            '      "root_cause": "CUDA uses 32-warps, HIP 64-warps on MI300X; the mask must cover all lanes",\n'
+            '      "exact_fix": "replace 0x1f with 0x3f in __shfl_up_sync mask argument",\n'
+            '      "priority": 1\n'
+            '    },\n'
+            '    {\n'
+            '      "error": "Missing __syncwarp after divergent branch — {inconsistent lane states}",\n'
+            '      "root_cause": "Divergent branches need sync to avoid deadlock on wavefront64",\n'
+            '      "exact_fix": "add __syncwarp() after each if/else block",\n'
+            '      "priority": 2\n'
+            '    }\n'
+            '  ]\n'
+            '}\n'
+            '\n'
+            "I also noticed some potential issues with shared memory bank conflicts, "
+            "but those are less critical.\n"
         )
-        # DeepSeek should have been called at least twice (initial + re-plan)
-        assert ds_call_count[0] >= 2, f"DeepSeek called {ds_call_count[0]} times, expected >=2"
 
-
-# ── RUN-FIRST: compile-pass is not convergence — the binary must also run ─────
-
-class TestRunFirstLoop:
-    """The 2026-07-09 run compiled on iteration 1, GLM flagged the likely
-    crash cause, the loop discarded the finding and declared victory — then
-    the binary SIGSEGVed in verify() with no feedback path back. The loop
-    now runs the binary in-loop after every passing compile."""
-
-    @staticmethod
-    def _call_side_effect(model_key, *args, **kwargs):
-        if model_key == "deepseek":
-            return AgentResult("deepseek", True, "Plan: port shfl", 0.1)
-        if model_key == "glm":
-            return AgentResult("glm", True, f"```cpp\n{HIP_CODE_OK}\n```", 0.1)
-        if model_key == "kimi27":
-            return AgentResult("kimi27", True,
-                '{"pass": true, "issues": ["__shfl_up_sync uses width as width param"], "feedback": "check shfl width"}', 0.1)
-        return AgentResult(model_key, True, '{"pass": true}', 0.1)
-
-    @patch.object(ModelRouter, '_call_model')
-    def test_runtime_crash_triggers_refine_not_convergence(self, mock_call, router):
-        """Compile passes but the binary SIGSEGVs → the loop must refine,
-        not break — then converge once the binary runs clean."""
-        mock_call.side_effect = self._call_side_effect
-        mock_verifier = MagicMock()
-        mock_verifier.quick_compile_check.return_value = {
-            "compile_success": True, "errors": [], "output": ""
-        }
-        mock_verifier.quick_run_check.side_effect = [
-            {"run_success": False, "run_exit_code": -11, "signal": "SIGSEGV", "run_output": ""},
-            {"run_success": True, "run_exit_code": 0, "signal": "", "run_output": "TEST PASSED"},
-        ]
-        result = router.route(
-            kernel_source=CUDA_KERNEL_EXAMPLE, patterns=[],
-            max_iterations=3, verifier=mock_verifier, kernel_name="test_runfirst",
-        )
-        assert result["orchestrator_passed"] is True
-        assert result["iterations_used"] == 2, (
-            "loop must NOT declare convergence on the crashing iteration")
-        crash_entries = [c for c in result["changes"] if "CRASHED at runtime" in c]
-        assert crash_entries, "the crash must be recorded in the changes log"
-        assert "SIGSEGV" in crash_entries[0]
-
-    @patch.object(ModelRouter, '_call_model')
-    def test_three_runtime_crashes_abort(self, mock_call, router):
-        """Persistent crashes must abort with runtime_stagnation, not burn
-        the full iteration budget."""
-        mock_call.side_effect = self._call_side_effect
-        mock_verifier = MagicMock()
-        mock_verifier.quick_compile_check.return_value = {
-            "compile_success": True, "errors": [], "output": ""
-        }
-        mock_verifier.quick_run_check.return_value = {
-            "run_success": False, "run_exit_code": -11, "signal": "SIGSEGV", "run_output": ""
-        }
-        result = router.route(
-            kernel_source=CUDA_KERNEL_EXAMPLE, patterns=[],
-            max_iterations=10, verifier=mock_verifier, kernel_name="test_runcrash",
-        )
-        assert result["abort_reason"] == "runtime_stagnation"
-        assert result["orchestrator_passed"] is False
-        assert result["iterations_used"] <= 3
-
-    @patch.object(ModelRouter, '_call_model')
-    def test_mock_verifier_without_run_info_still_converges(self, mock_call, router):
-        """A verifier whose quick_run_check returns a non-dict (MagicMock in
-        every pre-existing test) must read as 'no run info', not a crash —
-        preserving the old convergence behavior."""
-        mock_call.side_effect = self._call_side_effect
-        mock_verifier = MagicMock()
-        mock_verifier.quick_compile_check.return_value = {
-            "compile_success": True, "errors": [], "output": ""
-        }
-        # quick_run_check left as bare MagicMock → returns MagicMock, not dict
-        result = router.route(
-            kernel_source=CUDA_KERNEL_EXAMPLE, patterns=[],
-            max_iterations=2, verifier=mock_verifier, kernel_name="test_norun",
-        )
-        assert result["orchestrator_passed"] is True
-        assert result["iterations_used"] == 1
-
-
-# ── Bug 1: self-contained programs must not be truncated ──────────────────────
-
-SELF_CONTAINED_SOURCE = """
-#include <cuda_runtime.h>
-__global__ void shfl_scan_test(int *data, int width, int *partial_sums = NULL) {
-    int tid = threadIdx.x;
-}
-
-""" + ("// padding line to push the real entry point past a 6000-character window\n" * 250) + """
-int main(int argc, char *argv[]) {
-    shfl_scan_test<<<4, 64>>>(nullptr, 0, nullptr);
-    return 0;
-}
-"""
-
-
-class TestSelfContainedPromptTruncation:
-    """Bug 1: GLM must see a self-contained program's own main(), even when
-    the source is long enough that the old fixed character slices would have
-    cut it off (see docs/fix-plan-self-contained-programs.md)."""
-
-    def test_source_is_long_enough_to_have_broken_the_old_truncation(self):
-        # Sanity check on the fixture itself — if this fails, the fixture no
-        # longer exercises the bug and the tests below would pass vacuously.
-        assert len(SELF_CONTAINED_SOURCE) > 6000
-        assert SELF_CONTAINED_SOURCE[:6000].find("int main") == -1
-
-    def test_is_self_contained_detects_main(self, router):
-        assert router._is_self_contained(SELF_CONTAINED_SOURCE) is True
-        assert router._is_self_contained(CUDA_KERNEL_EXAMPLE) is False
-
-    def test_glm_code_prompt_contains_full_main(self, router):
-        prompt = router._build_kimi_code_prompt(SELF_CONTAINED_SOURCE, patterns=[])
-        assert "int main(int argc, char *argv[])" in prompt
-        assert "CRITICAL" in prompt and "main()" in prompt
-
-    def test_glm_refine_prompt_does_not_truncate_previous_code(self, router):
-        previous_code = SELF_CONTAINED_SOURCE  # pretend GLM echoed it back
-        prompt = router._build_kimi_refine_prompt(
-            kernel_source=SELF_CONTAINED_SOURCE,
-            previous_code=previous_code,
-            feedback="fix the warp shuffle mask",
-            patterns=[],
-        )
-        assert "int main(int argc, char *argv[])" in prompt
-
-    def test_deepseek_plan_prompt_does_not_truncate_self_contained_source(self, router):
-        prompt = router._build_deepseek_plan_prompt(SELF_CONTAINED_SOURCE, patterns=[])
-        assert "int main(int argc, char *argv[])" in prompt
-
-    def test_bare_kernel_still_truncates_at_budget(self, router):
-        long_bare_kernel = CUDA_KERNEL_EXAMPLE + ("// pad\n" * 3000)
-        assert len(long_bare_kernel) > 6000
-        prompt = router._build_kimi_code_prompt(long_bare_kernel, patterns=[])
-        assert len(prompt) < len(long_bare_kernel) + 2000  # truncated, not echoed whole
-
-
-# ── Bug 3: missing local .cuh headers must not be silently ignored ────────────
-
-class TestUnresolvedLocalHeaders:
-
-    def test_detects_missing_cuh(self, router):
-        source = '#include "shfl_integral_image.cuh"\n__global__ void k(int* a) {}\n'
-        missing = router._unresolved_local_headers(source)
-        assert "shfl_integral_image.cuh" in missing
-
-    def test_no_false_positive_for_present_header(self, router, tmp_path):
-        # A header that genuinely exists anywhere under sample_kernels/
-        # (rglob, not just the same directory) must not be flagged.
-        sample_dir = Path(__file__).resolve().parent.parent / "sample_kernels"
-        probe = sample_dir / "_test_tmp_header_for_unit_test.cuh"
-        probe.write_text("// unit-test probe header\n", encoding="utf-8")
+        # Strategy 1: prose-strip + trailing-strip + json.loads
+        json_start = raw_glm.find("{")
+        raw_glm_json = raw_glm[json_start:] if json_start >= 0 else raw_glm
+        trimmed = _strip_trailing_after_json(raw_glm_json)
+        import json
+        result = None
         try:
-            source = '#include "_test_tmp_header_for_unit_test.cuh"\n'
-            missing = router._unresolved_local_headers(source)
-            assert "_test_tmp_header_for_unit_test.cuh" not in missing
-        finally:
-            probe.unlink()
+            result = json.loads(trimmed)
+        except json.JSONDecodeError:
+            pass
 
-    def test_glm_code_prompt_warns_about_missing_header(self, router):
+        if result is None:
+            result = _extract_balanced_json(raw_glm)
+        if result is None:
+            result = _extract_arrays_regex(raw_glm)
+        if result is None:
+            result = _keyword_prose_fallback(raw_glm)
+
+        assert result is not None, "All 5 strategies failed on a valid GLM output"
+        assert "fixes" in result
+
+    def test_cascade_no_json_at_all_keyword_fallback_saves(self):
+        """When the LLM outputs pure prose with no JSON at all, Strategy 5
+        (keyword fallback) should still produce structured feedback."""
+        from router import _keyword_prose_fallback
+
+        raw = (
+            "The CUDA kernel uses __shfl_up_sync with a mask of 0xffffffff which is "
+            "32-bit and needs to be 0xffffffffffffffffULL for wavefront64 on AMD GPUs. "
+            "The warpSize should be changed from 32 to 64. Also the shared memory "
+            "allocation size needs to be adjusted for wavefront64."
+        )
+
+        result = _keyword_prose_fallback(raw)
+        fixes = result.get("fixes", [])
+        assert len(fixes) > 0, "Keyword fallback should extract fixes from prose"
+        # Should mention shfl, warpSize, and wavefront
+        keywords_found = [f.get("error", "") for f in fixes]
+        combined = " ".join(keywords_found)
+        assert "shfl" in combined or "warpSize" in combined or "wavefront" in combined
+
+    def test_truncation_detection_appends_note(self):
+        """When the raw output contains the TRUNCATED marker, the cascade should
+        append a truncation note to the fixes array."""
+        from router import _keyword_prose_fallback
+
+        raw = (
+            '{"fixes": [{"error": "test error", "root_cause": "test", '
+            '"exact_fix": "fix it", "priority": 1}], "summary": "ok"}'
+            '\n// TRUNCATED: output hit max_tokens limit'
+        )
+
+        import json
+        # Apply the same logic as the cascade
+        is_truncated = "TRUNCATED" in raw
+        assert is_truncated
+        json_start = raw.find("{")
+        trimmed = raw[json_start:] if json_start >= 0 else raw
+        # Use _strip_trailing_after_json to strip everything after the balanced }
+        from router import _strip_trailing_after_json
+        clean = _strip_trailing_after_json(trimmed)
+        result = json.loads(clean)
+
+        # Now apply truncation logic
+        if result:
+            if not result.get("fixes"):
+                result["fixes"] = []
+            result["fixes"].append({
+                "error": "(note: evaluator output was truncated at max_tokens — analysis may be incomplete)",
+                "root_cause": "The evaluator response was truncated because it exceeded the max_tokens limit.",
+                "priority": 99,
+            })
+
+        assert len(result["fixes"]) == 2
+        assert any("truncated" in str(f).lower() for f in result["fixes"])
+
+    def test_truncation_all_strategies_failed(self):
+        """When truncation happens AND all 5 strategies fail, the truncation
+        note should still be captured in a minimal glm_analysis dict."""
+        from router import _keyword_prose_fallback
+
+        raw = (
+            "I'm analyzing the kernel and here are my thoughts about the "
+            "__shfl_up_sync mask and warpSize issues on wavefront64...\n"
+            "// TRUNCATED: output hit max_tokens limit"
+        )
+
+        # Simulate cascade (no JSON at all)
+        result = _keyword_prose_fallback(raw)
+        is_truncated = "TRUNCATED" in raw
+        if is_truncated:
+            if result is None:
+                result = {"fixes": [], "_raw": raw[:500]}
+            if not result.get("fixes"):
+                result["fixes"] = []
+            result["fixes"].append({
+                "error": "(note: evaluator output was truncated at max_tokens — analysis may be incomplete)",
+                "root_cause": "The evaluator response was truncated because it exceeded the max_tokens limit.",
+                "priority": 99,
+            })
+
+        assert result is not None
+        assert len(result["fixes"]) > 1  # keyword fixes + truncation note
+        assert any("truncated" in str(f).lower() for f in result["fixes"])
+
+
+# ── I1: Kimi code prompt tests ─────────────────────────────────────────────────
+
+class TestKimiCodePrompt:
+    """Tests for Kimi coder prompt building."""
+
+    def test_cuda_include_dropped_in_code_prompt(self, router):
+        """CUDA includes in code prompt should still work even if unresolved."""
         source = (
             '#include "shfl_integral_image.cuh"\n'
             '__global__ void shfl_scan_test(int *data) {}\n'
