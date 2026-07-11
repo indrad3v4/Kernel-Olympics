@@ -1,0 +1,128 @@
+Script started on 2026-07-11 23:56:45+00:00 [COMMAND="bash scripts/amd_demo_record.sh" <not executed on terminal>]
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  KERNEL OLYMPICS — AMD TRACK 3
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+
+  Real hardware: AMD MI300X (ROCm 7.2)
+  Pipeline:      DeepSeek v4 (plan) → GLM-5.2 (code) → Kimi K2.7 (eval) → Gemma 4 (verify)
+  Repo:          github.com/indrad3v4/Kernel-Olympics
+  Recording:     2026-07-11 23:56 UTC
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PHASE 0: Environment Check
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  $ hipconfig --full (head -3)
+HIP version: 7.2.53211-e1a6bc5663
+
+==hipconfig
+
+  $ git log --oneline -3
+6696614 fix: when evaluator fails on a crashing binary, continue loop instead of breaking — feeds crash back to DeepSeek re-plan → GLM refine
+6021a28 Gemma 4 gate inside iteration loop — rejection triggers DeepSeek re-plan
+00def87 improve UI text and add Gemma→DeepSeek fallback messaging
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PHASE 1: make help — All Targets
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  $ make help
+
+[1mKernel Olympics — CUDA → ROCm Migration[0m
+
+  [2mUsage:[0m    make <target>   [CU_FILE=path/to/kernel.cu]
+
+  [1mCore workflow[0m
+    [1;34mpipeline        [0m Port → compile → run (full cycle)
+    [1;34mport            [0m Run LLM pipeline (CUDA→HIP)
+    [1;34mcompile         [0m hipcc device-only proof harness
+    [1;34mrun             [0m Execute proof on AMD GPU
+
+  [1mDemo & recording[0m
+    [1;34mdemo            [0m Full migration demo (3-5 min)
+    [1;34mrecord          [0m asciinema recording
+
+  [1mQuality[0m
+    [1;34mtest            [0m 665 unit tests
+    [1;34mdoctor          [0m Pre-flight check
+    [1;34mlint            [0m Ruff linter
+
+  [1mCache[0m
+    [1;34mspeed-demo      [0m LLM vs cache speed demo
+    [1;34mfresh           [0m Run with fresh cache
+
+  [1mUtility[0m
+    [1;34mclean           [0m Remove artifacts
+    [1;34mclean-all       [0m + remove .venv + ported kernels
+    [1;34msetup           [0m Full first-time setup on new machine
+    [1;34mreclone         [0m Fresh clone (zaps local changes)
+
+  [1mGitHub sync[0m
+    [1;34mpull            [0m git pull latest from GitHub
+    [1;34mpush            [0m git add+commit+push (MSG=...)
+    [1;34msync            [0m pull then push (two-way sync)
+    [1;34mpush-to-cation  [0m Pull here, pull on AMD workspace
+
+  [1mWatch & debug[0m
+    [1;34mdebug           [0m Debug artifacts saved
+    [1;34mwatch           [0m Daemon mode (auto-process)
+
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PHASE 2: make compile — hipcc on MI300X
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Generates proof harness → compiles with AMD hipcc
+
+  $ make compile
+║  │  🔧 HIP intrinsic fix: 2 CUDA _sync call(s) converted to non-sync variants            ║
+  ✅ Proof harness: /tmp/proof_harness.hip.cpp (147 lines)
+hipcc -o /tmp/nvidia_shfl_scan_proof /tmp/proof_harness.hip.cpp -I/opt/rocm/include 2>&1 | sed 's/^/  │ /'
+  │ /tmp/proof_harness.hip.cpp:145:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  │   145 |     hipFree(d_data); free(h_data);
+  │       |     ^~~~~~~~~~~~~~~
+  │ 1 warning generated when compiling for gfx1100.
+  │ /tmp/proof_harness.hip.cpp:145:5: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  │   145 |     hipFree(d_data); free(h_data);
+  │       |     ^~~~~~~~~~~~~~~
+  │ 1 warning generated when compiling for host.
+  ✓  Compiled → /tmp/nvidia_shfl_scan_proof
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  PHASE 3: make run — Execute on MI300X GPU
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Runs compiled binary on real AMD silicon
+
+  $ make run
+/tmp/nvidia_shfl_scan_proof
+Device:  | warpSize=32
+FAIL[32]: got 2112, expected 33
+FAILED
+make: *** [Makefile:55: run] Error 1
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  DEMO COMPLETE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  ✓  CUDA→HIP port          — LLM multi-agent loop
+  ✓  hipcc compile          — ROCm 7.2 on MI300X
+  ✓  GPU execution          — Real AMD hardware
+  ⚠  Correctness check      — Runtime bug caught
+
+  git log --oneline -3
+6696614 fix: when evaluator fails on a crashing binary, continue loop instead of breaking — feeds crash back to DeepSeek re-plan → GLM refine
+6021a28 Gemma 4 gate inside iteration loop — rejection triggers DeepSeek re-plan
+00def87 improve UI text and add Gemma→DeepSeek fallback messaging
+
+  https://github.com/indrad3v4/Kernel-Olympics
+
+
+Script done on 2026-07-11 23:56:55+00:00 [COMMAND_EXIT_CODE="0"]
