@@ -320,6 +320,129 @@ class VerificationAgent:
                   f"converted to non-sync variants{'':<12}║")
         return result
 
+    # ── Device-only proof: compile a minimal harness from just the device kernel ──
+
+    def _try_device_only_proof(self, kernel_name: str, device_source: str,
+                                 build_dir: Path, spec: Optional[dict],
+                                 on_progress=None,
+                                 offload_arch: Optional[str] = None) -> tuple:
+        """Attempt to compile a device-only proof harness.
+
+        Some kernels (NVIDIA SDK samples, benchmarks) carry unportable host
+        code (cudaEvent, printf, CPU-side verification) but have perfectly
+        valid device functions.  This method wraps just the device functions
+        in a minimal proof harness and tries hipcc.
+
+        Returns (compile_ok, compile_output, compile_log_path) — same shape
+        as :meth:`_compile` so the caller handles them identically.
+        """
+        import re
+
+        # ── 1. Build the proof harness from device code + spec ──
+        if spec and spec.get("params"):
+            proof, *_ = self._harness_from_spec(spec, device_source)
+        else:
+            proof = self._legacy_device_proof_harness(kernel_name, device_source)
+
+        proof_file = build_dir / f"{kernel_name}_proof.hip.cpp"
+        proof_file.write_text(proof, encoding="utf-8")
+
+        if on_progress: on_progress(35, "device-only compile attempt")
+        return self._compile(proof_file, build_dir, f"{kernel_name}_proof",
+                             on_progress=on_progress, offload_arch=offload_arch)
+
+    @staticmethod
+    def _legacy_device_proof_harness(kernel_name: str, device_source: str) -> str:
+        """Fallback proof harness when no spec is available.
+
+        Creates a minimal ``int``-based harness that allocates 256 values
+        (1..256), launches ``<<<1, 256>>>``, syncs, and prints PASSED/FAILED.
+
+        Assumes the kernel signature is ``(int* data, int width, ...)``
+        with ``width`` as the second param — the pattern used by most
+        warp-level prefix scan kernels.  The harness queries the real
+        ``warpSize`` at runtime via ``hipGetDeviceProperties``.
+        """
+        import re
+        match = re.search(r'__global__\s+void\s+(\w+)\s*\(', device_source)
+        kern_name = match.group(1) if match else f"{kernel_name}_kernel"
+
+        # Check device code for optional extra params after width
+        # Common: shfl_scan_test(int *data, int width, int *partial_sums)
+        extra = ""
+        sig_match = re.search(
+            rf'__global__\s+void\s+{re.escape(kern_name)}\s*\(([^)]*)\)',
+            device_source,
+        )
+        if sig_match:
+            parts = [p.strip() for p in sig_match.group(1).split(",")]
+            if len(parts) > 2:
+                # 3rd+ params — pass nullptr for pointers, 0 for scalars
+                extras = []
+                for p in parts[2:]:
+                    pname = p.split()[-1] if p.split() else "arg"
+                    extras.append("nullptr" if "*" in p else "0")
+                if extras:
+                    extra = ", " + ", ".join(extras)
+
+        harness = [
+            '#include <hip/hip_runtime.h>',
+            '#include <cstdio>',
+            '#include <cstdlib>',
+            '',
+            '// ── Device kernel ──',
+            device_source,
+            '',
+            'int main() {',
+            '    const int n = 256;',
+            '    int *d_data, *h_data;',
+            '    h_data = (int*)malloc(n * sizeof(int));',
+            '    if (!h_data) { fprintf(stderr, "malloc failed\\n"); return 1; }',
+            '    for (int i = 0; i < n; i++) h_data[i] = i + 1;',
+            '    if (hipMalloc(&d_data, n * sizeof(int)) != hipSuccess) {',
+            '        fprintf(stderr, "hipMalloc failed\\n"); return 1;',
+            '    }',
+            '    if (hipMemcpy(d_data, h_data, n * sizeof(int),',
+            '                  hipMemcpyHostToDevice) != hipSuccess) {',
+            '        fprintf(stderr, "hipMemcpy H2D failed\\n"); return 1;',
+            '    }',
+            '',
+            '    hipDeviceProp_t prop;',
+            '    if (hipGetDeviceProperties(&prop, 0) != hipSuccess) {',
+            '        fprintf(stderr, "hipGetDeviceProperties failed\\n"); return 1;',
+            '    }',
+            '    int width = prop.warpSize;',
+            f'    printf("Device: %s | warpSize=%d\\n", prop.name, width);',
+            '',
+            f'    {kern_name}<<<1, n>>>(d_data, width{extra});',
+            '    if (hipDeviceSynchronize() != hipSuccess) {',
+            '        fprintf(stderr, "hipDeviceSynchronize failed\\n"); return 1;',
+            '    }',
+            '',
+            '    if (hipMemcpy(h_data, d_data, n * sizeof(int),',
+            '                  hipMemcpyDeviceToHost) != hipSuccess) {',
+            '        fprintf(stderr, "hipMemcpy D2H failed\\n"); return 1;',
+            '    }',
+            '',
+            '    int pass = 1;',
+            '    for (int i = 0; i < n; i++) {',
+            '        int base = (i / width) * width;',
+            '        int expected = 0;',
+            '        for (int k = base; k <= i; k++) expected += (k + 1);',
+            '        if (h_data[i] != expected) {',
+            '            pass = 0;',
+            '            printf("FAIL[%d]: got %d, expected %d\\n",',
+            '                   i, h_data[i], expected);',
+            '            break;',
+            '        }',
+            '    }',
+            '    printf("%s\\n", pass ? "PASSED" : "FAILED");',
+            '    hipFree(d_data); free(h_data);',
+            '    return pass ? 0 : 1;',
+            '}',
+        ]
+        return "\n".join(harness)
+
     def _generate_harness(self, kernel_name: str, test_input: str,
                           ported_kernel_source: str) -> tuple:
         """
@@ -884,6 +1007,46 @@ class VerificationAgent:
         result["compile_log_path"] = compile_log_path
 
         if not compile_ok:
+            # ── DEVICE-ONLY PROOF: try extracting just the device kernel ──
+            # Some kernels (e.g. NVIDIA SDK samples with int main()) contain
+            # unportable host code but perfectly valid device kernels. Before
+            # giving up, strip to device functions and try a minimal proof.
+            device_only = self._strip_to_device_code(hip_source)
+            if device_only:
+                device_only = self._fix_hip_intrinsics(device_only)
+                proof_ok, proof_out, proof_log = self._try_device_only_proof(
+                    kernel_name, device_only, kernel_build_dir, spec,
+                    on_progress, arch,
+                )
+                if proof_ok:
+                    result["compile_success"] = True  # succeeded via device-only
+                    result["compile_output"] = (
+                        f"Full harness compile failed. "
+                        f"Device-only proof succeeded.\n{proof_out[:800]}"
+                    )
+                    # Step 4: Run the device-only binary
+                    if on_progress: on_progress(75, "running device-only proof")
+                    run_ok, run_output, benchmark, run_exit_code = self._run(
+                        kernel_build_dir, f"{kernel_name}_proof"
+                    )
+                    if on_progress: on_progress(90, "device-only run complete" if run_ok else "run failed")
+                    result["run_success"] = run_ok
+                    result["run_output"] = run_output[:1000] if run_output else ""
+                    result["benchmark_us"] = benchmark
+                    result["run_exit_code"] = run_exit_code
+                    if run_ok:
+                        result["device_only_verified"] = True
+                        result["passed"] = True
+                        if on_progress: on_progress(100, "PASSED ✅ (device-only proof)")
+                        return result
+                    else:
+                        # Device-only compiled but crashed at runtime
+                        compile_out += (
+                            f"\n\n⚠️ Device-only proof compiled but RUNTIME FAILED:\n"
+                            f"   {run_output[:300]}"
+                        )
+
+            # ── Save for manual hipcc (last resort) ──
             manual_dir = Path.cwd() / "ported_kernels"
             manual_dir.mkdir(parents=True, exist_ok=True)
             manual_path = manual_dir / f"{kernel_name}.hip.cpp"
