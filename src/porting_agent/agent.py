@@ -151,6 +151,23 @@ PORTING RULES (follow all that apply):
 11. threadIdx.x >> 5 computes warp index (32 lanes) → should be >> 6 for wavefront64
 12. Lane identification: if (lane_id < 32) → if (lane_id < 64) for wavefront boundary
 13. __shfl_sync (basic shuffle) — mask and lane count must be adjusted for wavefront64
+14. CRITICAL: Keep kernel LAUNCH parameters (blockDim/gridDim, shmem_sz) CONSISTENT
+    with the kernel BODY. If you change the kernel's `lane_id = id % 32` → `% 64`,
+    the host-side `nWarps = blockSize / 32` MUST also become `blockSize / 64`, and
+    `shmem_sz = nWarps * sizeof(int)` updates automatically. Inconsistent warp-size
+    between kernel body and launch config causes shared-memory OUT OF BOUNDS.
+15. CRITICAL: Do NOT hardcode the kernel `width` argument in the launch call.
+    The `width` parameter in `shfl_scan_test<<<...>>>(data, width, sums)` controls
+    the shuffle scan group size. On AMD, `warpSize = 64`, so `width=warpSize` is
+    correct. But the host code should COMPUTE it as `warpSize` (device property),
+    not hardcode `32` or `64`. Best: pass `warpSize` at runtime, or if the kernel
+    takes a plain `int width`, keep the original host-side formula
+    `width = blockSize / (2 * warpSize)` that scales correctly.
+16. CAUTION: `__shfl_up(value, delta, width)` with `width=1` is invalid — the
+    shuffle reads lane (lane_id - delta) = lane -1 → OUT OF BOUNDS → SIGSEGV.
+    If `blockDim.x / warpSize` could produce `1` on wavefront64 (64/64=1),
+    guard with `max(blockDim.x / WAVEFRONT_SIZE, 2u)` or check `if (width < 2)`.
+    When width=1, the shuffle is a no-op and should be skipped.
 
 OUTPUT FORMAT — STRICT JSON (no markdown fence, no extra text):
 Respond with a single JSON object. NO markdown code block (no ```json ... ```).
