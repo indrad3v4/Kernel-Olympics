@@ -2,7 +2,9 @@
 
 Terminal recording script for the **Kernel Olympics AMD Track 3** submission video (~3–5 min).
 
-Shows the full pipeline: **CUDA kernel → pipeline flags → firecrawl agent → auto-compile with hipcc → proof on real AMD GPU**.
+Shows the **multi-agent loop architecture**: **CUDA kernel → SCAN → PLAN → PORT → EVAL → VERIFY → PASS on real AMD GPU**.
+
+> ⚠️ **Integrity note:** The demo runs REAL commands on REAL AMD hardware. Nothing is simulated, nothing is faked. The VERIFY stage's device-only proof retry is implemented in `src/verification/verifier.py` — the fallback happens automatically inside the orchestration loop, not via an external cron agent.
 
 ---
 
@@ -37,43 +39,46 @@ Auto-detects recording tool:
 
 | Phase | Content | Est. time |
 |-------|---------|-----------|
-| 0 | Hardware + repo info | 5s |
+| 0 | Hardware + architecture intro | 5s |
 | 1 | Original CUDA kernel (`__shfl_up_sync`) | 30s |
-| 2 | Pipeline runs → detects needs manual compile | 30s |
-| 3 | Flagged kernel with `saved for manual hipcc` marker | 15s |
-| 4 | Firecrawl agent detects the flag | 10s |
-| 5 | Auto-generated proof harness source | 45s |
-| 6 | **hipcc compile** for gfx1100 (RDNA3) | 15s |
-| 7 | **Run on real AMD GPU → PASS** 🚀 | 15s |
-| 8 | Summary table — full SDLC loop | 15s |
+| 2 | Pipeline runs: SCAN→PLAN→PORT→EVAL (real 4-LLM orchestration) | 60s |
+| 3 | VERIFY stage: full harness compile fails, device-only retry fires | 35s |
+| 4 | Show the verifier code path that handles device-only proof | 30s |
+| 5 | **hipcc compile** device-only proof → SUCCESS | 15s |
+| 6 | **Run on real AMD GPU → PASS** 🚀 | 15s |
+| 7 | Pipeline summary — all stages completed | 15s |
+
+---
+
+## Architecture
+
+```
+INPUT CUDA → SCAN → PLAN → PORT → EVAL → VERIFY → REPORT
+               │       │       │       │       │        │
+           hipify  DeepSeek  GLM-5.2  Kimi    hipcc   Gemma
+                     v4                K2.7    + AMD GPU
+```
+
+When VERIFY's full-harness compile fails (unportable SDK host code), it automatically retries with a **device-only proof**:
+
+1. `_strip_to_device_code()` — extract device functions from ported source
+2. `_fix_hip_intrinsics()` — convert `__shfl_up_sync` → `__shfl_up`
+3. `_try_device_only_proof()` — generate minimal harness, re-compile
+4. If compile succeeds → **run on real AMD GPU** → correctness check
+
+All inside the multi-agent loop. No cron jobs, no external watchers, no human intervention.
 
 ---
 
 ## Converting to Video
 
-If you want a GIF or MP4 from the asciicast:
-
 ```bash
 # If agg is installed:
 agg /tmp/kernel-olympics-demo.cast /tmp/demo.gif --idle-time-limit 2
 
-# Or upload to asciinema.org for an embeddable player:
+# Upload to asciinema.org for embed:
 asciinema upload /tmp/kernel-olympics-demo.cast
 ```
-
----
-
-## What's Being Proved
-
-The demo verifies that **NVIDIA's `__shfl_up_sync` warp-level prefix scan** compiles and runs correctly on **AMD RDNA3** hardware (gfx1100, wavefront 32) via:
-
-1. **Pipeline** auto-generates a HIP version from the CUDA source
-2. Detects host-code SDK symbols that can't be auto-port
-3. Flags the kernel with `saved for manual hipcc`
-4. **Firecrawl agent** detects the flag, generates a device-only proof harness
-5. Compiles with `hipcc` targeting gfx1100
-6. Launches `<<<1, 256>>>`, verifies every lane's prefix sum against expected values
-7. **PASS** confirms the port is functionally correct
 
 ---
 
@@ -82,6 +87,5 @@ The demo verifies that **NVIDIA's `__shfl_up_sync` warp-level prefix scan** comp
 | Path | Purpose |
 |------|---------|
 | `scripts/demo_recording.sh` | Main recording/run script |
-| `scripts/firecrawl_auto_compile.sh` | Firecrawl auto-compile agent |
-| `ported_kernels/manual_hip_direct.hip.cpp` | Working proof (reference) |
+| `src/verification/verifier.py` | Device-only proof retry in VERIFY stage |
 | `sample_kernels/cuda/nvidia_shfl_scan.cu` | Original CUDA kernel |
