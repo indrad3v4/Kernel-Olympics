@@ -3665,6 +3665,7 @@ class ModelRouter:
         runtime_crash_count = 0  # RUN-FIRST: consecutive compile-pass-but-crash iterations
         kimi_plateau_count = 0  # C1: count consecutive iterations with same error set after Kimi refine
         code_sha_history = []  # Track SHA to detect oscillation
+        iter_gate_history = []  # Track gate outcomes to detect rejection↔compile oscillation
         # P1 (two-layer SIGSEGV): last code that hipcc accepted. Once set, a refine
         # that breaks compilation is discarded and this is restored (Layer 1).
         frozen_base_code = ""
@@ -3802,6 +3803,21 @@ class ModelRouter:
                     "; ".join(iter_structural.get("errors", [])),
                     ", ".join(iter_structural.get("missing_symbols", [])) or "(none reported)",
                 )
+                # ── Rejection-oscillation detection: structural→compile→structural→compile ──
+                # The SHA-based detector (line ~3832) only records compile-pass code, so
+                # oscillation between structural reject and compile pass is invisible to it.
+                iter_gate_history.append(("rejected", state.gate))
+                if len(iter_gate_history) >= 4:
+                    _last4 = [x[0] for x in iter_gate_history[-4:]]
+                    if _last4 == ["rejected", "compiled", "rejected", "compiled"]:
+                        result["changes"].append(
+                            "[oscillation] Rejection oscillation detected — "
+                            "pattern: rejected→compiled→rejected→compiled")
+                        print(f"║  │  🔄 REJECTION OSCILLATION: structural↔compiled "
+                              f"cycling - aborting{'':<12}║")
+                        result["iterations_used"] = iteration
+                        result["abort_reason"] = "rejection_oscillation"
+                        break
                 # Fall through past the hipcc block into the refine step.
             elif verifier and hasattr(verifier, 'quick_compile_check'):
                 state.gate = "compile"
@@ -3847,6 +3863,22 @@ class ModelRouter:
                         break
 
                 if cc["compile_success"]:
+                    # ── Rejection-oscillation detection ──
+                    # Match the "compiled" side that the structural block records as
+                    # "rejected". When the last 4 iterations alternate between
+                    # structural reject and compile pass, abort early.
+                    iter_gate_history.append(("compiled", "hipcc"))
+                    if len(iter_gate_history) >= 4:
+                        _last4 = [x[0] for x in iter_gate_history[-4:]]
+                        if _last4 == ["rejected", "compiled", "rejected", "compiled"]:
+                            result["changes"].append(
+                                "[oscillation] Rejection oscillation detected — "
+                                "pattern: rejected→compiled→rejected→compiled")
+                            print(f"║  │  🔄 REJECTION OSCILLATION: structural↔compiled "
+                                  f"cycling - aborting{'':<12}║")
+                            result["iterations_used"] = iteration
+                            result["abort_reason"] = "rejection_oscillation"
+                            break
                     state.compile_success = True
                     # Compile passed — release the repair reserve so the
                     # verification phase can draw on it.
@@ -5167,7 +5199,8 @@ class ModelRouter:
         # the furthest-compiling version instead — that is what "return the best
         # compiling code so far" means, and it is what the demo needs to show.
         if (result.get("abort_reason") in ("pipeline_timeout", "layer2_rejected",
-                                   "hard_stagnation", "oscillation_detected")
+                                   "hard_stagnation", "oscillation_detected",
+                                   "rejection_oscillation")
                 and best_attempt_code
                 and result["ported_code"] != best_attempt_code):
             result["ported_code"] = best_attempt_code
