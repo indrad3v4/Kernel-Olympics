@@ -1,6 +1,14 @@
 # Proof: Pipeline Verifies a Ported Kernel on a Real AMD MI300X
 
-**Status:** ⏳ **PENDING — not yet generated.**
+**Status:** ⏳ **PENDING — verification attempted but no AMD GPU/ROCm stack available in current CI environment.**
+
+> **Attempted verification:** `scripts/verify_on_amd_gpu.py` was run on
+> `2026-07-11` in the standard Hermes CI environment (Linux x86_64 cloud VM).
+> Both `rocm-smi` and `hipcc` reported "not found" — this environment does not
+> have access to AMD ROCm hardware or toolchain. See
+> `scripts/verify_on_amd_gpu.py` for the exact tooling required and instructions
+> for running on **AMD Developer Cloud** (`notebooks.amd.com`) where an MI300X
+> is available.
 
 ## Status summary
 
