@@ -10,6 +10,7 @@ TRIZ: Use risk classifier output as routing resource (no extra LLM call to decid
       Each model does what it's best at — no wasted tokens.
 """
 
+import hashlib
 import json
 import re
 import os
@@ -106,6 +107,44 @@ class IterationState:
         ``compile_ran and not compile_success`` instead of on this property.
         """
         return self.structural_reject or (self.compile_ran and not self.compile_success)
+
+    def failure_signature(self) -> str:
+        """Stable fingerprint of this iteration's failure mode.
+
+        Empty string on success. Otherwise a tagged, hash-suffixed string
+        that collides when two iterations fail the same way and does not
+        collide across gates.
+
+        For compile failures the signature is a hash of the parsed typed
+        diagnostic set ``{(kind, symbol, owner)}``, not the raw error
+        strings — so the same missing include reported with a slightly
+        different message column still collides, and two genuinely
+        different symbols missing at the same line no longer collide.
+        Falls back to path/line-stripped strings when the typed parser
+        yields no diagnostics (e.g. link errors).
+        """
+        if not self.compile_failed:
+            return ""
+        if self.structural_reject:
+            payload = "|".join(sorted(self.structural_errors))
+            return "structural:" + hashlib.sha256(payload.encode()).hexdigest()[:12]
+        # Compile failure: prefer typed diagnostic set for identity.
+        try:
+            from verification.typed_diagnostic import diagnostic_set
+            triples = diagnostic_set(self.compile_errs)
+        except Exception:
+            triples = frozenset()
+        if triples:
+            payload = "|".join(f"{k}:{s}:{o}" for k, s, o in sorted(triples))
+            return "compile:" + hashlib.sha256(payload.encode()).hexdigest()[:12]
+        # Fallback: strip "<path>:<line>:<col>:" so two runs of the same
+        # defect at different source offsets still collide.
+        stripped = sorted(_ERR_LOC_RE.sub("", e).strip() for e in self.compile_errs)
+        payload = "|".join(stripped)
+        return "compile:" + hashlib.sha256(payload.encode()).hexdigest()[:12]
+
+
+_ERR_LOC_RE = re.compile(r'^[^:\n]+:\d+:\d+:\s*')
 
 
 def _force_ipv4():
@@ -383,7 +422,8 @@ MIN_LLM_TIMEOUT_SECONDS = 5
 # Without the coder there is no kernel at all. So the planner gets a slice, and
 # the coder plus one compile get a reservation the planner may not touch.
 PLAN_BUDGET_FRACTION = 0.20      # planner may use at most 20% of the pipeline budget
-CODE_RESERVE_FRACTION = 0.55     # of the budget, held back for the coder
+CODE_RESERVE_FRACTION = 0.35     # of the budget, held back for the initial coder
+REPAIR_RESERVE_FRACTION = 0.30   # of the budget, held back for refine/repair cycles
 COMPILE_RESERVE_SECONDS = 25     # clock kept for hipcc; a compile cannot be interrupted
 
 # ── P0: per-stage budget caps (max, not target) ──
@@ -398,7 +438,11 @@ COMPILE_RESERVE_SECONDS = 25     # clock kept for hipcc; a compile cannot be int
 PLAN_CAP = 30              # planner: at most 30s
 CODEGEN_CAP = 70           # coder: at most 70s for the initial HIP port
 COMPILE_RESERVE = 25       # same as COMPILE_RESERVE_SECONDS — always protected
-REPAIR_RESERVE = 60        # protected until first compile failure, then released for repair cycles
+# Absolute reserve for refine/repair cycles. The FRACTION above expresses the
+# same knob as a share of the total budget; both exist because tests pin the
+# fraction (Part B) but pre-Part B call sites still consume the absolute.
+# Env override kept for tests that want to poke at the value directly.
+REPAIR_RESERVE = int(os.environ.get("REPAIR_RESERVE_SECONDS", "60"))
 VERIFY_CAP = 15            # final verification: at most 15s per call
 
 # Output-token ceiling for a planner that was handed a hipified draft. It is asked
