@@ -4890,11 +4890,15 @@ class ModelRouter:
 
                 if not evaluator.success:
                     result["changes"].append(
-                        f"[glm] Call failed (iteration {iteration})")
+                        f"[glm] Call failed (iteration {iteration}) "
+                        f"— keeping crash feedback, continuing loop")
                     self.debug.transition("EVALUATION_FAILED",
-                                          reason="GLM call failed",
+                                          reason="GLM call failed — continuing",
                                           validation_result=False, iteration=iteration)
-                    break
+                    # Don't break — the evaluator_feedback (crash details) is
+                    # already set from RUN-FIRST. Let the loop continue to
+                    # Kimi refine / DeepSeek re-plan with what we have.
+                    parsed = None
 
                 # Parse GLM evaluator JSON response
                 # GLM follows json_schema — should be clean JSON, but keep fallbacks
