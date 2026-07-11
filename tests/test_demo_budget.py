@@ -744,10 +744,10 @@ class TestPhaseBudgets:
 # ── P0: route() honours the wall-clock budget ────────────────────────────
 
 class TestRouteTimeout:
-    def test_default_budget_is_300s(self):
-        # Default bumped 180→300 (commit 2016929) to give the in-loop compile/
-        # refine cycle room to converge; keep this in sync with router.py.
-        assert MAX_PIPELINE_SECONDS == 300
+    def test_default_budget_is_500s(self):
+        # Default raised 180→300→500 to give the in-loop compile/refine cycle
+        # room to converge on large samples; keep this in sync with router.py.
+        assert MAX_PIPELINE_SECONDS == 500
 
     @patch.object(ModelRouter, '_call_model')
     def test_route_aborts_and_returns_best_compiling_code(self, mock_call, router):

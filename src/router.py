@@ -361,7 +361,7 @@ JSON_SCHEMAS = {
 # testable without spawning real timers, and — because _call_model clamps each
 # request timeout to the remaining budget — it actually bounds the blocking socket
 # reads that consume nearly all of the wall time. A signal could not do the latter.
-MAX_PIPELINE_SECONDS = int(os.environ.get("MAX_PIPELINE_SECONDS", "300"))
+MAX_PIPELINE_SECONDS = int(os.environ.get("MAX_PIPELINE_SECONDS", "500"))
 
 # Floor for a clamped LLM timeout. Below this a request cannot realistically
 # round-trip, so we fail fast instead of issuing a request doomed to time out.
