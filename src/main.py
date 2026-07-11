@@ -510,8 +510,8 @@ class KernelOlympics:
                 try:
                     ver_result = self.verifier.verify(
                         hip_source=port_result.get("ported_code", source),
-                        cuda_reference_output=reference_output,
                         kernel_name=Path(cr['file']).stem,
+                        cuda_source=source,
                         on_progress=_compile_progress
                     )
                 finally:

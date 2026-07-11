@@ -22,6 +22,7 @@ motivated this file.
 """
 import os
 import sys
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -365,11 +366,15 @@ class TestCompileFailure:
         mock_call.side_effect = dispatch
 
         verifier = MagicMock()
-        verifier.quick_compile_check.return_value = {
-            "compile_success": False,
-            "errors": ["error: use of undeclared identifier 'hipMalloc'"],
-            "output": "",
-        }
+        # Compile fails with a real-looking error string that _inloop_compile can parse
+        verifier.build_dir = Path("/tmp/fake_build")
+        verifier._generate_harness.return_value = ("// mock harness", 0, 0)
+        verifier._compile.return_value = (
+            False,
+            "test_kernel.hip.cpp:5:3: error: use of undeclared identifier 'hipMalloc'",
+            Path("/dev/null"))
+        verifier._classify_error_origin.return_value = "ported_code"
+        verifier._warn_if_legacy_harness.return_value = None
         verifier.verify.return_value = {
             "compile_success": False, "passed": False, "compile_output": "", "output": ""
         }
@@ -408,10 +413,17 @@ class TestCompileSuccess:
 
         mock_call.side_effect = dispatch
 
+        from pathlib import Path
         verifier = MagicMock()
-        verifier.quick_compile_check.return_value = {
-            "compile_success": True, "errors": [], "output": ""
-        }
+        verifier.build_dir = Path("/tmp/fake_build")
+        verifier._generate_harness.return_value = ("// mock harness", 0, 0)
+        verifier._compile.return_value = (True, "", Path("/dev/null"))
+        # _run fails so the fast-path RUN-FIRST check blocks it, and the
+        # convergence loop runs (producing last_iteration_state).
+        verifier._run.return_value = (False, "", 0, -11)
+        verifier._signal_name.return_value = "SIGSEGV"
+        verifier._classify_error_origin.return_value = "harness"
+        verifier._warn_if_legacy_harness.return_value = None
         verifier.verify.return_value = {
             "compile_success": True, "passed": True, "compile_output": "", "output": ""
         }

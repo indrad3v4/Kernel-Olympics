@@ -21,6 +21,8 @@ from pathlib import Path
 from typing import Dict, Optional, Any
 from dataclasses import dataclass
 
+from verification.oracle import DifferentialOracle, OracleKind
+
 # debug_session lives at the src/ root. Seed sys.path so importing this module
 # in isolation (a bare `from verification.verifier import ...` in a test) works
 # the same way it does under main.py, which seeds src/ itself.
@@ -31,6 +33,7 @@ from debug_session import DebugSession, compiler_version as _compiler_version
 
 # ── Spec directory (relative to this file) ──────────────────────────
 _SPEC_DIR = Path(__file__).parent / "specs"
+_REPO_ROOT = _SPEC_DIR.parent.parent.parent  # src/verification/specs/ -> src/ -> Kernel-Olympics/
 
 
 @dataclass
@@ -58,6 +61,13 @@ class VerificationAgent:
         # Phase 11: Debug Mode. Always a session object — a null one until the
         # router attaches a live one — so _compile() never branches on it.
         self.debug = DebugSession.disabled()
+
+        # Phase 12: Execution-grounded differential oracle.
+        # Replaces fabricated golden files with executed references.
+        self.oracle = DifferentialOracle(
+            repo_root=_REPO_ROOT,
+            nvcc=shutil.which("nvcc"),
+        )
 
         # Persistent build directory — reuse across verify() calls
         env_build_dir = os.environ.get("VERIFIER_BUILD_DIR")
@@ -788,9 +798,28 @@ class VerificationAgent:
             "kernel_name": kernel_name,
         }
 
-    def verify(self, hip_source: str, cuda_reference_output: str = "",
-               test_input: str = "", kernel_name: str = "test_kernel",
-               on_progress=None) -> Dict:
+    @staticmethod
+    def _build_seed(spec: Optional[dict]) -> bytes:
+        """Derive the deterministic input seed from the spec's input_setup.
+
+        Returns a consistent seed so that both the HIP kernel and the reference
+        see identical input data. When the spec has no input_setup, returns an
+        empty seed (both sides use whatever default the harness provides).
+        """
+        if not spec or "input_setup" not in spec:
+            return b""
+        setup = spec["input_setup"]
+        # If setup is a dict with explicit values, serialize them.
+        if isinstance(setup, dict):
+            return json.dumps(setup, sort_keys=True).encode("utf-8")
+        # If setup is a string (filename or seed literal), use it directly.
+        if isinstance(setup, str):
+            return setup.encode("utf-8")
+        return b""
+
+    def verify(self, hip_source: str, test_input: str = "",
+               kernel_name: str = "test_kernel",
+               on_progress=None, cuda_source: str = "") -> Dict:
         """
         Verify a ported HIP kernel:
         1. Write source to persistent build directory
@@ -909,29 +938,37 @@ class VerificationAgent:
                 return result
         result["determinism"] = {"ok": deterministic}
 
-        # Step 5: Diff against reference (90→100%)
-        if on_progress: on_progress(95, "diffing against CUDA reference")
-        ref_text = cuda_reference_output
-        spec_ref_path = spec.get("_reference_path") if spec else None
-        if spec_ref_path and not ref_text:
-            try:
-                ref_text = Path(spec_ref_path).read_text(encoding="utf-8")
-            except OSError as e:
-                print(f"║ ⚠️ Could not read spec reference file: {e}")
+        # Step 5: Diff against an EXECUTED reference (90->100%)
+        if on_progress: on_progress(95, "resolving executed reference")
 
-        if ref_text:
-            atol, rtol = self._tolerances(spec)
-            diff_ok, diff_report = self._diff(run_output, ref_text, atol=atol, rtol=rtol)
-            result["output_match"] = diff_ok
-            result["diff_report"] = diff_report[:500] if diff_report else ""
-            result["tolerance"] = {"atol": atol, "rtol": rtol}
-            result["passed"] = diff_ok
-        else:
-            result["output_match"] = True
-            result["diff_report"] = "No reference — marked pass (compiled + ran successfully)"
-            result["passed"] = True
+        # The seed MUST be the same input the harness fed the kernel. Derive it
+        # from the spec's input_setup so both sides see identical data.
+        seed = self._build_seed(spec)
 
-        if on_progress: on_progress(100, "PASSED ✅" if result["passed"] else "DIFF FAILED")
+        ref = self.oracle.resolve(kernel_name, cuda_source, seed)
+
+        if ref.kind is OracleKind.UNVERIFIABLE:
+            # Compiled + ran, but we CANNOT prove correctness. This is not PASSED
+            # and not FAILED — it is UNVERIFIED. Never store as a verified pattern.
+            result["output_match"] = None
+            result["oracle"] = {"kind": ref.kind.value, **ref.provenance}
+            result["passed"] = False
+            result["unverifiable"] = True
+            result["diff_report"] = ("Compiled and ran, but no executed reference "
+                                     "exists — correctness not proven. Add "
+                                     f"reference/{kernel_name}_ref.cpp or a source "
+                                     "self-check to make this verifiable.")
+            if on_progress: on_progress(100, "UNVERIFIABLE (compiled + ran)")
+            return result
+
+        atol, rtol = self._tolerances(spec)
+        diff_ok, diff_report = self._diff(run_output, ref.output, atol=atol, rtol=rtol)
+        result["output_match"] = diff_ok
+        result["diff_report"] = diff_report[:500] if diff_report else ""
+        result["tolerance"] = {"atol": atol, "rtol": rtol}
+        result["oracle"] = {"kind": ref.kind.value, **ref.provenance}
+        result["passed"] = diff_ok
+        if on_progress: on_progress(100, "PASSED ✅" if diff_ok else "DIFF FAILED")
         return result
 
     # ── Compile / Run / Diff helpers (unchanged from original) ──────

@@ -842,10 +842,10 @@ class ModelRouter:
 
         Returns ``(patched_code, compile_check)`` when the repair strictly
         reduces the error count (or compiles clean), else ``None``. The single
-        confirming ``quick_compile_check`` here is what guarantees the engine can
+        confirming ``_inloop_compile`` here is what guarantees the engine can
         never hand back code that compiles worse than what it was given.
         """
-        if not verifier or not hasattr(verifier, "quick_compile_check"):
+        if not verifier or not hasattr(verifier, "_compile"):
             return None
         if not (cuda_source and hip_source and compile_errs):
             return None
@@ -877,7 +877,7 @@ class ModelRouter:
 
         # Confirm the patched code actually compiles better before adopting it.
         with self.debug.stage("hipcc"):
-            cc = verifier.quick_compile_check(dry.patched_code, kernel_name=kernel_name)
+            cc = self._inloop_compile(verifier, dry.patched_code, kernel_name=kernel_name)
         before = len(compile_errs)
         after = len(cc.get("errors", []))
         improved = cc.get("compile_success") or after < before
@@ -3063,6 +3063,127 @@ class ModelRouter:
         )
         return prompt
 
+    # ── In-loop compile/run helpers (collapsed from verifier.quick_compile_check / quick_run_check) ──
+
+    @staticmethod
+    def _inloop_compile(verifier, source: str, kernel_name: str = "test_kernel",
+                        on_progress=None) -> Dict:
+        """Inline in-loop compile — calls verifier._compile() directly.
+
+        Replicates the logic of the former VerificationAgent.quick_compile_check
+        so the router does not depend on that wrapper.  Returns dict with keys:
+        compile_success, compile_output, errors, error_origins, error_context,
+        all_harness_origin, compile_log_path, kernel_name.
+
+        SAFE: wraps the entire body in try/except — if the verifier is a mock
+        (e.g. in tests) the call degrades to ``{"compile_success": False}``.
+        """
+        try:
+            import re
+
+            kernel_build_dir = verifier.build_dir / f"loop_{kernel_name}"
+            kernel_build_dir.mkdir(parents=True, exist_ok=True)
+
+            src_file = kernel_build_dir / f"{kernel_name}.hip.cpp"
+            src_file.write_text(source, encoding="utf-8")
+
+            harness, kernel_start, kernel_end = verifier._generate_harness(
+                kernel_name, "", source)
+            harness_file = kernel_build_dir / f"test_{kernel_name}.cpp"
+            harness_file.write_text(harness, encoding="utf-8")
+
+            if hasattr(verifier, "_warn_if_legacy_harness"):
+                verifier._warn_if_legacy_harness(kernel_name, source)
+
+            compile_ok, compile_out, compile_log_path = verifier._compile(
+                harness_file, kernel_build_dir, kernel_name)
+
+            # Extract error lines for concise LLM feedback
+            errors = []
+            origins = []
+            error_context = []
+            harness_lines = harness.splitlines()
+            lines = compile_out.splitlines()
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if "error:" not in stripped:
+                    continue
+                if "in instantiation of" in stripped:
+                    continue
+                if "required from" in stripped:
+                    continue
+                errors.append(stripped[:200])
+                origins.append(verifier._classify_error_origin(
+                    stripped, kernel_start, kernel_end))
+                lm = re.search(r":(\d+):\d+:\s*(?:fatal )?error:", stripped)
+                if lm:
+                    err_line_no = int(lm.group(1))
+                    lo = max(0, err_line_no - 2)
+                    hi = min(len(harness_lines), err_line_no + 1)
+                    snippet = "\n".join(
+                        f"  {n + 1:>4}{'>' if n + 1 == err_line_no else ' '} {harness_lines[n][:160]}"
+                        for n in range(lo, hi)
+                    )
+                    error_context.append(snippet)
+                if i + 1 < len(lines) and lines[i + 1].strip().startswith("|"):
+                    errors.append(lines[i + 1].strip()[:200])
+
+            # If no "error:" lines found but compile failed, grab first 3 non-empty lines
+            if not errors and not compile_ok and compile_out:
+                for line in lines:
+                    if line.strip() and "note:" not in line.strip():
+                        errors.append(line.strip()[:200])
+                        if len(errors) >= 3:
+                            break
+
+            # All-harness-origin detection: every known error points outside the ported kernel
+            known_origins = [o for o in origins if o != "unknown"]
+            all_harness_origin = bool(known_origins) and all(
+                o == "harness" for o in known_origins)
+
+            return {
+                "compile_success": compile_ok,
+                "compile_output": compile_out[:2000] if compile_out else "",
+                "errors": errors[:8],
+                "error_origins": origins[:8],
+                "error_context": error_context[:8],
+                "all_harness_origin": all_harness_origin,
+                "compile_log_path": str(compile_log_path) if compile_log_path else "",
+                "kernel_name": kernel_name,
+            }
+        except (ValueError, TypeError, AttributeError):
+            return {"compile_success": False, "errors": [], "compile_output": "",
+                    "error_origins": [], "error_context": [],
+                    "all_harness_origin": False, "compile_log_path": "",
+                    "kernel_name": kernel_name}
+
+    @staticmethod
+    def _inloop_run(verifier, kernel_name: str) -> Dict:
+        """Inline in-loop run — calls verifier._run() directly.
+
+        Replicates the logic of the former VerificationAgent.quick_run_check.
+        Returns dict with run_success, run_output, run_exit_code, signal, benchmark_us.
+
+        SAFE: try/except wrapping so mock verifiers degrade gracefully.
+        """
+        try:
+            import re
+            kernel_build_dir = verifier.build_dir / f"loop_{kernel_name}"
+            safe_kernel_name = re.sub(r"[^a-zA-Z0-9_-]", "", kernel_name)
+            run_ok, run_output, benchmark, exit_code = verifier._run(
+                kernel_build_dir, safe_kernel_name)
+            return {
+                "run_success": run_ok,
+                "run_output": run_output or "",
+                "run_exit_code": exit_code,
+                "signal": verifier._signal_name(exit_code) if hasattr(verifier, "_signal_name") else ("SIGSEGV" if exit_code < 0 else ""),
+                "benchmark_us": benchmark or 0.0,
+                "kernel_name": kernel_name,
+            }
+        except (ValueError, TypeError, AttributeError):
+            return {"run_success": False, "run_output": "", "run_exit_code": -1,
+                    "signal": "", "benchmark_us": 0.0, "kernel_name": kernel_name}
+
     # ── Main routing logic ──────────────────────────────────────
 
     def route(self, kernel_source: str, patterns: List[Dict],
@@ -3295,9 +3416,12 @@ class ModelRouter:
                 "change on wavefront64; a mechanical port would compile and then crash")
 
         if (fast_path and not residual and not needs_semantics
-                and verifier and hasattr(verifier, "quick_compile_check")):
+                and verifier and hasattr(verifier, "_compile")):
             if on_phase: on_phase("hipify", "hipify (regex)", "mechanical CUDA→HIP, no LLM")
-            cc = verifier.quick_compile_check(hipified_source, kernel_name=kernel_name)
+            try:
+                cc = self._inloop_compile(verifier, hipified_source, kernel_name=kernel_name)
+            except Exception:
+                cc = None
             # isinstance guard: a bare MagicMock verifier reads as "no information",
             # never as a pass — the fast path must never be taken on a guess.
             if isinstance(cc, dict) and cc.get("compile_success") is True:
@@ -3305,8 +3429,11 @@ class ModelRouter:
                 # compiled and then SIGSEGVed on shared memory sized blockDim/32.
                 # Mechanical translation cannot fix wavefront64 semantics, so the
                 # binary must actually run before we skip the models.
-                rc = (verifier.quick_run_check(kernel_name)
-                      if hasattr(verifier, "quick_run_check") else None)
+                try:
+                    rc = (self._inloop_run(verifier, kernel_name)
+                          if hasattr(verifier, "_run") else None)
+                except Exception:
+                    rc = None
                 if isinstance(rc, dict) and rc.get("run_success") is True:
                     result["ported_code"] = hipified_source
                     result["compile_passed"] = True
@@ -3554,10 +3681,10 @@ class ModelRouter:
                 prev_errors_norm = prev_errors_set
                 # Fall through past the initial hipcc block into the refine loop;
                 # the two unconditional lines below still fire.
-            elif verifier and hasattr(verifier, 'quick_compile_check'):
+            elif verifier and hasattr(verifier, '_compile'):
                 if on_phase: on_phase("compile", "hipcc", "in-loop compilation check")
                 with self.debug.stage("hipcc"):
-                    cc = verifier.quick_compile_check(extracted, kernel_name=kernel_name)
+                    cc = self._inloop_compile(verifier, extracted, kernel_name=kernel_name)
                 self.debug.transition(
                     "HIPCC_COMPILE",
                     reason=("compile passed" if cc["compile_success"]
@@ -3664,6 +3791,7 @@ class ModelRouter:
         replan_count = 0  # Bug 7: how many stagnation re-plans we've already used
         runtime_crash_count = 0  # RUN-FIRST: consecutive compile-pass-but-crash iterations
         kimi_plateau_count = 0  # C1: count consecutive iterations with same error set after Kimi refine
+        oracle_passed = True  # Fix 3: default True — if no oracle, treat as pass
         code_sha_history = []  # Track SHA to detect oscillation
         iter_gate_history = []  # Track gate outcomes to detect rejection↔compile oscillation
         # P1 (two-layer SIGSEGV): last code that hipcc accepted. Once set, a refine
@@ -3819,12 +3947,12 @@ class ModelRouter:
                         result["abort_reason"] = "rejection_oscillation"
                         break
                 # Fall through past the hipcc block into the refine step.
-            elif verifier and hasattr(verifier, 'quick_compile_check'):
+            elif verifier and hasattr(verifier, '_compile'):
                 state.gate = "compile"
                 state.compile_ran = True
                 if on_phase: on_phase("compile", "hipcc", f"compile-first check (attempt {iteration}/{max_iterations})")
                 with self.debug.stage("hipcc"):
-                    cc = verifier.quick_compile_check(result["ported_code"], kernel_name=kernel_name)
+                    cc = self._inloop_compile(verifier, result["ported_code"], kernel_name=kernel_name)
                 self.debug.transition(
                     "HIPCC_COMPILE",
                     reason=("compile passed" if cc["compile_success"]
@@ -3908,9 +4036,9 @@ class ModelRouter:
                     # cause (__shfl_up_sync width) and the loop discarded it.
                     # isinstance guard: mocked verifiers in tests return MagicMock,
                     # which must read as "no run info" (pass), not crash.
-                    if verifier and hasattr(verifier, 'quick_run_check'):
+                    if verifier and hasattr(verifier, '_run'):
                         with self.debug.stage("run"):
-                            rc = verifier.quick_run_check(kernel_name)
+                            rc = self._inloop_run(verifier, kernel_name)
                         if isinstance(rc, dict):
                             self.debug.write_json(
                                 "09_compiler", f"run_iter{iteration}", rc)
@@ -3924,6 +4052,40 @@ class ModelRouter:
                             runtime_crash_count = 0  # consecutive-crash counter
                             result["changes"].append(
                                 f"[run] Iter {iteration}: binary ran clean (exit 0)")
+                            # ── ORACLE: diff against executed reference ──
+                            # compile + run pass is necessary but not sufficient —
+                            # the output must match the executed reference.
+                            try:
+                                if verifier and hasattr(verifier, 'oracle') and kernel_source:
+                                    spec = verifier.load_spec(kernel_name)
+                                    seed = verifier._build_seed(spec)
+                                    ref = verifier.oracle.resolve(kernel_name, kernel_source, seed)
+                                    if ref.verifiable:
+                                        rc_output = rc.get("run_output", "")
+                                        if rc_output:
+                                            atol, rtol = verifier._tolerances(spec)
+                                            diff_ok, diff_report = verifier._diff(
+                                                rc_output, ref.output, atol=atol, rtol=rtol)
+                                            oracle_passed = diff_ok
+                                            if diff_ok:
+                                                result["changes"].append(
+                                                    f"[oracle] Iter {iteration}: output matches executed reference ✅")
+                                            else:
+                                                result["changes"].append(
+                                                    f"[oracle] Iter {iteration}: output MISMATCHES reference — "
+                                                    f"continuing refinement ({diff_report[:100]})")
+                                                print(f"║  │  🔍 ORACLE: compiled + ran but output wrong — refining{'':<12}║")
+                                        else:
+                                            result["changes"].append(
+                                                f"[oracle] Iter {iteration}: no run output to diff")
+                                    else:
+                                        result["changes"].append(
+                                            f"[oracle] Iter {iteration}: no executed reference — "
+                                            f"cannot verify correctness (unverifiable)")
+                            except Exception as exc:
+                                result["changes"].append(
+                                    f"[oracle] Iter {iteration}: oracle check failed ({exc}) — "
+                                    f"continuing without oracle verdict")
                         if isinstance(rc, dict) and rc.get("run_success") is False:
                             state.gate = "run"
                             state.run_crashed = True
@@ -4189,10 +4351,10 @@ class ModelRouter:
                                       f"{len(undeclared_ids)} undeclared IDs{'':<27}║")
 
                                 # Re-compile one more time (no more Kimi)
-                                if verifier and hasattr(verifier, 'quick_compile_check'):
+                                if verifier and hasattr(verifier, '_compile'):
                                     with self.debug.stage("hipcc"):
-                                        cc_retry = verifier.quick_compile_check(
-                                            result["ported_code"], kernel_name=kernel_name)
+                                        cc_retry = self._inloop_compile(
+                                            verifier, result["ported_code"], kernel_name=kernel_name)
                                     self.debug.transition(
                                         "HIPCC_COMPILE",
                                         reason="recompile after shim injection",
@@ -4839,18 +5001,20 @@ class ModelRouter:
             # Converged when: compile passed AND the binary RAN AND GLM passed.
             # RUN-FIRST: a compile-pass + GLM-pass on a binary that SIGSEGVs is
             # not convergence — the 2026-07-09 run shipped exactly that.
-            if parsed is not None and parsed.get("pass", False) and not run_crashed_this_iter:
+            if parsed is not None and parsed.get("pass", False) and not run_crashed_this_iter and oracle_passed:
                 verify_success = True
                 verify_passed = True
                 result["changes"].append(
                     f"[glm] Passed semantic evaluation (iteration {iteration})")
                 # Compile already passed (we only ran GLM because it did),
                 # or there's no verifier (GLM pass is sufficient in that case).
+                # oracle_passed is also required when an oracle is available
+                # (Fix 3: correctness gates convergence, not just compile success).
                 result["orchestrator_passed"] = True
                 self.debug.transition(
-                    "SUCCESS", reason="compile + run + semantic evaluation all passed",
+                    "SUCCESS", reason="compile + run + semantic evaluation + oracle all passed",
                     validation_result=True, iteration=iteration)
-                break  # Truly converged — compile + run + GLM all passed
+                break  # Truly converged — compile + run + GLM + oracle all passed
 
             # ── Step 4: Kimi refines with whatever feedback we have ──────────
             # If compile failed → feedback = compile errors (set in Step 1)
@@ -4880,12 +5044,12 @@ class ModelRouter:
             # code — GLM's semantic findings (which flagged __shfl_up_sync
             # width before the 2026-07-09 segfault, and were discarded here)
             # plus the crash info become the refine feedback instead.
-            if not compile_failed_this_iter and parsed is not None and not run_crashed_this_iter:
+            if not compile_failed_this_iter and parsed is not None and not run_crashed_this_iter and oracle_passed:
                 if not parsed.get("pass", False):
                     result["changes"].append(
                         f"[glm] Iteration {iteration}: semantic issues found but "
                         f"compile passed and binary ran — keeping working code, not refining")
-                # Break: compiled + ran + GLM ran = done. Don't refine.
+                # Break: compiled + ran + GLM ran + oracle passed = done. Don't refine.
                 break
 
             # Runtime crash: merge GLM's semantic findings into the crash

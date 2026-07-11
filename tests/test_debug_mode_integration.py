@@ -44,18 +44,60 @@ PROSE = "Let's think about this.\nI think we need a different approach.\nActuall
 
 
 class FakeVerifier:
-    """Compiles nothing. Fails the first N compiles, then passes."""
+    """Compiles nothing. Fails the first N compiles, then passes.
+
+    Supports the new in-loop compile/run API (_compile, _generate_harness,
+    _run) so the convergence loop and semantic repair engine work.
+    """
 
     def __init__(self, fail_first: int = 1):
+        from pathlib import Path
+        import tempfile
         self.fail_first = fail_first
         self.compiles = 0
         self.attached = None
+        self._build_dir = Path(tempfile.mkdtemp())
 
     def attach_debug_session(self, session):
         self.attached = session
 
     def detach_debug_session(self):
         self.attached = None
+
+    # ── New API (in-loop compile/run helpers) ──
+
+    @property
+    def build_dir(self):
+        return self._build_dir
+
+    def _warn_if_legacy_harness(self, kernel_name, source):
+        pass
+
+    def _classify_error_origin(self, text, kernel_start, kernel_end):
+        return "harness" if "error" in text else "unknown"
+
+    def _signal_name(self, exit_code):
+        return "normal" if exit_code == 0 else f"sig_{exit_code}"
+
+    def _generate_harness(self, kernel_name, harness_template, source):
+        return f"// fake harness for {kernel_name}", 0, len(source.splitlines())
+
+    def _compile(self, harness_file, build_dir, kernel_name):
+        self.compiles += 1
+        if self.compiles <= self.fail_first:
+            return False, "boom\nk.cpp:5:3: error: use of undeclared identifier 'foo'", build_dir / f"{kernel_name}.log"
+        return True, "", build_dir / f"{kernel_name}.log"
+
+    def _run(self, build_dir, kernel_name):
+        return True, "42\n", 0, 0
+
+    # ── Old API (deprecated — kept for backward compat) ──
+
+    @property
+    def build_dir(self):
+        from pathlib import Path
+        import tempfile
+        return Path(tempfile.mkdtemp())
 
     def quick_compile_check(self, src, kernel_name="k"):
         self.compiles += 1
@@ -304,7 +346,8 @@ class TestFailurePackaging:
         monkeypatch.setenv("KERNEL_OLYMPICS_DEBUG_DIR", str(tmp_path))
 
         class ExplodingVerifier(FakeVerifier):
-            def quick_compile_check(self, src, kernel_name="k"):
+            """Override _compile so the convergence loop raises."""
+            def _compile(self, harness_file, build_dir, kernel_name):
                 raise RuntimeError("hipcc exploded")
 
         r = ModelRouter(api_key="fake")
@@ -383,7 +426,8 @@ class TestSessionOwnership:
                             _fake_models(["```cpp\n" + GOOD_HIP + "```"]))
 
         class ExplodingVerifier(FakeVerifier):
-            def quick_compile_check(self, src, kernel_name="k"):
+            """Override _compile so the convergence loop raises."""
+            def _compile(self, harness_file, build_dir, kernel_name):
                 raise RuntimeError("hipcc exploded")
 
         s = DebugSession("warp_reduce", root=tmp_path)

@@ -186,9 +186,22 @@ int main() { float* d; cudaMalloc(&d, 4); cudaFree(d); return 0; }
 
 
 def _clean_verifier():
+    from pathlib import Path
+    import tempfile
     v = MagicMock()
-    v.quick_compile_check.return_value = {"compile_success": True, "errors": [], "output": ""}
-    v.quick_run_check.return_value = {"run_success": True}
+    v.build_dir = Path(tempfile.mkdtemp())
+    v._generate_harness.return_value = ("// mock harness", 0, 0)
+    v._compile.return_value = (True, "", v.build_dir / "test.log")
+    v._classify_error_origin.return_value = "harness"
+    v._warn_if_legacy_harness.return_value = None
+    # Oracle (for convergence loop) — resolve to unverifiable so it passes through
+    mock_ref = MagicMock(verifiable=False)
+    mock_ref.verifiable = False
+    v.oracle = MagicMock()
+    v.oracle.resolve.return_value = mock_ref
+    # _run returns (ok, output, benchmark_us, exit_code) — a 4-tuple
+    v._run.return_value = (True, "42\n", 0, 0)
+    v._signal_name.return_value = "normal"
     return v
 
 
@@ -254,10 +267,15 @@ class TestFastPath:
     def test_compiles_but_crashes_falls_through_to_the_models(self, router):
         """RUN-FIRST: a mechanical port that compiles and SIGSEGVs is not a port.
         This is the 2026-07-09 failure — shared memory sized blockDim/32."""
+        from pathlib import Path
         v = MagicMock()
-        v.quick_compile_check.return_value = {"compile_success": True, "errors": [], "output": ""}
-        v.quick_run_check.return_value = {
-            "run_success": False, "signal": "SIGSEGV", "run_exit_code": -11, "run_output": ""}
+        v.build_dir = Path("/tmp/fake_build")
+        v._generate_harness.return_value = ("// mock harness", 0, 0)
+        v._compile.return_value = (True, "", Path("/dev/null"))
+        v._classify_error_origin.return_value = "harness"
+        v._run.return_value = (False, "", 0, -11)
+        v._signal_name.return_value = "SIGSEGV"
+        v._warn_if_legacy_harness.return_value = None
 
         def side_effect(model_key, *a, **k):
             if model_key == "kimi27":
@@ -273,9 +291,13 @@ class TestFastPath:
         assert any("did not run clean" in c for c in result["changes"])
 
     def test_compile_failure_falls_through_to_the_models(self, router):
+        from pathlib import Path
         v = MagicMock()
-        v.quick_compile_check.return_value = {
-            "compile_success": False, "errors": ["e1", "e2"], "output": "", "error_context": []}
+        v.build_dir = Path("/tmp/fake_build")
+        v._generate_harness.return_value = ("// mock harness", 0, 0)
+        v._compile.return_value = (False, "boom\nerror: undeclared 'foo'", Path("/dev/null"))
+        v._classify_error_origin.return_value = "ported_code"
+        v._signal_name.return_value = ""
 
         def side_effect(model_key, *a, **k):
             if model_key == "kimi27":
@@ -325,17 +347,10 @@ class TestFastPath:
         assert mc.call_count > 0
 
     def test_non_dict_compile_result_is_never_read_as_a_pass(self, router):
-        """A MagicMock quick_compile_check returns a MagicMock, which is truthy.
-        The fast-path probe must read that as 'no information', never as a pass —
-        otherwise a mocked verifier ships an unverified kernel."""
+        """A bare MagicMock verifier returns compile_success=False from
+        _inloop_compile's try/except guard, which reads as 'no information'
+        and never as a pass — otherwise a mock would ship an unverified kernel."""
         v = MagicMock()
-        # first call is the fast-path probe (no information); the loop's own
-        # compiles afterwards return a real dict
-        v.quick_compile_check.side_effect = [
-            MagicMock(),
-            {"compile_success": False, "errors": ["e"], "output": "", "error_context": []},
-            {"compile_success": False, "errors": ["e"], "output": "", "error_context": []},
-        ]
 
         def side_effect(model_key, *a, **k):
             if model_key == "kimi27":
@@ -362,10 +377,16 @@ class TestFastPath:
             _json.dumps({"compile_success": _FalsyUnserializable()})
 
         v = MagicMock()
-        v.quick_compile_check.return_value = {
-            "compile_success": _FalsyUnserializable(),
-            "errors": ["error: undeclared identifier"],
-            "output": "", "error_context": []}
+        v.build_dir = Path("/tmp/fake_verifier")
+        v._generate_harness.return_value = ("// mock harness", 0, 0)
+        v._compile.return_value = (
+            _FalsyUnserializable(),
+            "error: undeclared identifier",
+            Path("/dev/null"))
+        v._classify_error_origin.return_value = "ported_code"
+        v._warn_if_legacy_harness.return_value = None
+        v._run.return_value = (True, "42\n", 0, 0)
+        v._signal_name.return_value = ""
 
         def side_effect(model_key, *a, **k):
             if model_key == "kimi27":
@@ -475,8 +496,11 @@ class TestPreprocessedSourcePrompts:
             return AgentResult(model_key, True, '{"fixes": []}', 0.5)
 
         v = MagicMock()
-        v.quick_compile_check.return_value = {
-            "compile_success": False, "errors": ["e"], "output": "", "error_context": []}
+        v.build_dir = Path("/tmp/fake_verifier")
+        v._generate_harness.return_value = ("// mock harness", 0, 0)
+        v._compile.return_value = (False, "error: e\n", Path("/dev/null"))
+        v._classify_error_origin.return_value = "ported_code"
+        v._warn_if_legacy_harness.return_value = None
 
         with patch.object(ModelRouter, '_call_model', side_effect=side_effect):
             router.route(CUDA_SRC, [], max_iterations=2, verifier=v,
@@ -542,9 +566,13 @@ class TestPhaseBudgets:
         assert MODEL_CATALOG["deepseek"]["timeout"] == 120, "premise changed"
         seen = []
         verifier = MagicMock()
-        verifier.quick_compile_check.return_value = {
-            "compile_success": True, "errors": [], "output": ""}
-        verifier.quick_run_check.return_value = {"run_success": True}
+        verifier.build_dir = Path("/tmp/fake_verifier")
+        verifier._generate_harness.return_value = ("// mock harness", 0, 0)
+        verifier._compile.return_value = (True, "", Path("/dev/null"))
+        verifier._classify_error_origin.return_value = "harness"
+        verifier._warn_if_legacy_harness.return_value = None
+        verifier._run.return_value = (True, "42\n", 0, 0)
+        verifier._signal_name.return_value = ""
 
         with patch("urllib.request.urlopen", side_effect=_instant_fireworks(seen)):
             router.route(CUDA_SRC, [], max_iterations=1, verifier=verifier,
@@ -560,9 +588,13 @@ class TestPhaseBudgets:
     def test_coder_gets_the_rest_minus_a_compile_reserve(self, router):
         seen = []
         verifier = MagicMock()
-        verifier.quick_compile_check.return_value = {
-            "compile_success": True, "errors": [], "output": ""}
-        verifier.quick_run_check.return_value = {"run_success": True}
+        verifier.build_dir = Path("/tmp/fake_verifier")
+        verifier._generate_harness.return_value = ("// mock harness", 0, 0)
+        verifier._compile.return_value = (True, "", Path("/dev/null"))
+        verifier._classify_error_origin.return_value = "harness"
+        verifier._warn_if_legacy_harness.return_value = None
+        verifier._run.return_value = (True, "42\n", 0, 0)
+        verifier._signal_name.return_value = ""
 
         with patch("urllib.request.urlopen", side_effect=_instant_fireworks(seen)):
             router.route(CUDA_SRC, [], max_iterations=1, verifier=verifier,
@@ -578,9 +610,13 @@ class TestPhaseBudgets:
         clock finding out — and still produce a port."""
         seen = []
         verifier = MagicMock()
-        verifier.quick_compile_check.return_value = {
-            "compile_success": True, "errors": [], "output": ""}
-        verifier.quick_run_check.return_value = {"run_success": True}
+        verifier.build_dir = Path("/tmp/fake_verifier")
+        verifier._generate_harness.return_value = ("// mock harness", 0, 0)
+        verifier._compile.return_value = (True, "", Path("/dev/null"))
+        verifier._classify_error_origin.return_value = "harness"
+        verifier._warn_if_legacy_harness.return_value = None
+        verifier._run.return_value = (True, "42\n", 0, 0)
+        verifier._signal_name.return_value = ""
 
         with patch("urllib.request.urlopen", side_effect=_instant_fireworks(seen)):
             result = router.route(CUDA_SRC, [], max_iterations=1, verifier=verifier,
@@ -599,9 +635,13 @@ class TestPhaseBudgets:
             return AgentResult(model_key, True, f"```cpp\n{HIP_OK}\n```", 0.5)
 
         verifier = MagicMock()
-        verifier.quick_compile_check.return_value = {
-            "compile_success": True, "errors": [], "output": ""}
-        verifier.quick_run_check.return_value = {"run_success": True}
+        verifier.build_dir = Path("/tmp/fake_verifier")
+        verifier._generate_harness.return_value = ("// mock harness", 0, 0)
+        verifier._compile.return_value = (True, "", Path("/dev/null"))
+        verifier._classify_error_origin.return_value = "harness"
+        verifier._warn_if_legacy_harness.return_value = None
+        verifier._run.return_value = (True, "42\n", 0, 0)
+        verifier._signal_name.return_value = ""
 
         with patch.object(ModelRouter, '_call_model', side_effect=slow_plan):
             result = router.route(CUDA_SRC, [], max_iterations=1, verifier=verifier,
@@ -643,9 +683,12 @@ class TestPhaseBudgets:
             return AgentResult(model_key, True, "plan", 0.5)
 
         verifier = MagicMock()
-        verifier.quick_compile_check.return_value = {
-            "compile_success": False, "errors": ["error: undeclared identifier"],
-            "output": "", "error_context": []}
+        verifier.build_dir = Path("/tmp/fake_verifier")
+        verifier._generate_harness.return_value = ("// mock harness", 0, 0)
+        verifier._compile.return_value = (
+            False, "error: undeclared identifier\n", Path("/dev/null"))
+        verifier._classify_error_origin.return_value = "ported_code"
+        verifier._warn_if_legacy_harness.return_value = None
 
         with patch.object(ModelRouter, '_call_model', side_effect=side_effect):
             result = router.route(CUDA_SRC, [], max_iterations=2, verifier=verifier,
@@ -663,8 +706,12 @@ class TestPhaseBudgets:
             return AgentResult(model_key, True, "plan", 0.5)
 
         verifier = MagicMock()
-        verifier.quick_compile_check.return_value = {
-            "compile_success": False, "errors": ["e"], "output": "", "error_context": []}
+        verifier.build_dir = Path("/tmp/fake_verifier")
+        verifier._generate_harness.return_value = ("// mock harness", 0, 0)
+        verifier._compile.return_value = (
+            False, "error: e\n", Path("/dev/null"))
+        verifier._classify_error_origin.return_value = "ported_code"
+        verifier._warn_if_legacy_harness.return_value = None
 
         calls = {"n": 0}
 
@@ -695,8 +742,12 @@ class TestPhaseBudgets:
             return AgentResult(model_key, True, '{"fixes": []}', 0.5)
 
         verifier = MagicMock()
-        verifier.quick_compile_check.return_value = {
-            "compile_success": False, "errors": ["e"], "output": "", "error_context": []}
+        verifier.build_dir = Path("/tmp/fake_verifier")
+        verifier._generate_harness.return_value = ("// mock harness", 0, 0)
+        verifier._compile.return_value = (
+            False, "error: e\n", Path("/dev/null"))
+        verifier._classify_error_origin.return_value = "ported_code"
+        verifier._warn_if_legacy_harness.return_value = None
 
         with patch.object(ModelRouter, '_call_model', side_effect=side_effect):
             result = router.route(CUDA_SRC, [], max_iterations=2, verifier=verifier,
@@ -718,8 +769,12 @@ class TestPhaseBudgets:
             return AgentResult(model_key, True, "plan", 0.5)
 
         verifier = MagicMock()
-        verifier.quick_compile_check.return_value = {
-            "compile_success": False, "errors": ["e"], "output": ""}
+        verifier.build_dir = Path("/tmp/fake_verifier")
+        verifier._generate_harness.return_value = ("// mock harness", 0, 0)
+        verifier._compile.return_value = (
+            False, "error: e\n", Path("/dev/null"))
+        verifier._classify_error_origin.return_value = "ported_code"
+        verifier._warn_if_legacy_harness.return_value = None
 
         calls = {"n": 0}
         real_has = Deadline.has_at_least
@@ -756,10 +811,13 @@ class TestRouteTimeout:
             mk, True, f"```cpp\n{HIP_OK}\n```" if mk == "kimi27" else '{"pass": true}', 0.5)
 
         verifier = MagicMock()
-        # pre-loop passes, iter1 passes (freezes best attempt), then we starve the budget
-        verifier.quick_compile_check.return_value = {
-            "compile_success": True, "errors": [], "output": ""}
-        verifier.quick_run_check.return_value = {"run_success": True}
+        verifier.build_dir = Path("/tmp/fake_verifier")
+        verifier._generate_harness.return_value = ("// mock harness", 0, 0)
+        verifier._compile.return_value = (True, "", Path("/dev/null"))
+        verifier._classify_error_origin.return_value = "harness"
+        verifier._warn_if_legacy_harness.return_value = None
+        verifier._run.return_value = (True, "42\n", 0, 0)
+        verifier._signal_name.return_value = ""
 
         real_deadline = {}
         orig_init = Deadline.__init__
@@ -803,13 +861,17 @@ class TestRouteTimeout:
         mock_call.side_effect = side_effect
 
         verifier = MagicMock()
-        verifier.quick_compile_check.side_effect = [
-            {"compile_success": False, "errors": ["e"], "output": ""},  # pre-loop
-            {"compile_success": True, "errors": [], "output": ""},      # iter1 → A compiles
+        verifier.build_dir = Path("/tmp/fake_verifier")
+        verifier._generate_harness.return_value = ("// mock harness", 0, 0)
+        verifier._compile.side_effect = [
+            (False, "error: e\n", Path("/dev/null")),   # pre-loop
+            (True, "", Path("/dev/null")),               # iter1 → A compiles
         ]
+        verifier._classify_error_origin.return_value = "harness"
+        verifier._warn_if_legacy_harness.return_value = None
         # A compiles but crashes → the loop refines into B instead of converging
-        verifier.quick_run_check.return_value = {
-            "run_success": False, "signal": "SIGSEGV", "run_exit_code": -11, "run_output": ""}
+        verifier._run.return_value = (False, "", 0, -11)
+        verifier._signal_name.return_value = "SIGSEGV"
 
         # Budget survives iteration 1's boundary check, dies before iteration 2's.
         calls = {"n": 0}
@@ -839,9 +901,13 @@ class TestRouteTimeout:
         mock_call.side_effect = lambda mk, *a, **k: AgentResult(
             mk, True, f"```cpp\n{HIP_OK}\n```" if mk == "kimi27" else '{"pass": true}', 0.5)
         verifier = MagicMock()
-        verifier.quick_compile_check.return_value = {
-            "compile_success": True, "errors": [], "output": ""}
-        verifier.quick_run_check.return_value = {"run_success": True}
+        verifier.build_dir = Path("/tmp/fake_verifier")
+        verifier._generate_harness.return_value = ("// mock harness", 0, 0)
+        verifier._compile.return_value = (True, "", Path("/dev/null"))
+        verifier._classify_error_origin.return_value = "harness"
+        verifier._warn_if_legacy_harness.return_value = None
+        verifier._run.return_value = (True, "42\n", 0, 0)
+        verifier._signal_name.return_value = ""
 
         result = router.route(CUDA_SRC, [], max_iterations=1, verifier=verifier,
                               kernel_name="test_nobudget", max_seconds=0)
@@ -942,8 +1008,12 @@ class TestStagnationThresholds:
 
         mock_call.side_effect = side_effect
         verifier = MagicMock()
-        verifier.quick_compile_check.return_value = {
-            "compile_success": False, "errors": ["error: undeclared foo"], "output": ""}
+        verifier.build_dir = Path("/tmp/fake_verifier")
+        verifier._generate_harness.return_value = ("// mock harness", 0, 0)
+        verifier._compile.return_value = (
+            False, "error: undeclared foo\n", Path("/dev/null"))
+        verifier._classify_error_origin.return_value = "ported_code"
+        verifier._warn_if_legacy_harness.return_value = None
 
         router.route(CUDA_SRC, [], max_iterations=3, verifier=verifier,
                      kernel_name="test_replan", max_seconds=0)
@@ -984,15 +1054,18 @@ class TestTwoLayerFix:
         mock_call.side_effect = side_effect
 
         verifier = MagicMock()
-        verifier.quick_compile_check.side_effect = [
-            {"compile_success": True, "errors": [], "output": ""},   # pre-loop
-            {"compile_success": True, "errors": [], "output": ""},   # iter1 → freeze Layer 1
-            {"compile_success": False, "errors": ["error: a", "error: b"],
-             "output": ""},                                          # iter2 → Layer 2 broke it
+        verifier.build_dir = Path("/tmp/fake_verifier")
+        verifier._generate_harness.return_value = ("// mock harness", 0, 0)
+        verifier._compile.side_effect = [
+            (True, "", Path("/dev/null")),   # pre-loop + iter1 → freeze Layer 1
+            (True, "", Path("/dev/null")),
+            (False, "error: a\nerror: b\n", Path("/dev/null")),  # iter2 → Layer 2 broke it
         ]
+        verifier._classify_error_origin.return_value = "harness"
+        verifier._warn_if_legacy_harness.return_value = None
         # compiles but SIGSEGVs
-        verifier.quick_run_check.return_value = {
-            "run_success": False, "signal": "SIGSEGV", "run_exit_code": -11, "run_output": ""}
+        verifier._run.return_value = (False, "", 0, -11)
+        verifier._signal_name.return_value = "SIGSEGV"
 
         result = router.route(CUDA_SRC, [], max_iterations=3, verifier=verifier,
                               kernel_name="test_twolayer", max_seconds=0)

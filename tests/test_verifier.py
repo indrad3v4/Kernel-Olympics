@@ -11,7 +11,6 @@ def test_verify_no_hipcc():
     agent = VerificationAgent()
     result = agent.verify(
         hip_source="// Test kernel\nint main() { return 0; }",
-        cuda_reference_output="",
         kernel_name="test_kernel"
     )
     assert result["compile_success"] is False

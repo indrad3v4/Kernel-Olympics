@@ -249,31 +249,39 @@ class TestSpecIntegrity:
             f"Expected int, got {type(spec['input_setup']['default_value'])}"
         )
 
-    def test_spec_has_golden_reference(self):
-        """A reference output makes a verify PASS mean 'numerically correct',
-        not merely 'ran without crashing'. The expected result for the all-1s
-        input over 4 blocks of 64 is each block's inclusive scan sum = 64."""
-        spec_path = Path("src/verification/specs/nvidia_shfl_scan.json")
-        spec = json.loads(spec_path.read_text())
-        ref_rel = spec.get("reference_output")
-        assert ref_rel, "spec is missing reference_output"
-        ref_path = Path(ref_rel)
-        assert ref_path.exists(), f"reference file missing: {ref_rel}"
-        lines = [l for l in ref_path.read_text().splitlines() if l.strip()]
-        assert lines == ["64", "64", "64", "64"], (
-            f"golden reference must be four 64s, got {lines}"
+    def test_oracle_resolves_nvidia_shfl_scan(self):
+        """nvidia_shfl_scan.cu has a CPUverify() self-check — the DifferentialOracle
+        must detect it and report SELF_CHECK, not UNVERIFIABLE."""
+        from pathlib import Path
+        cuda_dir = Path("sample_kernels/cuda")
+        src = (cuda_dir / "nvidia_shfl_scan.cu").read_text()
+        from src.verification.oracle import DifferentialOracle
+        oracle = DifferentialOracle(repo_root=Path("."))
+        assert oracle._has_self_check(src), (
+            "nvidia_shfl_scan.cu must contain a self-check symbol (CPUverify)"
         )
 
-    def test_reference_diff_accepts_correct_and_rejects_wrong(self):
-        """The wired reference must PASS a correct GPU output and FAIL a wrong
-        one — otherwise it is not actually gating on correctness."""
-        from src.verification.verifier import VerificationAgent
-        va = VerificationAgent()
-        spec = va.load_spec("nvidia_shfl_scan")
-        if spec is None or not spec.get("_reference_path"):
-            pytest.skip("nvidia_shfl_scan spec/reference not present")
-        ref = Path(spec["_reference_path"]).read_text()
-        ok_good, _ = va._diff("64\n64\n64\n64\n", ref)
-        ok_bad, _ = va._diff("32\n32\n32\n32\n", ref)
-        assert ok_good is True
-        assert ok_bad is False
+    def test_oracle_self_check_detects_cpuverify(self):
+        """The oracle's _has_self_check must flag sources that carry CPUverify,
+        verifyDataRowSums, checkResult, etc."""
+        from src.verification.oracle import DifferentialOracle
+        oracle = DifferentialOracle(repo_root=Path("."))
+        assert oracle._has_self_check("void CPUverify(...)") is True
+        assert oracle._has_self_check("int verifyDataRowSums(...)") is True
+        assert oracle._has_self_check("bool checkResult(...)") is True
+        assert oracle._has_self_check("int verify_result(...)") is True
+        assert oracle._has_self_check("void compareResults(...)") is True
+        assert oracle._has_self_check("__global__ void kernel(...)") is False
+        assert oracle._has_self_check("int main() { return 0; }") is False
+
+    def test_oracle_produces_unverifiable_for_unknown_kernel(self):
+        """A kernel with neither a self-check nor a reference/*_ref.cpp file
+        must resolve to UNVERIFIABLE — never a fabricated PASSED."""
+        from src.verification.oracle import DifferentialOracle
+        oracle = DifferentialOracle(repo_root=Path("."))
+        ref = oracle.resolve("no_such_kernel___", "// empty source", b"seed")
+        assert ref.kind.value == "unverifiable", (
+            f"Expected unverifiable, got {ref.kind}"
+        )
+        assert ref.output is None
+        assert not ref.verifiable
