@@ -241,7 +241,7 @@ def test_generate_harness_device_subset_strips_leaked_main():
     harness, kernel_start, kernel_end = agent._generate_harness("nvidia_shfl_scan", "", leaked)
     assert harness.count("int main(") == 1
     assert "__global__ void shfl_scan_test" in harness
-    assert "__shfl_up_sync" in harness  # device body preserved, not truncated
+    assert "__shfl_up" in harness  # device body preserved, not truncated (non-sync variants)
     for host_sym in ("findCudaDevice", "cudaDeviceProp", "p.major"):
         assert host_sym not in harness
 

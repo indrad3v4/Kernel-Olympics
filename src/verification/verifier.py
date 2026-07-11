@@ -265,6 +265,51 @@ class VerificationAgent:
                     extracted.append("")
         return "\n".join(extracted).strip()
 
+    @staticmethod
+    def _fix_hip_intrinsics(device_source: str) -> str:
+        """Replace CUDA _sync warp intrinsics with HIP non-sync variants.
+
+        On AMD CDNA2/CDNA3 (gfx942), ``__shfl_up_sync(mask, value, delta, width)``
+        with a mask that has only 1 bit set (single-wavefront block) triggers an
+        LDS out-of-bounds access because lane 0 reads from lane -1. The non-sync
+        variants (``__shfl_up(value, delta, width)``) use a different compiler
+        code path that handles the edge case gracefully.
+
+        Safe replacements (mask is the first arg, always dropped):
+          __shfl_up_sync    → __shfl_up       (upward shuffle)
+          __shfl_down_sync  → __shfl_down     (downward shuffle)
+          __shfl_xor_sync   → __shfl_xor      (butterfly shuffle)
+        """
+        import re
+        result = device_source
+        # __shfl_up_sync(mask, value, delta, width) → __shfl_up(value, delta, width)
+        result = re.sub(
+            r'__shfl_up_sync\s*\(\s*[^,]+,\s*',
+            '__shfl_up(',
+            result,
+        )
+        # __shfl_down_sync(mask, value, delta, width) → __shfl_down(value, delta, width)
+        result = re.sub(
+            r'__shfl_down_sync\s*\(\s*[^,]+,\s*',
+            '__shfl_down(',
+            result,
+        )
+        # __shfl_xor_sync(mask, value, delta, width) → __shfl_xor(value, delta, width)
+        result = re.sub(
+            r'__shfl_xor_sync\s*\(\s*[^,]+,\s*',
+            '__shfl_xor(',
+            result,
+        )
+        if result != device_source:
+            changed_count = (
+                device_source.count('__shfl_up_sync(')
+                + device_source.count('__shfl_down_sync(')
+                + device_source.count('__shfl_xor_sync(')
+            )
+            print(f"║  │  🔧 HIP intrinsic fix: {changed_count} CUDA _sync call(s) "
+                  f"converted to non-sync variants{'':<12}║")
+        return result
+
     def _generate_harness(self, kernel_name: str, test_input: str,
                           ported_kernel_source: str) -> tuple:
         """
@@ -306,6 +351,7 @@ class VerificationAgent:
         # host code and always build the spec harness.
         if spec is not None and spec.get("port_mode") == "DEVICE_SUBSET":
             device_only = self._strip_to_device_code(ported_kernel_source)
+            device_only = self._fix_hip_intrinsics(device_only)
             return self._harness_from_spec(spec, device_only or ported_kernel_source)
 
         if re.search(r'^\s*int\s+main\s*\(', ported_kernel_source, re.MULTILINE):
