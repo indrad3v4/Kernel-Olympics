@@ -1060,7 +1060,7 @@ def main():
             with urllib.request.urlopen(req, timeout=15) as resp:
                 local_path.write_bytes(resp.read())
             lines = len(local_path.read_text(encoding="utf-8").splitlines())
-            print(cyan(f"  ↓ Downloaded: {filename} ({lines} lines)\n"))
+            print(cyan(f"  ✓ Downloaded: {filename} ({lines} lines)\n"))
             args.input = [str(local_path)]
         except Exception as e:
             print(yellow(f"  ⚠️ Download failed ({e}) — trying local copy..."))
@@ -1350,7 +1350,7 @@ def run_daemon(watch_dir: str, interval: int = 5,
 
     watch = Path(watch_dir)
     if not watch.is_dir():
-        print(f"[daemon] ERROR: watch directory does not exist: {watch_dir}", file=sys.stderr)
+        print(f"[daemon] ⚠  Watch directory does not exist: {watch_dir}", file=sys.stderr)
         return 1
 
     print(f"[daemon] Watching {watch.resolve()} every {interval}s (PID {os.getpid()})", file=sys.stderr)
@@ -1368,21 +1368,21 @@ def run_daemon(watch_dir: str, interval: int = 5,
                     mtime = stat.st_mtime
                     size = stat.st_size
                 except OSError as e:
-                    print(f"[daemon] ERROR: cannot stat {fpath}: {e}", file=sys.stderr)
+                    print(f"[daemon] ✗  Cannot stat {fpath}: {e}", file=sys.stderr)
                     continue
-                print(f"[daemon] Processing: {fpath.name}", file=sys.stderr)
+                print(f"[daemon] →  Processing: {fpath.name}", file=sys.stderr)
                 sys.stderr.flush()
                 report = _process_single_file(ko, fpath_str, reference_dir)
                 if "error" in report:
-                    print(f"[daemon] ERROR: {fpath.name}: {report['error']}", file=sys.stderr)
+                    print(f"[daemon] ✗  {fpath.name}: {report['error']}", file=sys.stderr)
                     state.mark_processed(fpath_str, mtime, size, status="error", result=report["error"])
                 else:
                     state.mark_processed(fpath_str, mtime, size, status="ok", result="done")
-                    print(f"[daemon] Completed: {fpath.name}", file=sys.stderr)
+                    print(f"[daemon] ✓  Completed: {fpath.name}", file=sys.stderr)
                 sys.stderr.flush()
         except Exception as loop_exc:
             import traceback as _tb
-            print(f"[daemon] Loop error: {loop_exc}", file=sys.stderr)
+            print(f"[daemon] ⚠  Loop error: {loop_exc}", file=sys.stderr)
         if not _SHUTDOWN_REQUESTED:
             for _ in range(interval):
                 if _SHUTDOWN_REQUESTED:

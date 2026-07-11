@@ -25,11 +25,11 @@ GH_BRANCH     ?= main
 	.venv/bin/pip install --quiet --upgrade pip setuptools wheel
 
 venv: .venv  ## Create Python virtual environment
-	@echo "  ✅ .venv ready — activate with:  source .venv/bin/activate"
+	@echo "  ✓  .venv ready — activate with:  source .venv/bin/activate"
 
 install: .venv  ## Install all Python dependencies (editable)
 	.venv/bin/pip install --quiet -e "."
-	@echo "  ✅ Dependencies installed"
+	@echo "  ✓  Dependencies installed"
 
 # ── Pipeline targets ------------------------------------------
 
@@ -42,14 +42,14 @@ port-all: .venv  ## Run pipeline on ALL sample kernels at once
 # ── All‑in‑one -------------------------------------------------
 
 pipeline: port compile run  ## Full cycle: CUDA → ROCm in one command
-	@echo "  ✅ $(CU_FILE) → AMD GPU — DONE"
+	@echo "  ✓  $(CU_FILE) → AMD GPU — done"
 
 # ── Compile + Run helpers (separate targets for clarity) ------
 
 compile: $(PORTED)  ## hipcc device‑only proof harness and compile
 	@scripts/generate_proof.py "$(PORTED)" "$(KERNEL_NAME)" "$(PROOF)"
 	hipcc -o $(BINARY) $(PROOF) -I/opt/rocm/include 2>&1 | sed 's/^/  │ /'
-	@echo "  ✅ Compiled → $(BINARY)"
+	@echo "  ✓  Compiled → $(BINARY)"
 
 run: $(BINARY)  ## Run compiled proof on AMD GPU
 	$(BINARY)
@@ -99,11 +99,11 @@ speed-demo-reset: .venv  ## Speed demo with fresh cache
 
 pull:  ## git pull latest from GitHub
 	git pull origin $(GH_BRANCH)
-	@echo "  ✅ $(GH_BRANCH) synced from github.com/$(GH_USER)/$(GH_REPO)"
+	@echo "  ✓  $(GH_BRANCH) synced from https://github.com/$(GH_USER)/$(GH_REPO)"
 
 push:  ## git add -A + commit + push (use MSG="message")
 	git add -A && git commit -m "$(MSG)" && git push origin $(GH_BRANCH)
-	@echo "  ✅ Pushed to github.com/$(GH_USER)/$(GH_REPO)"
+	@echo "  ✓  Pushed to https://github.com/$(GH_USER)/$(GH_REPO)"
 
 sync: pull push  ## Pull latest, then push local changes
 
@@ -116,7 +116,7 @@ setup:  ## Clone repo + venv + install (one-shot on new machine)
 	fi; \
 	git pull origin $(GH_BRANCH)
 	$(MAKE) install
-	@echo "  ✅ $(GH_REPO) ready on this machine"
+	@echo "  ✓  $(GH_REPO) ready on this machine"
 
 reclone:  ## Full re-clone (zaps local changes)
 	rm -rf .git .venv
@@ -124,13 +124,13 @@ reclone:  ## Full re-clone (zaps local changes)
 	rsync -a --remove-source-files /tmp/$(GH_REPO)/ . && \
 	rm -rf /tmp/$(GH_REPO) && \
 	$(MAKE) install
-	@echo "  ✅ Fresh clone of $(GH_REPO)"
+	@echo "  ✓  Fresh clone of $(GH_REPO)"
 
 # ── Deployment -------------------------------------------------
 
 push-to-cation: pull  ## Push to AMD workspace (cation) via SSH
 	ssh cation "cd /workspace/Kernel-Olympics && git pull origin $(GH_BRANCH)"
-	@echo "  ✅ cation synced to origin/main"
+	@echo "  ✓  cation synced to origin/main"
 
 # ── Debug / daemon ---------------------------------------------
 
@@ -152,12 +152,12 @@ clean:  ## Remove build artifacts and proof files
 	rm -rf __pycache__ .pytest_cache debug/
 	rm -f portability_report.json demo_report.json
 	find . -type d -name __pycache__ -prune -exec rm -rf {} +
-	@echo "  ✅ Clean"
+	@echo "  ✓  Clean"
 
 clean-all: clean  ## Clean + remove .venv and ported kernels
 	rm -rf .venv
 	rm -f ported_kernels/*.hip.cpp
-	@echo "  ✅ Full clean"
+	@echo "  ✓  Full clean"
 
 # ── Help -------------------------------------------------------
 

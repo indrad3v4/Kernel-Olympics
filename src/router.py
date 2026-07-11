@@ -5317,7 +5317,7 @@ class ModelRouter:
         # ~0s (_call_model checks deadline.exhausted() first), which is why a timed-out
         # run still shows a "final verification 0.0s" line.
         if result["ported_code"]:
-            if on_phase: on_phase("verify", "Gemma 4", "final verification")
+            if on_phase: on_phase("verify", "Gemma 4", "Gemma 4 → DeepSeek v4 Pro fallback")
             gemma_prompt = self._build_glm_evaluate_prompt(
                 result["ported_code"], patterns,
                 regex_changelog=result.get("regex_changelog"),
@@ -5332,7 +5332,8 @@ class ModelRouter:
                 # Report which endpoint actually served the call
                 last_call = self.call_log[-1] if self.call_log else {}
                 verify_source = last_call.get("source", "fireworks")
-                source_label = "local vLLM (AMD GPU)" if "local" in verify_source else "Fireworks API"
+                source_label = "local vLLM (AMD GPU)" if "local" in verify_source else (
+                    "DeepSeek v4 Pro fallback (Gemma unavailable)" if "fallback" in verify_source else "Fireworks API")
                 try:
                     parsed = json.loads(verify.output)
                     if parsed.get("pass", False):
@@ -5352,8 +5353,15 @@ class ModelRouter:
                         result["changes"].append(
                             f"[gemma4] Issues found ({source_label}): {verify.output[:200]}")
             else:
-                result["changes"].append(
-                    "[gemma4] Verification unavailable (local vLLM + Fireworks both failed)")
+                # Check whether we attempted DeepSeek fallback
+                last_call = self.call_log[-1] if self.call_log else {}
+                fb_source = last_call.get("source", "")
+                if "fallback" in fb_source and "error" in last_call:
+                    result["changes"].append(
+                        "[gemma4] Gemma 4 unavailable — fallback DeepSeek v4 Pro also failed")
+                else:
+                    result["changes"].append(
+                        "[gemma4] Verification unavailable (local vLLM + Fireworks both failed)")
 
         # Rubric-based scoring
         result["confidence"] = self._rubric_score_pipeline(
@@ -5698,6 +5706,61 @@ class ModelRouter:
                         self.call_log.append({"model": model_key, "source": "fireworks",
                                               "error": f"fallback also failed: {str(e2)[:60]}"})
                 continue  # Try next endpoint
+
+        # ── Model fallback: if all endpoints failed, try fallback_id ──
+        fallback_id = model_info.get("fallback_id")
+        if fallback_id and not deadline.exhausted():
+            self.call_log.append({"model": model_key, "source": "fallback",
+                                  "error": "Primary endpoints failed — trying fallback model"})
+            try:
+                fallback_timeout = deadline.clamp_timeout(
+                    min(model_timeout * 2, _phase_remaining()))
+                if fallback_timeout >= MIN_LLM_TIMEOUT_SECONDS:
+                    fb_messages = []
+                    if system_prompt:
+                        fb_messages.append({"role": "system", "content": system_prompt})
+                    fb_messages.append({"role": "user", "content": prompt})
+                    if prefill:
+                        fb_messages.append({"role": "assistant", "content": prefill})
+                    fb_payload = {
+                        "model": fallback_id,
+                        "messages": fb_messages,
+                        "max_tokens": max_tokens,
+                        "temperature": model_info.get("temperature", 0.2),
+                    }
+                    fb_data = json.dumps(fb_payload).encode()
+                    fb_req = urllib.request.Request(
+                        f"{self.base_url}/chat/completions",
+                        data=fb_data,
+                        headers={
+                            "Authorization": f"Bearer {self.api_key}",
+                            "Content-Type": "application/json"
+                        }
+                    )
+                    with urllib.request.urlopen(fb_req, timeout=fallback_timeout) as resp:
+                        raw = resp.read()
+                    data = json.loads(raw)
+                    content = data["choices"][0]["message"]["content"]
+                    usage = data.get("usage", {})
+                    tokens = (
+                        usage.get("total_tokens", 0)
+                        or usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+                    )
+                    if finish_reason := data["choices"][0].get("finish_reason", ""):
+                        if finish_reason == "length":
+                            content += "\n// TRUNCATED: output hit max_tokens limit"
+                    if prefill:
+                        content = prefill + content
+                    cost = (tokens / 1000) * model_info["cost_per_1k"]
+                    self.total_cost += cost
+                    self.call_log.append({"model": model_key, "source": "fallback",
+                                          "tokens": tokens, "cost": cost, "model_id": fallback_id})
+                    return AgentResult(model_key, True, content,
+                                       self._rubric_score_response(content),
+                                       tokens, round((time.perf_counter()-t0)*1000, 1))
+            except Exception as e:
+                self.call_log.append({"model": model_key, "source": "fallback",
+                                      "error": f"fallback failed: {str(e)[:200]}"})
 
         return AgentResult(model_key, False, "All endpoints failed", 0.0)
 
