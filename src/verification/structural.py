@@ -234,11 +234,57 @@ def extract_top_level_functions(code: str) -> List[str]:
     return names
 
 
-def validate_structure(source: str, ported: str) -> ValidationResult:
+def _device_only_source(source: str) -> str:
+    """Return only the ``__global__``/``__device__`` function definitions of *source*.
+
+    The truncation heuristic below sizes the generated port against the source.
+    For a DEVICE_SUBSET port the coder is told to emit ONLY the device kernels
+    and drop the entire host driver — so the correct output is a small fraction
+    of the original file (72 vs 336 non-blank lines for nvidia_shfl_scan). Sizing
+    against the whole file then rejects a *correct* port as "truncated". Sizing
+    against just the device region of the source is the apples-to-apples baseline.
+
+    Brace-matched, K&R-safe (a signature whose ``{`` is on the next line is not
+    closed early). Returns "" when the source has no device functions.
+    """
+    lines = source.splitlines()
+    out: List[str] = []
+    in_kernel = False
+    depth = 0
+    seen_open = False
+    for line in lines:
+        s = line.lstrip()
+        if not in_kernel and ("__global__" in s or "__device__" in s):
+            in_kernel = True
+            seen_open = False
+            depth = 0
+            out.append(line)
+            depth += line.count("{") - line.count("}")
+            if line.count("{"):
+                seen_open = True
+                if depth <= 0:
+                    in_kernel = False
+            continue
+        if in_kernel:
+            out.append(line)
+            depth += line.count("{") - line.count("}")
+            if line.count("{"):
+                seen_open = True
+            if seen_open and depth <= 0:
+                in_kernel = False
+    return "\n".join(out)
+
+
+def validate_structure(source: str, ported: str,
+                       port_mode: str | None = None) -> ValidationResult:
     """Gate a generated port before it reaches hipcc.
 
     ``source`` is the original CUDA; ``ported`` the model's HIP output.
-    Rejects only on defects that cannot occur in valid C++.
+    ``port_mode`` — when ``"DEVICE_SUBSET"``, the expected output is only the
+    device kernels, so the truncation heuristic is sized against the source's
+    device region rather than the whole file (which would reject a correct,
+    deliberately-smaller port). Rejects only on defects that cannot occur in
+    valid C++.
     """
     errors: List[str] = []
     warnings: List[str] = []
@@ -262,7 +308,17 @@ def validate_structure(source: str, ported: str) -> ValidationResult:
     if _TRUNCATION_MARKERS.search(ported):
         errors.append("contains a truncation marker ('// ... rest of code')")
 
-    src_lines = len([l for l in source.splitlines() if l.strip()])
+    # Size the truncation heuristic against the EXPECTED output. For a
+    # DEVICE_SUBSET port that is the source's device region, not the whole file
+    # (the host driver is dropped by design), so comparing to the full source
+    # branded every correct device-only port "truncated" and it never reached
+    # hipcc — the loop then exhausted its iterations on a false reject.
+    baseline_source = source
+    if port_mode == "DEVICE_SUBSET":
+        device_region = _device_only_source(source)
+        if device_region.strip():
+            baseline_source = device_region
+    src_lines = len([l for l in baseline_source.splitlines() if l.strip()])
     prt_lines = len([l for l in ported.splitlines() if l.strip()])
     if src_lines and prt_lines < src_lines * LINE_COUNT_REJECT_RATIO:
         errors.append(
@@ -273,7 +329,11 @@ def validate_structure(source: str, ported: str) -> ValidationResult:
     # A missing symbol is strong evidence of a bad port, but a regex extractor
     # is not trustworthy enough to gate a compile on. Feed it to the repair
     # prompt instead — that is where it actually helps.
-    src_funcs = set(extract_top_level_functions(source))
+    # Use the same baseline as the line count: for a DEVICE_SUBSET port only
+    # the device functions are expected, so a dropped HOST helper (main,
+    # CPUverify, …) is correct, not a defect — flagging it would push the coder
+    # to re-add the very host code the port was told to drop.
+    src_funcs = set(extract_top_level_functions(baseline_source))
     prt_funcs = set(extract_top_level_functions(ported))
     missing = sorted(src_funcs - prt_funcs)
     if missing:

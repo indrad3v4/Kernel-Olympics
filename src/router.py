@@ -1478,6 +1478,21 @@ class ModelRouter:
 
     # ── Phase prompt builders ────────────────────────────────────
 
+    @staticmethod
+    def _strip_markdown_fences(code: str) -> str:
+        """Remove stray markdown code-fence lines (```or ```cpp) from *code*.
+
+        A fence line is never valid C++, so dropping whole fence-only lines is
+        safe and cannot corrupt real source. Only lines that are *entirely* a
+        fence (optionally with a language tag) are removed; a ``` that somehow
+        appears mid-expression is left for the lexical gate to judge.
+        """
+        if not code or "```" not in code:
+            return code
+        kept = [ln for ln in code.splitlines()
+                if not re.match(r'^\s*```[A-Za-z0-9_+-]*\s*$', ln)]
+        return "\n".join(kept)
+
     def _postprocess_port(self, model_output: str, kernel_source: str,
                           iteration: int = 0, generation: Optional[int] = None,
                           model: str = "kimi27", tokens: int = 0,
@@ -1538,6 +1553,14 @@ class ModelRouter:
                 code = extraction.code
             else:
                 code = self._extract_code(model_output)
+
+        # Normalize stray markdown fences BEFORE the lexical gate. A leaked
+        # ``` line is a formatting artifact, not a portability defect — the
+        # lexical gate treats it as a hard reject ("extractor grabbed the
+        # wrapper too"), which used to burn a whole refine iteration on a
+        # cosmetic issue. Stripping fence-only lines here turns that reject
+        # into a no-op; genuine prose is still caught by the gate's other rules.
+        code = self._strip_markdown_fences(code)
 
         # Debug Mode: persist the generation and the extraction decision before
         # any repair regex mutates the text. `gen` ties every later artifact for
@@ -1601,7 +1624,7 @@ class ModelRouter:
         # scoped strictly to defects that cannot occur in valid C++.
         with self.debug.stage("structural_validation"):
             try:
-                structural = _validate_structure(kernel_source, code)
+                structural = _validate_structure(kernel_source, code, port_mode=port_mode)
             except Exception as _sv_exc:  # never let the gate itself take down the loop
                 logger.debug("structural validation errored: %s", _sv_exc)
                 structural = _StructuralResult(ok=True, warnings=["structural check errored"])

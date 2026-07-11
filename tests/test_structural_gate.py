@@ -26,7 +26,7 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 
 from router import ModelRouter
-from verification.structural import ValidationResult
+from verification.structural import ValidationResult, validate_structure
 
 
 @pytest.fixture(autouse=True)
@@ -105,6 +105,70 @@ class TestStructuralRejects:
         broken = "```hip\n#include <hip/hip_runtime.h>\n```"
         _, _, _, structural = router._postprocess_port(broken, long_src)
         assert structural.ok is False
+
+
+# ── DEVICE_SUBSET ports are sized against the device region, not the file ──
+
+# A full NVIDIA-sample-shaped source: a large host driver + a couple of kernels.
+# A DEVICE_SUBSET port correctly emits ONLY the kernels, so it is a small
+# fraction of the whole file — which must NOT be read as truncation.
+_HOST_HEAVY_SOURCE = (
+    "#include <cuda_runtime.h>\n"
+    "#include <helper_cuda.h>\n"
+    + "\n".join(f"void host_helper_{i}(int* p) {{ (void)p; /* pad */ }}"
+                for i in range(40))
+    + "\n"
+    "__global__ void scan_kernel(int* data, int width, int* sums) {\n"
+    "    extern __shared__ int s[];\n"
+    "    int id = blockIdx.x * blockDim.x + threadIdx.x;\n"
+    "    s[threadIdx.x] = data[id];\n"
+    "    __syncthreads();\n"
+    "    data[id] = s[threadIdx.x];\n"
+    "}\n"
+    "int main() { return 0; }\n"
+)
+
+_DEVICE_ONLY_PORT = (
+    "__global__ void scan_kernel(int* data, int width, int* sums) {\n"
+    "    extern __shared__ int s[];\n"
+    "    int id = blockIdx.x * blockDim.x + threadIdx.x;\n"
+    "    s[threadIdx.x] = data[id];\n"
+    "    __syncthreads();\n"
+    "    data[id] = s[threadIdx.x];\n"
+    "}\n"
+)
+
+
+class TestDeviceSubsetSizing:
+    def test_device_subset_port_not_rejected_as_truncated(self):
+        """A correct device-only port is a small fraction of a host-heavy file;
+        under DEVICE_SUBSET it must be sized against the source's device region,
+        not the whole file, or it is falsely rejected as truncated and never
+        reaches hipcc (the nvidia_shfl_scan iteration-exhaustion regression)."""
+        r = validate_structure(_HOST_HEAVY_SOURCE, _DEVICE_ONLY_PORT,
+                               port_mode="DEVICE_SUBSET")
+        assert r.ok is True, r.reason()
+
+    def test_same_port_rejected_without_device_subset(self):
+        """Without the port_mode hint the whole-file baseline still applies —
+        this documents the exact behavior the fix changes."""
+        r = validate_structure(_HOST_HEAVY_SOURCE, _DEVICE_ONLY_PORT)
+        assert r.ok is False
+
+    def test_device_subset_still_rejects_real_truncation(self):
+        """The truncation signal is preserved: a near-empty port is still below
+        25% of the device-region baseline."""
+        tiny = "#include <hip/hip_runtime.h>\n"
+        r = validate_structure(_HOST_HEAVY_SOURCE, tiny, port_mode="DEVICE_SUBSET")
+        assert r.ok is False
+
+    def test_device_subset_does_not_flag_dropped_host_helpers(self):
+        """Dropped host helpers are correct in DEVICE_SUBSET mode and must not
+        appear as missing symbols (which would push the coder to re-add them)."""
+        r = validate_structure(_HOST_HEAVY_SOURCE, _DEVICE_ONLY_PORT,
+                               port_mode="DEVICE_SUBSET")
+        assert not any("host_helper" in s for s in r.missing_symbols)
+        assert "main" not in r.missing_symbols
 
 
 # ── Symbol preservation surfaces as a warning, not a hard reject ───────────
