@@ -248,3 +248,32 @@ class TestSpecIntegrity:
         assert isinstance(spec["input_setup"]["default_value"], int), (
             f"Expected int, got {type(spec['input_setup']['default_value'])}"
         )
+
+    def test_spec_has_golden_reference(self):
+        """A reference output makes a verify PASS mean 'numerically correct',
+        not merely 'ran without crashing'. The expected result for the all-1s
+        input over 4 blocks of 64 is each block's inclusive scan sum = 64."""
+        spec_path = Path("src/verification/specs/nvidia_shfl_scan.json")
+        spec = json.loads(spec_path.read_text())
+        ref_rel = spec.get("reference_output")
+        assert ref_rel, "spec is missing reference_output"
+        ref_path = Path(ref_rel)
+        assert ref_path.exists(), f"reference file missing: {ref_rel}"
+        lines = [l for l in ref_path.read_text().splitlines() if l.strip()]
+        assert lines == ["64", "64", "64", "64"], (
+            f"golden reference must be four 64s, got {lines}"
+        )
+
+    def test_reference_diff_accepts_correct_and_rejects_wrong(self):
+        """The wired reference must PASS a correct GPU output and FAIL a wrong
+        one — otherwise it is not actually gating on correctness."""
+        from src.verification.verifier import VerificationAgent
+        va = VerificationAgent()
+        spec = va.load_spec("nvidia_shfl_scan")
+        if spec is None or not spec.get("_reference_path"):
+            pytest.skip("nvidia_shfl_scan spec/reference not present")
+        ref = Path(spec["_reference_path"]).read_text()
+        ok_good, _ = va._diff("64\n64\n64\n64\n", ref)
+        ok_bad, _ = va._diff("32\n32\n32\n32\n", ref)
+        assert ok_good is True
+        assert ok_bad is False

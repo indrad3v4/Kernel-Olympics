@@ -43,6 +43,7 @@
     "element_type": "int",
     "format": "int_per_line"
   },
+  "reference_output": "sample_kernels/reference/nvidia_shfl_scan_output.txt",
   "dynamic_shared_mem": 256,
   "self_contained": true,
   "port_mode": "DEVICE_SUBSET"
