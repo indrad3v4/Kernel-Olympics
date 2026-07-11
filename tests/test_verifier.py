@@ -124,6 +124,53 @@ def test_harness_histogram_dynamic_shared():
     assert ", 1024" in harness  # dynamic shared mem
 
 
+def test_extern_shared_kernel_gets_nonzero_dynamic_smem():
+    """A kernel using `extern __shared__` must never be launched with 0 dynamic
+    shared memory — that runs the first shared access out of bounds → SIGSEGV
+    before any output (the nvidia_shfl_scan runtime crash). When the spec pins no
+    size, the harness derives a safe default from the block dimensions."""
+    agent = VerificationAgent()
+    # Spec-less kernel -> legacy path has no dynamic smem support, so drive it via
+    # a spec that omits dynamic_shared_mem to exercise the auto-default.
+    if agent.load_spec("nvidia_shfl_scan") is None:
+        import pytest
+        pytest.skip("nvidia_shfl_scan spec not present")
+    src = (
+        "__global__ void shfl_scan_test(int* data, int width, int* partial_sums) {\n"
+        "    extern __shared__ int sums[];\n"
+        "    int id = blockIdx.x * blockDim.x + threadIdx.x;\n"
+        "    sums[threadIdx.x / warpSize] = data[id];\n"
+        "}\n"
+    )
+    harness, _s, _e = agent._generate_harness("nvidia_shfl_scan", "", src)
+    launch = [l for l in harness.splitlines() if "shfl_scan_test<<<" in l][0]
+    config = launch.split("<<<")[1].split(">>>")[0]
+    # third launch config argument (dynamic shared bytes) must be present & > 0
+    parts = [p.strip() for p in config.split(",")]
+    # config is "dim3(...), dim3(...), <bytes>" -> dim3 commas inflate the split;
+    # the trailing numeric token is the shared-mem size.
+    assert parts[-1].isdigit() and int(parts[-1]) > 0, (
+        f"expected nonzero dynamic shared mem in launch, got: {launch}"
+    )
+
+
+def test_scalar_value_pinned_in_spec_is_used():
+    """A scalar param with an explicit `value` must use it (not default to the
+    input element count). nvidia_shfl_scan's `width` is 64 (the wavefront scan
+    width), not 512; defaulting to the buffer size made __shfl_up_sync's width
+    invalid."""
+    agent = VerificationAgent()
+    spec = agent.load_spec("nvidia_shfl_scan")
+    if spec is None:
+        import pytest
+        pytest.skip("nvidia_shfl_scan spec not present")
+    width_param = [p for p in spec["params"] if p["name"] == "width"][0]
+    assert width_param.get("value") == 64
+    src = "__global__ void shfl_scan_test(int* data, int width, int* partial_sums) {}"
+    harness, _s, _e = agent._generate_harness("nvidia_shfl_scan", "", src)
+    assert "int width = 64;" in harness
+
+
 def test_harness_transpose_2d_block():
     """Transpose harness should use 2D block (32,32)."""
     agent = VerificationAgent()

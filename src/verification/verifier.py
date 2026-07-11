@@ -204,6 +204,23 @@ class VerificationAgent:
     # ── Spec-driven harness generation ──────────────────────────────
 
     @staticmethod
+    def _sizeof_ctype(elem_type: str) -> int:
+        """Byte size of a C element type name, for shared-memory sizing.
+
+        Defaults to 4 (int/float) for anything unrecognized — a conservative
+        choice that never under-allocates the common 4-byte scalars.
+        """
+        sizes = {
+            "char": 1, "unsigned char": 1, "int8_t": 1, "uint8_t": 1,
+            "short": 2, "unsigned short": 2, "int16_t": 2, "uint16_t": 2,
+            "int": 4, "unsigned": 4, "unsigned int": 4, "float": 4,
+            "int32_t": 4, "uint32_t": 4,
+            "double": 8, "long": 8, "unsigned long": 8, "long long": 8,
+            "int64_t": 8, "uint64_t": 8, "size_t": 8,
+        }
+        return sizes.get(elem_type.strip(), 4)
+
+    @staticmethod
     def _strip_to_device_code(source: str) -> str:
         """Return only the ``__global__``/``__device__`` function definitions.
 
@@ -448,8 +465,20 @@ class VerificationAgent:
                 free_lines.append(f"    hipFree(d_{name});")
                 kernel_args.append(f"d_{name}")
 
-        # Dynamic shared memory
+        # Dynamic shared memory. A kernel that declares `extern __shared__` reads
+        # its size from the launch's 3rd config argument; launching it with 0
+        # bytes makes the first shared-memory access run out of bounds → SIGSEGV
+        # before any output (exactly the nvidia_shfl_scan crash). When the spec
+        # does not pin a size, derive a safe default from the block dimensions
+        # (one element per thread covers both per-thread and per-warp shared
+        # arrays) so the kernel at least does not crash on launch.
         dynamic_smem = spec.get("dynamic_shared_mem", 0)
+        if not dynamic_smem and re.search(r'extern\s+__shared__', ported_kernel_source):
+            block_threads = bx * by * bz
+            dynamic_smem = block_threads * self._sizeof_ctype(elem_type)
+            print(f"║ ⚠️ '{fn}' uses extern __shared__ but spec sets no "
+                  f"dynamic_shared_mem — defaulting to {dynamic_smem} bytes "
+                  f"({block_threads}×{elem_type}) to avoid a launch-time SIGSEGV.")
         dsmem_suffix = f", {dynamic_smem}" if dynamic_smem else ""
 
         # Build print / output format — read from last pointer param's host buffer
