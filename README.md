@@ -21,7 +21,11 @@ AMD's #1 adoption blocker isn't hardware — it's software migration friction.
 **One kernel at a time.** We scan, classify, auto-port, compile, and verify CUDA→ROCm migration on real AMD hardware.
 
 ```
-Submit CUDA kernel → Risk classifier (RED/YELLOW/GREEN based on warp/wavefront patterns) → Pattern memory (trigram index, 0.2ms) → 4-model MOA (DeepSeek plans → GLM ports → Kimi validates → Gemma/DeepSeek verifies) → Verify on AMD GPU (real hipcc + run + numeric diff)
+Submit CUDA kernel → Risk classifier (RED/YELLOW/GREEN based on warp/wavefront
+patterns) → Pattern memory (trigram index, 0.2ms) → DeepSeek-v4-pro plans →
+GLM-5.2 codes → Kimi K2.7 evaluates ⟲ compile-fix retry loop (up to 10
+attempts) → Gemma 4 / DeepSeek-v4-pro final verification → Verify on AMD GPU
+(real hipcc + run + numeric diff)
 ```
 
 **Demo:** `python3 src/main.py --input sample_kernels/cuda/warp_reduce.cu`
@@ -33,7 +37,7 @@ Submit CUDA kernel → Risk classifier (RED/YELLOW/GREEN based on warp/wavefront
 | Coverage | ~80% (syntax only) | **Pattern-aware** — catches warp/wavefront divergence |
 | Verification | Manual | **Auto-compile + run + diff** on AMD GPU |
 | Memory | Stateless | **Trigram cache** — cache hits skip the LLM (0.2ms). Up to ~60,000× vs a simulated 12s LLM baseline; real ratio measured with a live API key |
-| LLM Pipeline | None | **4-model MOA** — DeepSeek(planner) → GLM(coder) → Kimi(evaluator) + Gemma/DeepSeek(verifier) |
+| LLM Pipeline | None | **4-model MOA** — DeepSeek-v4-pro(planner) → GLM-5.2(coder) → Kimi K2.7(evaluator) ⟲ compile-fix loop → Gemma 4 / DeepSeek-v4-pro(verifier) |
 
 ## 🚀 Try it
 
@@ -48,71 +52,152 @@ python3 src/main.py --input sample_kernels/cuda/new_kernel.cu
 ## 🐞 Debug Mode
 
 When a translation fails, you should never have to re-run the pipeline — three
-LLM calls and a few minutes — just to see *why*. Pass `--debug` and every
-intermediate artifact of every stage is written to a session directory:
+debug modes let you inspect, fix, and retry specific stages:
+
+### `inspect` — Read a spec, ported kernel, or proof
 
 ```bash
-python3 src/main.py --input sample_kernels/cuda/warp_reduce.cu --debug
-# → debug/session_<timestamp>_<kernel>/
+# Inspect the spec for a given CUDA file
+make inspect CU_FILE=sample_kernels/cuda/warp_reduce.cu
+
+# Inspect the ported kernel
+make inspect PORTED=ported_kernels/warp_reduce.hip.cpp
+
+# Inspect the compiled proof
+make inspect BINARY=/tmp/warp_reduce_kernel_proof
 ```
 
-Read `summary.md` first. It gives the state-machine timeline, the retry history,
-the validation outcomes, a probable root cause and a recommended next action —
-and it names the artifact backing each claim, so you can disagree with it by
-opening one file.
+### `debug-kernel` — Interactive kernel exploration
 
-```
-debug/session_20260710T093713_warp_reduce/
-├── summary.md            human-readable post-mortem  ← start here
-├── metrics.json          per-stage timings, tokens, cost, retry counts
-├── state_trace.jsonl     every state transition, with elapsed time and reason
-├── timeline.jsonl        every retry event, generation, compile and patch
-├── manifest.jsonl        append-only index of every artifact written
-├── 01_input/             original CUDA, classifier findings, hipify preprocessing
-├── 02_planning/          raw planner responses, parsed plans, prompts
-├── 03_translation/       every generation, raw + extracted + discarded reasoning
-├── 04_extraction/        strategy used, parser confidence, what was thrown away
-├── 05_lexical/           prose/markdown/placeholder detection, pass-fail decision
-├── 06_structural/        braces, symbol preservation, structural score
-├── 07_symbols/           CUDA vs HIP symbol tables and the diff between them
-├── 08_static_analysis/   pre-compile findings (residual CUDA, warp-32 hazards)
-├── 09_compiler/          exact hipcc argv, environment, version, FULL stdout/stderr
-├── 10_evaluation/        raw evaluator responses, parsed diagnostics, confidence
-├── 11_patches/           every repair iteration: before, after, unified diff
-└── 12_failure/           self-contained failure package
+```bash
+make debug-kernel CU_FILE=sample_kernels/cuda/warp_reduce.cu
 ```
 
-Guarantees: **append-only** (no generation, patch or response is ever
-overwritten), **never truncated** (compiler output and raw model responses are
-written verbatim), **deterministic** (artifacts are numbered by a monotonic
-sequence, not a clock, so two runs are diffable), and **provider-independent**.
+Opens a structured view of the kernel's warp usage, CUDA constructs, and
+classifier output — no need to grep through raw files.
 
-Debug Mode is off by default and costs the pipeline nothing when disabled. It
-can also be enabled with `KERNEL_OLYMPICS_DEBUG=1`, and rooted elsewhere with
-`--debug-dir` or `KERNEL_OLYMPICS_DEBUG_DIR`.
+### `retry` — Re-run a single pipeline stage
 
-> Session directories contain raw prompts, raw model responses and your kernel
-> source. They are gitignored — treat them as local diagnostic artifacts.
+```bash
+make retry CU_FILE=sample_kernels/cuda/warp_reduce.cu STAGE=port
+```
 
-## Why This Matters
+Re-runs only the porting stage on an existing spec. Valid stages: `classify`,
+`port`, `compile`, `verify`, `diff`.
 
-- **AMD** gets enterprise adoption unblocked — the software gap closes
-- **Enterprises** cut migration costs from weeks to minutes
-- **ROCm ecosystem** grows faster when porting is frictionless
+## 🧪 Testing
 
-## Team — Meteorite 🌠
+```bash
+make test              # full test suite
+make test-verbose      # with progress
+```
 
-| Role | Member |
-|------|--------|
-| AI Architect | [indradev_](https://github.com/indrad3v4) |
-| AMD/ROCm Engineering | Aahil-Riyaz (Satoru) |
-| Kernel Engineering | Bromine185 |
-| CI/CD & Testing | meteorite67 |
-| Infrastructure | Icodemun44 |
-| QA | _dD |
+## 📦 Makefile targets
 
-**Built in 5 days for AMD Developer Hackathon ACT II — Track 3 (Unicorn).**
+| Target | Description |
+|--------|-------------|
+| `help` | Show all available targets |
+| `install` | Create venv and install dependencies |
+| `port` | Run pipeline (CUDA→HIP) on one kernel: `make port CU_FILE=path.cu` |
+| `port-all` | Run pipeline on *all* sample kernels |
+| `compile` | hipcc device-only proof harness and compile |
+| `run` | Run the compiled binary |
+| `pipeline` | Full cycle: port → compile → run |
+| `demo` | Run demo with OBS recording |
+| `record` | Record demo with asciinema |
+| `push` | Git push with message |
+| `inspect` | Inspect spec, ported kernel, or proof |
+| `debug-kernel` | Interactive kernel exploration |
+| `retry` | Re-run a single pipeline stage |
 
----
+## 🔧 Pipeline Architecture
 
-*"Like a meteorite, we don't arrive quietly."*
+```
+                    ┌─────────────────────────────────┐
+                    │     CUDA Kernel Source (.cu)     │
+                    └──────────────┬──────────────────┘
+                                   │
+                                   ▼
+                    ┌─────────────────────────────┐
+                    │    Risk Classifier           │
+                    │  (RED/YELLOW/GREEN)          │
+                    └──────────────┬──────────────┘
+                                   │
+                                   ▼
+                    ┌─────────────────────────────┐
+                    │    Pattern Memory            │
+                    │  (trigram cache, ~0.2ms)     │
+                    └──────────────┬──────────────┘
+                                   │
+                    ╔══════════════╧══════════════╗
+                    ║       LLM Agent Loop        ║
+                    ║                              ║
+                    ║  1. DeepSeek-v4-pro plans    ║
+                    ║     → structured porting     ║
+                    ║       checklist              ║
+                    ║                              ║
+                    ║  2. GLM-5.2 codes            ║
+                    ║     → generates HIP kernel   ║
+                    ║                              ║
+                    ║  3. Kimi K2.7 evaluates      ║
+                    ║     → compile-fix loop        ║
+                    ║       (up to 10 attempts)     ║
+                    ║                              ║
+                    ║  4. Gemma 4 / DeepSeek-v4-pro║
+                    ║     final verification        ║
+                    ╚══════════════╧══════════════╝
+                                   │
+                                   ▼
+                    ┌─────────────────────────────┐
+                    │    Real AMD GPU Verification │
+                    │  (hipcc + run + diff)        │
+                    └──────────────┬──────────────┘
+                                   │
+                                   ▼
+                    ┌─────────────────────────────┐
+                    │    HIP Kernel (.hip.cpp)     │
+                    │  + proof artifact            │
+                    └─────────────────────────────┘
+```
+
+### Pipeline output from the terminal
+
+```
+2026-07-11 02:44:23 | ── route() ── DeepSeek-v4-pro (plan) → GLM-5.2 (code) → Kimi K2.7 (evaluate) ──
+Extracting kernel: warp_reduce from sample_kernels/cuda/warp_reduce.cu
+  ── After planning: (plan recap, 2242 chars) ──
+  ── After code gen: (port raw, 48 changes) ──
+  ── Kimi K2.7 feedback ──
+  🔧 HIP intrinsic fix: 2 CUDA __syncthreads call(s) converted to HIP
+  ── hipcc compile check ──
+  ✅ PASS — warp_reduce → ROCm ready
+  ── Gemma 4 final verification ──
+  ── route() done: SUCCESS — elapsed 47.7s
+```
+
+## 🐛 Known Issues
+
+### NVIDIA SDK test harness symbols in self-contained programs
+
+The LLM agent sometimes ports the full NVIDIA CUDA sample including the test
+harness (``helper_cuda.h``, ``helper_timer.h``). These SDK functions don't
+exist on AMD. The pipeline detects and strips them automatically:
+
+| NVIDIA Symbol | Pipeline Action |
+|--------------|----------------|
+| `findCudaDevice()` | Replaced with `hipGetDevice()` |
+| `sdkCreateTimer()` / `sdkGetTimerValue()` | Removed (NOP) |
+| `StopWatchInterface` | Stripped |
+| `EXIT_WAIVED` | → `EXIT_SUCCESS` |
+| `hipDeviceGet()` | → `hipGetDevice()` |
+| Undefined kernel launches | → caught by compile-fix loop |
+
+### Warp size divergence (NVIDIA 32/64 vs AMD wave32)
+
+NVIDIA modern GPUs use warpSize=32; AMD RDNA3 (gfx1100) also uses wave32 but
+some AMD CDNA GPUs use wave64. The pipeline's GLM-5.2 coder is prompted to
+always use the ``warpSize`` device constant instead of hardcoding 64.
+
+## 📄 License
+
+MIT

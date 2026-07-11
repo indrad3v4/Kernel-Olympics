@@ -197,7 +197,7 @@ with open('/tmp/proof_harness.hip.cpp', 'w') as f:
 print('Wrote: /tmp/proof_harness.hip.cpp (' + str(len(proof.splitlines())) + ' lines)')
 " 2>/dev/null | sed 's/^/  │ /'
         }
-    else:
+    else
         echo "  (HIP file not found — showing reference proof harness)"
         cat /tmp/proof_harness.hip.cpp 2>/dev/null | sed 's/^/  │ /' || \
             echo "  (Run Phase 2 pipeline first)"

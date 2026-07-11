@@ -443,6 +443,78 @@ class VerificationAgent:
         ]
         return "\n".join(harness)
 
+    @staticmethod
+    def _sanitize_nvidia_sdk_symbols(source: str) -> str:
+        """Strip/replace NVIDIA SDK symbols that don't exist in HIP.
+
+        The LLM may port a full NVIDIA CUDA sample including the test harness
+        (``helper_cuda.h``, ``helper_timer.h``, etc.). These symbols are
+        undefined on AMD and cause link errors or SIGSEGV at runtime.
+
+        Applied before returning self-contained programs from
+        :meth:`_generate_harness`.
+
+        Returns the sanitized source (unchanged if no NVIDIA symbols found).
+        """
+        original = source
+
+        # ── Replace findCudaDevice with a simple hipGetDevice call ──
+        source = re.sub(
+            r'(?:\w+\s*=\s*)?findCudaDevice\s*\([^)]*\)\s*;?',
+            'int __hip_dev; hipGetDevice(&__hip_dev);',
+            source,
+        )
+        # ── Remove StopWatch / sdkTimer symbols ──
+        source = re.sub(
+            r'StopWatchInterface\s*\*?\s*\w+\s*;?',
+            '/* StopWatch removed — not available on AMD */',
+            source,
+        )
+        source = re.sub(
+            r'sdkCreateTimer\s*\([^)]*\)\s*;?',
+            '/* sdkCreateTimer removed */',
+            source,
+        )
+        source = re.sub(
+            r'sdkResetTimer\s*\([^)]*\)\s*;?',
+            '/* sdkResetTimer removed */',
+            source,
+        )
+        source = re.sub(
+            r'sdkStartTimer\s*\([^)]*\)\s*;?',
+            '/* sdkStartTimer removed */',
+            source,
+        )
+        source = re.sub(
+            r'sdkStopTimer\s*\([^)]*\)\s*;?',
+            '/* sdkStopTimer removed */',
+            source,
+        )
+        source = re.sub(
+            r'sdkGetTimerValue\s*\([^)]*\)\s*;?',
+            '/* sdkGetTimerValue removed */ 0.0;',
+            source,
+        )
+        # ── Replace EXIT_WAIVED with EXIT_SUCCESS ──
+        source = source.replace('EXIT_WAIVED', 'EXIT_SUCCESS')
+        # ── Fix hipDeviceGet → hipGetDevice ──
+        source = re.sub(
+            r'hipDeviceGet\s*\(',
+            'hipGetDevice(',
+            source,
+        )
+        # ── Only add HIP header if we actually made changes ──
+        if source != original:
+            has_hip_header = (
+                '#include <hip/hip_runtime.h>' in source
+                or '#include <hip_runtime.h>' in source
+                or '#include <hip/hip_runtime_api.h>' in source
+            )
+            if not has_hip_header:
+                source = '#include <hip/hip_runtime.h>\n' + source
+
+        return source
+
     def _generate_harness(self, kernel_name: str, test_input: str,
                           ported_kernel_source: str) -> tuple:
         """
@@ -474,7 +546,8 @@ class VerificationAgent:
         # check below unreliable. The spec is the authoritative source.
         spec = self.load_spec(kernel_name)
         if spec is not None and spec.get("port_mode") == "WHOLE_PROGRAM":
-            return ported_kernel_source, 1, len(ported_kernel_source.splitlines())
+            sanitized = self._sanitize_nvidia_sdk_symbols(ported_kernel_source)
+            return sanitized, 1, len(sanitized.splitlines())
 
         # DEVICE_SUBSET: the spec is authoritative — the port is meant to contain
         # ONLY device functions, driven by the synthesized spec harness. A model
@@ -488,7 +561,8 @@ class VerificationAgent:
             return self._harness_from_spec(spec, device_only or ported_kernel_source)
 
         if re.search(r'^\s*int\s+main\s*\(', ported_kernel_source, re.MULTILINE):
-            return ported_kernel_source, 1, len(ported_kernel_source.splitlines())
+            sanitized = self._sanitize_nvidia_sdk_symbols(ported_kernel_source)
+            return sanitized, 1, len(sanitized.splitlines())
 
         if spec is not None:
             return self._harness_from_spec(spec, ported_kernel_source)
