@@ -47,6 +47,8 @@ make port CU_FILE=sample_kernels/cuda/nvidia_shfl_scan.cu
 
 ## 🎬 Demo
 
+**🐙 Live: [kernel-olympics-production.up.railway.app](https://kernel-olympics-production.up.railway.app)** — Upload a CUDA kernel and watch the pipeline port it live.
+
 <p align="center">
   <a href="https://github.com/indrad3v4/Kernel-Olympics/blob/main/amd_demo.gif">
     <img src="amd_demo.gif" alt="Kernel Olympics Pipeline Demo" width="720">
@@ -127,6 +129,12 @@ Instead of calling expensive LLMs for every kernel, we **cache porting patterns 
 | CI/CD | ✅ Automated (GitHub Actions) |
 
 ## 🚀 Quick Start
+
+### Live Demo (no install required)
+
+→ **[kernel-olympics-production.up.railway.app](https://kernel-olympics-production.up.railway.app)** — Upload a `.cu` file, see the autonomous pipeline port it to HIP in real time.
+
+### Local Setup
 
 ```bash
 git clone https://github.com/indrad3v4/Kernel-Olympics.git
