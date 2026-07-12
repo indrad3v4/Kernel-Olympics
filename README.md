@@ -1,28 +1,91 @@
-# Kernel Olympics 🏆
-### Autonomous GPU Migration Platform — From any GPU architecture to any target in minutes
+# 🚀 Kernel Olympics
+
+### *Breaking Vendor Lock-In with Multi-Agent AI*
 
 <p align="center">
-  <a href="https://github.com/indrad3v4/Kernel-Olympics">
-    <img src="https://img.shields.io/badge/AMD-ROCm%207.2%20✓-ed1c24?style=for-the-badge&logo=amd" alt="AMD ROCm">
-  </a>
-  <a href="https://github.com/indrad3v4/Kernel-Olympics/actions/workflows/ci.yml">
-    <img src="https://github.com/indrad3v4/Kernel-Olympics/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI">
-  </a>
-  <a href="LICENSE">
-    <img src="https://img.shields.io/badge/License-MIT-purple?style=for-the-badge" alt="MIT">
-  </a>
-  <a href="https://github.com/indrad3v4/Kernel-Olympics/graphs/contributors">
-    <img src="https://img.shields.io/github/contributors/indrad3v4/Kernel-Olympics?style=for-the-badge" alt="Contributors">
-  </a>
-  <a href="https://github.com/indrad3v4/Kernel-Olympics/stargazers">
-    <img src="https://img.shields.io/github/stars/indrad3v4/Kernel-Olympics?style=for-the-badge&color=yellow" alt="Stars">
-  </a>
+
+Built during the 🏆 **AMD Developer Hackathon 2026** — An AI-powered **Autonomous GPU Migration Platform** that helps developers move CUDA applications to AMD ROCm using multi-agent reasoning.
+
 </p>
 
-<p align="center">
-  <b>AMD Developer Hackathon ACT II — Track 3: Open Innovation</b><br>
-  <sub>🏆 665 tests passing | 4-LLM multi-agent pipeline | Real AMD MI300X verification</sub>
-</p>
+---
+
+## 🌍 Why Kernel Olympics Exists
+
+The biggest challenge preventing organizations from adopting AMD GPUs isn't hardware. It isn't performance. It isn't software quality.
+
+It's **migration**.
+
+Thousands of CUDA applications remain locked to the NVIDIA ecosystem because migrating production GPU software is expensive, risky, time-consuming, and requires highly specialized expertise.
+
+Kernel Olympics changes that.
+
+Instead of acting as another AI coding assistant, Kernel Olympics functions as an **Autonomous GPU Migration Platform** that understands an entire CUDA project, plans the migration, performs intelligent code transformations, verifies correctness, benchmarks performance, explains every change, and produces a production-ready migration report.
+
+> **Reduce GPU migration from weeks of engineering work to an AI-assisted workflow that developers can trust.**
+
+---
+
+## ✨ What Makes Kernel Olympics Different?
+
+Kernel Olympics is **not**:
+- ❌ another AI chatbot
+- ❌ another GitHub Copilot
+- ❌ another wrapper around hipify
+- ❌ simple prompt engineering
+
+Instead, Kernel Olympics behaves like an experienced GPU engineering team. Multiple specialized AI agents collaborate to understand an entire repository before making any modifications. Rather than translating files one by one, the platform reasons about architecture, dependencies, compatibility, performance implications, unsupported APIs, testing strategy, documentation, and migration risks.
+
+Every decision is transparent. Every modification is explainable. Every migration produces evidence.
+
+---
+
+## 🎯 Vision
+
+Imagine opening any CUDA repository and clicking one button. Within minutes you receive:
+- ✅ Complete repository analysis
+- ✅ Migration readiness score
+- ✅ CUDA compatibility report
+- ✅ Intelligent migration strategy
+- ✅ Automatically migrated ROCm code
+- ✅ Performance benchmark
+- ✅ Validation report
+- ✅ Pull Request
+- ✅ Human-readable documentation
+
+Instead of asking *"Can this file be converted?"*, Kernel Olympics answers: **"Your entire project is now ready for AMD GPUs."**
+
+---
+
+## 🧠 The Problem
+
+Today, migrating GPU software is difficult because developers must manually:
+- Understand large CUDA codebases
+- Identify unsupported APIs
+- Rewrite kernels
+- Replace memory management
+- Verify correctness
+- Debug compilation failures
+- Benchmark performance
+- Write migration documentation
+
+Even experienced GPU developers spend days or weeks doing this. The process is repetitive, error-prone, expensive, and hard to scale.
+
+---
+
+## 💡 Our Solution
+
+Kernel Olympics introduces an AI-native migration workflow. Instead of treating migration as file conversion, the platform treats it as an engineering reasoning problem. The system first understands the repository, identifies architectural patterns, analyzes dependencies, detects unsupported CUDA features, proposes migration strategies, executes intelligent transformations, validates results, benchmarks performance, and generates a comprehensive migration report explaining every decision.
+
+This creates a migration pipeline that is explainable, repeatable, and significantly easier for developers to trust.
+
+---
+
+## 🏆 Why This Matters
+
+GPU ecosystems are becoming increasingly diverse. Organizations want flexibility. Researchers want portability. Companies want freedom from vendor lock-in.
+
+Kernel Olympics enables that transition by making GPU migration dramatically easier. The long-term vision extends far beyond CUDA → ROCm — future versions can support CUDA → SYCL, Vulkan Compute, OpenCL, Metal, DirectML, and more. The platform becomes a **universal GPU migration engine** rather than a single-purpose converter.
 
 ---
 
@@ -33,6 +96,8 @@ AMD GPUs (MI300X) outperform NVIDIA on price/performance. Yet enterprises stay o
 **AMD's #1 adoption blocker isn't hardware — it's software migration friction.**
 
 The broader market is bigger: GPU architectures multiply (NVIDIA CUDA, AMD ROCm, Intel oneAPI, Apple Metal, custom NPUs) while the talent pool doesn't. Every hardware generation creates a **$2B+ migration tax** across the industry — teams rewriting kernels by hand instead of building new products.
+
+---
 
 ## What is Kernel Olympics?
 
@@ -56,6 +121,18 @@ make port CU_FILE=sample_kernels/cuda/nvidia_shfl_scan.cu
   <br>
   <sub>Full pipeline: CUDA source → 4-LLM loop ports it → hipcc compile → AMD MI300X run → <b>PASSED ✓</b></sub>
 </p>
+
+## 📈 Quick Stats
+
+| Metric | Value |
+|--------|-------|
+| Pipeline budget | 1,800s (30 min) |
+| Max iterations | 10 (compile-fix loop) |
+| LLM cost per run | ~$0.09 |
+| Cache hit speed | ~0.2ms |
+| Tests | **665 passing** |
+| CI/CD | ✅ Automated (GitHub Actions) |
+| Hardware target | AMD MI300X (192GB HBM3, CDNA3) |
 
 ## 🧠 Multi-Agent Architecture
 
@@ -116,17 +193,6 @@ Instead of calling expensive LLMs for every kernel, we **cache porting patterns 
 | Pattern lookup | N/A | **0.2ms** | — |
 | LLM call (simulated) | ~12s | 0.2ms | **60,000×** |
 | Verified with live API | — | ✓ measured | ✓ |
-
-## 📊 Pipeline Performance
-
-| Metric | Value |
-|--------|-------|
-| Pipeline budget | 1,800s (30 min) |
-| Max iterations | 10 (compile-fix loop) |
-| LLM cost per run | ~$0.09 |
-| Cache hit speed | ~0.2ms |
-| Tests | **665 passing** |
-| CI/CD | ✅ Automated (GitHub Actions) |
 
 ## 🚀 Quick Start
 
