@@ -3490,11 +3490,13 @@ class ModelRouter:
         # P0: the planner runs on a slice, not on the whole clock. Its own timeout
         # is 120s of a 180s budget; unclamped it starves the coder and every
         # refinement behind it. The plan is advisory — the port is not.
+        # Use the FRACTION of the remaining budget rather than the absolute
+        # REPAIR_RESERVE so the formula is portable to short demo budgets.
         plan_cap = (None if deadline.unlimited
                     else max(min(PLAN_CAP,
                                  deadline.remaining()
                                  - COMPILE_RESERVE_SECONDS
-                                 - REPAIR_RESERVE,
+                                 - deadline.remaining() * REPAIR_RESERVE_FRACTION,  # type: ignore[operator]
                                  ), 0.0))
 
         plan_skipped = plan_cap is not None and plan_cap < MIN_LLM_TIMEOUT_SECONDS

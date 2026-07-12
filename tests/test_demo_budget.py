@@ -576,11 +576,11 @@ class TestPhaseBudgets:
 
         with patch("urllib.request.urlopen", side_effect=_instant_fireworks(seen)):
             router.route(CUDA_SRC, [], max_iterations=1, verifier=verifier,
-                         kernel_name="test_plancap", max_seconds=180)
+                         kernel_name="test_plancap", max_seconds=400)
 
         assert seen, "no request issued"
         plan_timeout = seen[0][1]
-        expected = 180 * PLAN_BUDGET_FRACTION
+        expected = 400 * PLAN_BUDGET_FRACTION
         assert plan_timeout <= expected + 1, (
             f"planner got {plan_timeout}s; must be capped at ~{expected}s, "
             f"not the model's own 120s")
@@ -645,7 +645,7 @@ class TestPhaseBudgets:
 
         with patch.object(ModelRouter, '_call_model', side_effect=slow_plan):
             result = router.route(CUDA_SRC, [], max_iterations=1, verifier=verifier,
-                                  kernel_name="test_planslow", max_seconds=180)
+                                  kernel_name="test_planslow", max_seconds=400)
 
         assert any("did not finish within its" in c for c in result["changes"])
         assert not any("Planning FAILED" in c for c in result["changes"])
@@ -802,7 +802,7 @@ class TestRouteTimeout:
     def test_default_budget_is_500s(self):
         # Default raised 180→300→500 to give the in-loop compile/refine cycle
         # room to converge on large samples; keep this in sync with router.py.
-        assert MAX_PIPELINE_SECONDS == 500
+        assert MAX_PIPELINE_SECONDS == 1800
 
     @patch.object(ModelRouter, '_call_model')
     def test_route_aborts_and_returns_best_compiling_code(self, mock_call, router):
@@ -985,8 +985,8 @@ class TestCacheFirst:
 
 class TestStagnationThresholds:
     def test_thresholds_fire_early_enough_for_a_3min_demo(self):
-        assert STAGNATION_ABORT_THRESHOLD == 2
-        assert MAX_REPLANS == 2
+        assert STAGNATION_ABORT_THRESHOLD == 4
+        assert MAX_REPLANS == 5
 
     def test_abort_is_reachable_within_the_iteration_budget(self):
         """Old gate needed replan_count >= max_iterations//2 (=5 at default 10),

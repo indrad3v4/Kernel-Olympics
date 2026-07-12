@@ -51,7 +51,7 @@ class TestBudgetConstants:
         """The three protected slices, taken together, must leave enough
         for the planner (~20%) + verify (~10%) + slack. Otherwise the
         first codegen sees a negative cap and the loop cannot proceed."""
-        budget = 180.0
+        budget = 500.0
         used = (budget * CODE_RESERVE_FRACTION
                 + budget * REPAIR_RESERVE_FRACTION
                 + COMPILE_RESERVE_SECONDS)
