@@ -4,7 +4,7 @@
 
 | Component | Model |
 |-----------|-------|
-| **GPU** | AMD Instinct MI300X (220 Compute Units) |
+| **GPU** | AMD Instinct MI300X (220 Compute Units) — provisioned via [notebooks.amd.com/hackathon](https://notebooks.amd.com/hackathon) |
 | **Memory** | 192 GB HBM3 |
 | **Arch** | CDNA 3 |
 

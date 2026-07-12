@@ -97,7 +97,7 @@ This creates a migration pipeline that is explainable, repeatable, and significa
     <img src="amd_demo.gif" alt="Kernel Olympics Pipeline Demo" width="720">
   </a>
   <br>
-  <sub>Full pipeline: CUDA source → 4-LLM loop ports it → hipcc compile → AMD MI300X run → <b>PASSED ✓</b></sub>
+  <sub>📡 Real AMD MI300X via <a href="https://notebooks.amd.com/hackathon">notebooks.amd.com/hackathon</a> — CUDA source → 4-LLM loop ports → hipcc compile → GPU run → <b>PASSED ✓</b></sub>
 </p>
 
 ---
@@ -112,7 +112,7 @@ This creates a migration pipeline that is explainable, repeatable, and significa
 | Cache hit speed | ~0.2ms |
 | Tests | **665 passing** |
 | CI/CD | ✅ Automated (GitHub Actions) |
-| Hardware target | AMD MI300X (192GB HBM3, CDNA3) |
+| Hardware target | AMD MI300X via [notebooks.amd.com/hackathon](https://notebooks.amd.com/hackathon) (192GB HBM3, CDNA3) |
 
 ---
 
@@ -246,6 +246,7 @@ Full guide: [`AMD_STACK_USAGE.md`](AMD_STACK_USAGE.md) — but here's the 30-sec
 ### Prerequisites
 
 - AMD GPU (MI300X, MI250, RX 7900 XTX) with ROCm 6+ installed
+- *No AMD hardware? Use the [AMD AI Notebooks](https://notebooks.amd.com/hackathon) portal — free MI300X instances for hackathon participants*
 - `hipcc` in PATH (`hipcc --version`)
 - Python 3.11+, git
 
