@@ -239,6 +239,69 @@ make port CU_FILE=sample_kernels/cuda/nvidia_shfl_scan.cu
 
 ---
 
+## 🏁 For Judges: Running on AMD GPU
+
+Full guide: [`AMD_STACK_USAGE.md`](AMD_STACK_USAGE.md) — but here's the 30-second version:
+
+### Prerequisites
+
+- AMD GPU (MI300X, MI250, RX 7900 XTX) with ROCm 6+ installed
+- `hipcc` in PATH (`hipcc --version`)
+- Python 3.11+, git
+
+### Quick Run
+
+```bash
+# 1. Clone
+git clone https://github.com/indrad3v4/Kernel-Olympics.git
+cd Kernel-Olympics
+
+# 2. Install deps
+pip install -r requirements.txt
+
+# 3. Set your API key (any OpenAI-compatible LLM)
+export FIREWORKS_API_KEY="your-key"
+
+# 4. Run the full pipeline on a real kernel (port → compile → run → verify)
+make pipeline CU_FILE=sample_kernels/cuda/warp_reduce.cu
+
+# Or with extended budget (30 min, 10 iterations)
+make pipeline-heavy CU_FILE=sample_kernels/cuda/nvidia_shfl_scan.cu
+```
+
+### What to Expect
+
+| Stage | Time | Output |
+|-------|------|--------|
+| Port (4-LLM loop) | 1–5 min | HIP code in `ported_kernels/` |
+| Compile (hipcc) | 2–5 sec | Binary in `build/` |
+| Run on AMD GPU | 1–3 sec | Numerical output |
+| Verify | 0.5 sec | **PASS** ✓ or FAIL |
+
+A successful run ends with:
+
+```
+✅ Pipeline complete — RESULT: PASS
+```
+
+### Without an AMD GPU
+
+The pipeline still ports + verifies. Just skip compile/run:
+
+```bash
+make port CU_FILE=sample_kernels/cuda/warp_reduce.cu
+make inspect CU_FILE=sample_kernels/cuda/warp_reduce.cu  # view ported code
+```
+
+### Verify the Setup
+
+```bash
+make doctor           # check ROCm, hipcc, API key
+make test             # 665 tests
+```
+
+---
+
 ## 📋 Makefile Targets
 
 | Target | Description |
