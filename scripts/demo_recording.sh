@@ -36,6 +36,19 @@ demo_main() {
     HIP_FILE="ported_kernels/${KERNEL}.hip.cpp"
     local need_cleanup=0
 
+    # Outcome trackers — Phase 8 reports these instead of hardcoded ✅s
+    local pipeline_rc=-1 pipeline_secs=0
+    local harness_mode="none"       # verifier | fallback | none
+    local compile_failed=-1         # -1 = not attempted
+    local gpu_result="not run"
+    local hip_fresh=0 hip_mtime_before=""
+
+    # Remove stale artifacts so every status below reflects THIS run only
+    rm -f /tmp/proof_harness.hip.cpp /tmp/shfl_proof
+    if [[ -f "$HIP_FILE" ]]; then
+        hip_mtime_before=$(stat -c %Y "$HIP_FILE" 2>/dev/null || echo "")
+    fi
+
     # ── PHASE 0: Intro ──────────────────────────────────────
     clear
     hr "KERNEL OLYMPICS — CUDA → ROCm Migration"
@@ -69,10 +82,24 @@ demo_main() {
     echo "  (see _strip_to_kernel_only in the architecture)"
     echo ""
 
-    # Run the pipeline — real LLM calls, real orchestration
-    # Save exit code so we can continue even if pipeline fails to fully verify
-    python3 -m src.main "$CU_FILE" 2>&1 | sed 's/^/  │ /' || true
+    # Run the pipeline — real LLM calls, real orchestration.
+    # Capture the exit code (T0.3: non-zero = a real port failed verification)
+    # so Phase 8 can report what actually happened.
+    rm -f portability_report.json
+    local t0=$SECONDS
+    set +e
+    python3 -m src.main "$CU_FILE" 2>&1 | sed 's/^/  │ /'
+    pipeline_rc=$?
+    set -e
+    pipeline_secs=$(( SECONDS - t0 ))
     need_cleanup=1
+    if [[ -f "$HIP_FILE" ]]; then
+        local hip_mtime_now
+        hip_mtime_now=$(stat -c %Y "$HIP_FILE" 2>/dev/null || echo "")
+        if [[ -n "$hip_mtime_now" && "$hip_mtime_now" != "$hip_mtime_before" ]]; then
+            hip_fresh=1
+        fi
+    fi
     pause 4
 
     # ── PHASE 3: Show the Migration — CUDA → HIP ────────────
@@ -82,6 +109,11 @@ demo_main() {
     echo ""
 
     if [[ -f "$HIP_FILE" ]]; then
+        if [[ $hip_fresh -eq 0 ]]; then
+            echo "  ⚠️  NOTE: this HIP file pre-dates this run — the pipeline"
+            echo "     above did not (re)write it."
+            echo ""
+        fi
         echo "  ── Ported HIP kernel (${HIP_FILE}) ──"
         echo ""
         # Show only the device kernel section
@@ -142,9 +174,13 @@ with open('$HIP_FILE') as f:
 device = v._strip_to_device_code(src)
 device = v._fix_hip_intrinsics(device)
 proof = v._legacy_device_proof_harness('${KERNEL}', device)
+with open('/tmp/proof_harness.hip.cpp', 'w') as f:
+    f.write(proof)
 print(proof)
-" 2>/dev/null | sed 's/^/  │ /' || {
-            echo "  (Using reference — verifier proof harness)"
+" 2>/dev/null | sed 's/^/  │ /' && harness_mode="verifier" || {
+            echo "  ⚠️  Verifier harness generation FAILED — falling back to the"
+            echo "     scripted reference harness (pre-written, not pipeline output)."
+            harness_mode="fallback"
             python3 -c "
 proof = '''#include <hip/hip_runtime.h>
 #include <cstdio>
@@ -214,8 +250,9 @@ print('Wrote: /tmp/proof_harness.hip.cpp (' + str(len(proof.splitlines())) + ' l
     echo "  $ hipcc -o /tmp/shfl_proof /tmp/proof_harness.hip.cpp -I/opt/rocm/include"
     echo ""
 
-    local compile_failed=0
+    compile_failed=0
     if [[ ! -f /tmp/proof_harness.hip.cpp ]]; then
+        harness_mode="fallback"
         python3 -c "
 proof = '''#include <hip/hip_runtime.h>
 #include <cstdio>
@@ -278,10 +315,14 @@ with open('/tmp/proof_harness.hip.cpp', 'w') as f:
         ls -lh /tmp/shfl_proof | sed 's/^/  │ /'
     else
         echo "  ❌ COMPILATION FAILED"
-        echo "  (fallback harness didn't match — trying verifier path...)"
+        echo "  (harness didn't compile — trying the full pipeline-generated HIP...)"
         # Try with the actual pipeline-generated HIP
-        hipcc -o /tmp/shfl_proof "$HIP_FILE" -I/opt/rocm/include 2>&1 | \
-            sed 's/^/  │ /' || true
+        if hipcc -o /tmp/shfl_proof "$HIP_FILE" -I/opt/rocm/include 2>&1 | \
+            sed 's/^/  │ /'; then
+            compile_failed=0
+            harness_mode="full-hip"
+            echo "  ✅ Full HIP file compiled instead"
+        fi
     fi
     pause 3
 
@@ -298,6 +339,7 @@ with open('/tmp/proof_harness.hip.cpp', 'w') as f:
         echo ""
 
         if echo "$run_out" | grep -q "PASSED"; then
+            gpu_result="PASSED"
             local device_name=$(echo "$run_out" | grep -oP 'Device: \K[^| ]+' | head -1)
             local warp_sz=$(echo "$run_out" | grep -oP 'warpSize=\K\d+')
             echo "  ╔═══════════════════════════════════════════════════╗"
@@ -311,34 +353,91 @@ with open('/tmp/proof_harness.hip.cpp', 'w') as f:
             echo "  ║   Zero human intervention. Zero manual fixes.      ║"
             echo "  ║   The 4-LLM loop ported + verified it end-to-end. ║"
             echo "  ╚═══════════════════════════════════════════════════╝"
+            if [[ "$harness_mode" != "verifier" ]]; then
+                echo ""
+                echo "  ⚠️  Caveat: the compiled harness came from the"
+                echo "     '${harness_mode}' path, not the verifier-generated one."
+                echo "     See the Phase 8 table for the honest breakdown."
+            fi
         else
+            gpu_result="FAILED (wrong output)"
             echo "  ❌ OUTPUT DID NOT MATCH EXPECTED"
             echo "  (kernel ran but produced wrong results)"
         fi
     else
+        gpu_result="not run (no binary)"
         echo "  ❌ Binary not found — compilation step may have failed."
-        echo "  (This demonstrates the VERIFY fallback correctly:"
-        echo "   device-only compile saved for manual review)"
+        echo "  (Device-only compile artifacts saved for manual review)"
     fi
     pause 4
 
-    # ── PHASE 8: Summary ─────────────────────────────────────
-    hr "PHASE 8: REPORT — Pipeline Summary"
+    # ── PHASE 8: Summary — built from ACTUAL outcomes ────────
+    hr "PHASE 8: REPORT — Pipeline Summary (actual outcomes)"
+
+    # Pull the honest verdict + cost from the report THIS run wrote
+    # (we rm'd any stale portability_report.json before Phase 2).
+    local report_verdict="" report_cost=""
+    if [[ -f portability_report.json ]]; then
+        report_verdict=$(python3 -c "import json; print(json.load(open('portability_report.json')).get('result',''))" 2>/dev/null || true)
+        report_cost=$(python3 -c "
+import json
+ps = json.load(open('portability_report.json')).get('pipeline_state', {})
+c = ps.get('total_cost', 0)
+print(f'\${c:.4f}' if c else str(ps.get('llm_calls', 0)) + ' LLM calls')
+" 2>/dev/null || true)
+    fi
+
+    local pipeline_status hip_status harness_status compile_status gpu_status
+    if [[ $pipeline_rc -eq 0 ]]; then
+        pipeline_status="✅ exit 0${report_verdict:+ — $report_verdict}"
+    elif [[ $pipeline_rc -eq -1 ]]; then
+        pipeline_status="— not run"
+    else
+        pipeline_status="❌ exit $pipeline_rc${report_verdict:+ — $report_verdict}"
+    fi
+
+    if [[ -f "$HIP_FILE" ]]; then
+        if [[ $hip_fresh -eq 1 ]]; then
+            hip_status="✅ written by this run"
+        else
+            hip_status="⚠️ pre-existing (not rewritten this run)"
+        fi
+    else
+        hip_status="❌ not generated"
+    fi
+
+    case "$harness_mode" in
+        verifier) harness_status="✅ generated by verifier" ;;
+        fallback) harness_status="⚠️ scripted reference (verifier path failed)" ;;
+        full-hip) harness_status="⚠️ full HIP file compiled directly" ;;
+        *)        harness_status="❌ none produced" ;;
+    esac
+
+    if [[ $compile_failed -eq 0 ]]; then
+        compile_status="✅ hipcc OK"
+    elif [[ $compile_failed -eq -1 ]]; then
+        compile_status="— not attempted"
+    else
+        compile_status="❌ hipcc failed"
+    fi
+
+    case "$gpu_result" in
+        PASSED)    gpu_status="✅ PASSED" ;;
+        FAILED*)   gpu_status="❌ $gpu_result" ;;
+        *)         gpu_status="— $gpu_result" ;;
+    esac
+
     echo ""
-    printf "  %-55s %s\n" "Stage" "Status"
-    printf "  %-55s %s\n" "─────" "──────"
-    printf "  %-55s %s\n" "1. SCAN  — hipify + risk classification"            "✅"
-    printf "  %-55s %s\n" "2. PLAN  — DeepSeek v4 (architecture analysis)"     "✅"
-    printf "  %-55s %s\n" "3. PORT  — GLM-5.2 (HIP code generation)"           "✅"
-    printf "  %-55s %s\n" "4. EVAL  — Kimi-K2.7 (3-gate validation)"           "✅"
-    printf "  %-55s %s\n" "5. VERIFY (full harness) — SDK symbols detected"    "🔁"
-    printf "  %-55s %s\n" "   └→ VERIFY (device-only retry)"                   "✅"
-    printf "  %-55s %s\n" "6. hipcc compile — device kernel on AMD target"     "✅"
-    printf "  %-55s %s\n" "7. GPU execution — real ROCm hardware"              "✅"
-    printf "  %-55s %s\n" "8. REPORT — Gemma summary"                          "✅"
+    printf "  %-48s %s\n" "Stage" "Actual outcome"
+    printf "  %-48s %s\n" "─────" "──────────────"
+    printf "  %-48s %s\n" "Pipeline (SCAN→PLAN→PORT→EVAL→VERIFY)"  "$pipeline_status"
+    printf "  %-48s %s\n" "Ported HIP artifact (${HIP_FILE##*/})"  "$hip_status"
+    printf "  %-48s %s\n" "Device-only proof harness"              "$harness_status"
+    printf "  %-48s %s\n" "hipcc compile"                          "$compile_status"
+    printf "  %-48s %s\n" "GPU execution (real ROCm hardware)"     "$gpu_status"
     echo ""
     echo "  ─────────────────────────────────────────────────────────"
-    echo "   CUDA → ROCm in ~105s | $0.03/ kernel | 96% confidence"
+    echo "   Pipeline wall time: ${pipeline_secs}s | Cost: ${report_cost:-n/a}"
     echo "   Architecture: Multi-Agent Orchestration (4 LLMs + hipcc)"
     echo "   Team Meteorite 🌠 — Kernel Olympics | Track 3"
     echo "  ─────────────────────────────────────────────────────────"
@@ -346,7 +445,13 @@ with open('/tmp/proof_harness.hip.cpp', 'w') as f:
 
     echo ""
     echo ""
-    echo "  🏆  CUDA → ROCm MIGRATION PROVEN ON REAL AMD HARDWARE"
+    if [[ "$gpu_result" == "PASSED" && "$harness_mode" == "verifier" ]]; then
+        echo "  🏆  CUDA → ROCm MIGRATION PROVEN ON REAL AMD HARDWARE"
+    elif [[ "$gpu_result" == "PASSED" ]]; then
+        echo "  🏅  KERNEL PASSED ON AMD HARDWARE (via ${harness_mode} harness)"
+    else
+        echo "  ⚠️  RUN DID NOT FULLY VERIFY — see Phase 8 table above"
+    fi
     echo "  ──────────────────────────────────────────────────────"
     echo "   No cron agents. No external watchers. No faked output."
     echo "   Pure multi-agent loop engineering."
