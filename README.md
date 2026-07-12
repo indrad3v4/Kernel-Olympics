@@ -1,10 +1,10 @@
 # 🚀 Kernel Olympics
 
-### *Breaking Vendor Lock-In with Multi-Agent AI*
+### *Autonomous GPU Migration Platform — Starting with CUDA → ROCm. Designed for a future of portable GPU computing.*
 
 <p align="center">
 
-Built during the 🏆 **AMD Developer Hackathon 2026** — An AI-powered **Autonomous GPU Migration Platform** that helps developers move CUDA applications to AMD ROCm using multi-agent reasoning.
+Built during the 🏆 **AMD Developer Hackathon 2026** — An AI-powered platform that helps developers move CUDA applications to AMD ROCm using multi-agent reasoning.
 
 </p>
 
@@ -26,6 +26,16 @@ Instead of acting as another AI coding assistant, Kernel Olympics functions as a
 
 ---
 
+## The $10B Problem
+
+AMD GPUs (MI300X) outperform NVIDIA on price/performance. Yet enterprises stay on NVIDIA because **20% of CUDA code won't port to ROCm** — custom kernels, warp-sensitive logic, library-specific calls. hipify handles the easy 80%. The remaining 20% is a manual, weeks-long slog per project.
+
+**AMD's #1 adoption blocker isn't hardware — it's software migration friction.**
+
+The broader market is bigger: GPU architectures multiply (NVIDIA CUDA, AMD ROCm, Intel oneAPI, Apple Metal, custom NPUs) while the talent pool doesn't. Every hardware generation creates a **$2B+ migration tax** across the industry — teams rewriting kernels by hand instead of building new products.
+
+---
+
 ## ✨ What Makes Kernel Olympics Different?
 
 Kernel Olympics is **not**:
@@ -40,20 +50,17 @@ Every decision is transparent. Every modification is explainable. Every migratio
 
 ---
 
-## 🎯 Vision
+## 🔍 Repository Intelligence
 
-Imagine opening any CUDA repository and clicking one button. Within minutes you receive:
-- ✅ Complete repository analysis
-- ✅ Migration readiness score
-- ✅ CUDA compatibility report
-- ✅ Intelligent migration strategy
-- ✅ Automatically migrated ROCm code
-- ✅ Performance benchmark
-- ✅ Validation report
-- ✅ Pull Request
-- ✅ Human-readable documentation
+Kernel Olympics doesn't process kernels independently. Before modifying a single line, the platform analyzes the entire project context to identify:
 
-Instead of asking *"Can this file be converted?"*, Kernel Olympics answers: **"Your entire project is now ready for AMD GPUs."**
+- CUDA kernels and their call sites
+- Runtime API usage and device memory operations
+- Build configuration and dependencies
+- Shared utilities and include hierarchy
+- Unsupported CUDA features and migration complexity
+
+Instead of blindly translating files, the platform understands the codebase as a whole — which dramatically improves migration quality.
 
 ---
 
@@ -81,35 +88,6 @@ This creates a migration pipeline that is explainable, repeatable, and significa
 
 ---
 
-## 🏆 Why This Matters
-
-GPU ecosystems are becoming increasingly diverse. Organizations want flexibility. Researchers want portability. Companies want freedom from vendor lock-in.
-
-Kernel Olympics enables that transition by making GPU migration dramatically easier. The long-term vision extends far beyond CUDA → ROCm — future versions can support CUDA → SYCL, Vulkan Compute, OpenCL, Metal, DirectML, and more. The platform becomes a **universal GPU migration engine** rather than a single-purpose converter.
-
----
-
-## The $10B Problem
-
-AMD GPUs (MI300X) outperform NVIDIA on price/performance. Yet enterprises stay on NVIDIA because **20% of CUDA code won't port to ROCm** — custom kernels, warp-sensitive logic, library-specific calls. hipify handles the easy 80%. The remaining 20% is a manual, weeks-long slog per project.
-
-**AMD's #1 adoption blocker isn't hardware — it's software migration friction.**
-
-The broader market is bigger: GPU architectures multiply (NVIDIA CUDA, AMD ROCm, Intel oneAPI, Apple Metal, custom NPUs) while the talent pool doesn't. Every hardware generation creates a **$2B+ migration tax** across the industry — teams rewriting kernels by hand instead of building new products.
-
----
-
-## What is Kernel Olympics?
-
-**An autonomous multi-agent pipeline** that takes GPU kernel code from any source architecture, ports it to any target, compiles, runs on real hardware, and verifies correctness — **zero human intervention**.
-
-First supported path: **CUDA → ROCm/HIP** (the highest-demand migration today). Architecture-agnostic design means adding new paths (oneAPI, Metal) is a config change, not a rewrite.
-
-```bash
-# One command: CUDA in → HIP + proof + PASS/FAIL out
-make port CU_FILE=sample_kernels/cuda/nvidia_shfl_scan.cu
-```
-
 ## 🎬 Demo
 
 **🐙 Live: [kernel-olympics-production.up.railway.app](https://kernel-olympics-production.up.railway.app)** — Upload a CUDA kernel and watch the pipeline port it live.
@@ -122,6 +100,8 @@ make port CU_FILE=sample_kernels/cuda/nvidia_shfl_scan.cu
   <sub>Full pipeline: CUDA source → 4-LLM loop ports it → hipcc compile → AMD MI300X run → <b>PASSED ✓</b></sub>
 </p>
 
+---
+
 ## 📈 Quick Stats
 
 | Metric | Value |
@@ -133,6 +113,8 @@ make port CU_FILE=sample_kernels/cuda/nvidia_shfl_scan.cu
 | Tests | **665 passing** |
 | CI/CD | ✅ Automated (GitHub Actions) |
 | Hardware target | AMD MI300X (192GB HBM3, CDNA3) |
+
+---
 
 ## 🧠 Multi-Agent Architecture
 
@@ -184,6 +166,30 @@ make port CU_FILE=sample_kernels/cuda/nvidia_shfl_scan.cu
                     └─────────────────────────────┘
 ```
 
+---
+
+## 🔬 Explainable AI
+
+Every modification includes reasoning. Nothing is hidden. Every decision is transparent.
+
+```
+Original CUDA API
+    ↓
+Reason for replacement
+    ↓
+New ROCm implementation
+    ↓
+Performance implications
+    ↓
+Documentation
+    ↓
+Confidence Score
+```
+
+Instead of asking "What changed?", developers see **why** every change was made — making migration reviewable, auditable, and trustworthy.
+
+---
+
 ## 🔬 Key Innovation: Pattern Memory Cache
 
 Instead of calling expensive LLMs for every kernel, we **cache porting patterns as trigram vectors**:
@@ -193,6 +199,23 @@ Instead of calling expensive LLMs for every kernel, we **cache porting patterns 
 | Pattern lookup | N/A | **0.2ms** | — |
 | LLM call (simulated) | ~12s | 0.2ms | **60,000×** |
 | Verified with live API | — | ✓ measured | ✓ |
+
+---
+
+## 🗺️ Future Roadmap
+
+The long-term vision extends far beyond CUDA → ROCm. Future versions can support:
+
+- CUDA → ROCm (✅ currently supported)
+- CUDA → SYCL
+- CUDA → Vulkan Compute
+- CUDA → OpenCL
+- CUDA → Metal
+- CUDA → DirectML
+
+The platform is designed as a **universal GPU migration engine** rather than a single-purpose converter. Adding new target paths is a configuration change, not a rewrite.
+
+---
 
 ## 🚀 Quick Start
 
@@ -214,6 +237,8 @@ make port CU_FILE=sample_kernels/cuda/warp_reduce.cu
 make port CU_FILE=sample_kernels/cuda/nvidia_shfl_scan.cu
 ```
 
+---
+
 ## 📋 Makefile Targets
 
 | Target | Description |
@@ -232,6 +257,8 @@ make port CU_FILE=sample_kernels/cuda/nvidia_shfl_scan.cu
 | `debug-kernel` | Interactive kernel explorer |
 | `retry` | Re-run a single pipeline stage |
 
+---
+
 ## 🐞 Debug Mode
 
 Three levels of debugging for when things go wrong:
@@ -248,12 +275,16 @@ make debug-kernel CU_FILE=sample_kernels/cuda/warp_reduce.cu
 make retry CU_FILE=sample_kernels/cuda/warp_reduce.cu STAGE=port
 ```
 
+---
+
 ## 🧪 Running Tests
 
 ```bash
 make test              # full suite
 make test-verbose      # with progress
 ```
+
+---
 
 ## 🔧 Pipeline Architecture Details
 
@@ -274,6 +305,8 @@ make test-verbose      # with progress
 - **Wave64 divergence** — `warpSize` constant used instead of hardcoded 64
 - **SIGSEGV from host-code symbols** — sanitizer in verifier catches at compile time
 
+---
+
 ## 👥 Team
 
 | Role | Member | Focus |
@@ -285,6 +318,8 @@ make test-verbose      # with progress
 | 🔧 Infra | icodemun44 | Tooling, automation |
 | 🧪 CI | meteorite67 | GitHub Actions, test suite |
 | 🏭 AMD | Aahil-Riyaz (Satoru) | AMD MI300X testing, ROCm debugging |
+
+---
 
 ## 📄 License
 
