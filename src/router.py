@@ -474,7 +474,7 @@ JSON_SCHEMAS = {
 # testable without spawning real timers, and — because _call_model clamps each
 # request timeout to the remaining budget — it actually bounds the blocking socket
 # reads that consume nearly all of the wall time. A signal could not do the latter.
-MAX_PIPELINE_SECONDS = int(os.environ.get("MAX_PIPELINE_SECONDS", "500"))
+MAX_PIPELINE_SECONDS = int(os.environ.get("MAX_PIPELINE_SECONDS", "1800"))
 
 # Floor for a clamped LLM timeout. Below this a request cannot realistically
 # round-trip, so we fail fast instead of issuing a request doomed to time out.
@@ -497,7 +497,7 @@ MIN_LLM_TIMEOUT_SECONDS = 5
 # the coder plus one compile get a reservation the planner may not touch.
 PLAN_BUDGET_FRACTION = 0.20      # planner may use at most 20% of the pipeline budget
 CODE_RESERVE_FRACTION = 0.35     # of the budget, held back for the initial coder
-REPAIR_RESERVE_FRACTION = 0.30   # of the budget, held back for refine/repair cycles
+REPAIR_RESERVE_FRACTION = 0.40   # of the budget, held back for refine/repair cycles
 COMPILE_RESERVE_SECONDS = 25     # clock kept for hipcc; a compile cannot be interrupted
 
 # ── P0: per-stage budget caps (max, not target) ──
@@ -509,14 +509,14 @@ COMPILE_RESERVE_SECONDS = 25     # clock kept for hipcc; a compile cannot be int
 # the 180s pipeline budget — but these are MAXES, not targets, so the actual
 # pipeline fits as long as the planner and coder together run in ≤ 90s, which
 # the observed 22s + 90s trace already satisfies.
-PLAN_CAP = 30              # planner: at most 30s
-CODEGEN_CAP = 70           # coder: at most 70s for the initial HIP port
+PLAN_CAP = 60              # planner: at most 60s (up from 30 with 3.6x budget)
+CODEGEN_CAP = 120           # coder: at most 120s for the initial HIP port (up from 70)
 COMPILE_RESERVE = 25       # same as COMPILE_RESERVE_SECONDS — always protected
 # Absolute reserve for refine/repair cycles. The FRACTION above expresses the
 # same knob as a share of the total budget; both exist because tests pin the
 # fraction (Part B) but pre-Part B call sites still consume the absolute.
 # Env override kept for tests that want to poke at the value directly.
-REPAIR_RESERVE = int(os.environ.get("REPAIR_RESERVE_SECONDS", "60"))
+REPAIR_RESERVE = int(os.environ.get("REPAIR_RESERVE_SECONDS", "300"))
 VERIFY_CAP = 15            # final verification: at most 15s per call
 
 # Output-token ceiling for a planner that was handed a hipified draft. It is asked
@@ -532,8 +532,8 @@ PLAN_DELTA_MAX_TOKENS = 640
 #
 # STAGNATION_ABORT_THRESHOLD was effectively 3-with-5-replans, which needed ~6
 # iterations to fire and so never did before the user hit Ctrl+C.
-STAGNATION_ABORT_THRESHOLD = 2   # consecutive iterations with no error reduction
-MAX_REPLANS = 2                  # total DeepSeek re-plans allowed per route() call
+STAGNATION_ABORT_THRESHOLD = 4   # consecutive iterations with no error reduction
+MAX_REPLANS = 5                  # total DeepSeek re-plans allowed per route() call
 
 
 class PipelineTimeoutError(RuntimeError):

@@ -18,6 +18,8 @@ PROOF         := /tmp/proof_harness.hip.cpp
 GH_USER       ?= indrad3v4
 GH_REPO       ?= Kernel-Olympics
 GH_BRANCH     ?= main
+MAX_ITER      ?= 10       # max loop iterations (pipeline loops until compile+run pass)
+PIPELINE_BUDGET ?= 1800   # wall-clock budget in seconds (env: MAX_PIPELINE_SECONDS)
 
 # ── Virtual environment ---------------------------------------
 .venv:
@@ -34,15 +36,22 @@ install: .venv  ## Install all Python dependencies (editable)
 # ── Pipeline targets ------------------------------------------
 
 port: .venv  ## Run pipeline (CUDA→HIP) on one kernel:  make port CU_FILE=path.cu
+ifeq ($(origin PIPELINE_BUDGET),environment)
 	$(PYTHON) -m src.main --input "$(CU_FILE)"
+else
+	MAX_PIPELINE_SECONDS=$(PIPELINE_BUDGET) $(PYTHON) -m src.main --input "$(CU_FILE)"
+endif
 
 port-all: .venv  ## Run pipeline on ALL sample kernels at once
 	$(PYTHON) -m src.main --input sample_kernels/cuda/*.cu
 
 # ── All‑in‑one -------------------------------------------------
 
-pipeline: port compile run  ## Full cycle: CUDA → ROCm in one command
+pipeline: port compile run  ## Full cycle: CUDA -> ROCm in one command (default: 30 min budget)
 	@echo "  ✓  $(CU_FILE) → AMD GPU — done"
+
+pipeline-heavy:  ## Engineering loop: iterate until compile+run pass (longer budget, 1800s)
+	MAX_PIPELINE_SECONDS=$(PIPELINE_BUDGET) $(MAKE) pipeline
 
 # ── Compile + Run helpers (separate targets for clarity) ------
 
