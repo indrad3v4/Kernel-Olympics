@@ -1,5 +1,5 @@
 # Kernel Olympics 🏆
-### CUDA → ROCm Migration Copilot — Port, compile, and verify on real AMD GPUs in minutes
+### Autonomous GPU Migration Platform — From any GPU architecture to any target in minutes
 
 <p align="center">
   <a href="https://github.com/indrad3v4/Kernel-Olympics">
@@ -32,9 +32,13 @@ AMD GPUs (MI300X) outperform NVIDIA on price/performance. Yet enterprises stay o
 
 **AMD's #1 adoption blocker isn't hardware — it's software migration friction.**
 
+The broader market is bigger: GPU architectures multiply (NVIDIA CUDA, AMD ROCm, Intel oneAPI, Apple Metal, custom NPUs) while the talent pool doesn't. Every hardware generation creates a **$2B+ migration tax** across the industry — teams rewriting kernels by hand instead of building new products.
+
 ## What is Kernel Olympics?
 
-**One kernel at a time.** A fully autonomous multi-agent pipeline that scans, classifies, ports, compiles, and verifies CUDA→ROCm migration on real AMD hardware — **zero human intervention**.
+**An autonomous multi-agent pipeline** that takes GPU kernel code from any source architecture, ports it to any target, compiles, runs on real hardware, and verifies correctness — **zero human intervention**.
+
+First supported path: **CUDA → ROCm/HIP** (the highest-demand migration today). Architecture-agnostic design means adding new paths (oneAPI, Metal) is a config change, not a rewrite.
 
 ```bash
 # One command: CUDA in → HIP + proof + PASS/FAIL out
@@ -48,7 +52,7 @@ make port CU_FILE=sample_kernels/cuda/nvidia_shfl_scan.cu
     <img src="amd_demo.gif" alt="Kernel Olympics Pipeline Demo" width="720">
   </a>
   <br>
-  <sub>Full pipeline: CUDA source → 4-LLM loop ports it → hipcc compile → AMD GPU run → <b>PASSED</b></sub>
+  <sub>Full pipeline: CUDA source → 4-LLM loop ports it → hipcc compile → AMD MI300X run → <b>PASSED ✓</b></sub>
 </p>
 
 ## 🧠 Multi-Agent Architecture
