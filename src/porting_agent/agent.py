@@ -137,37 +137,30 @@ ROLE: CUDA→HIP porting specialist — you understand AMD GPU architecture
 (wavefront=64 threads) and know how every CUDA warp intrinsic maps to HIP.
 
 PORTING RULES (follow all that apply):
-1. AMD GPUs use wavefronts of 64 threads, not warps of 32
-2. __shfl_down_sync(0xffffffff, val, 16) on wavefront64 skips half the lanes — 
-   the offset must be adjusted or use a different algorithm
-3. Hardcoded "32" for warp size → should be "64" or use warpSize/wavefront size
-4. __shared__ arrays sized to 32 → may need 64 for wavefront-aware code
+1. AMD GPUs can have wavefronts of 32 (RDNA3/RX 7900) or 64 (CDNA/MI300X) threads
+2. NEVER hardcode 32 or 64 for warp/wavefront size — use `warpSize` (HIP built-in, available in __device__/__global__ code) or `prop.warpSize` (host-side from hipGetDeviceProperties)
+3. __shfl_down_sync(mask, val, delta, width) — keep the mask but ensure it matches wavefront size
+4. __shared__ arrays should use warpSize-derived sizes, not hardcoded 32/64
 5. __syncwarp() → use __syncthreads() for HIP compatibility
 6. Use __ballot_sync (HIP) instead of CUDA warp-vote functions
 7. Keep the same algorithm structure — only change what's needed for portability
-8. __activemask() → use __ballot_sync(0xffffffff, 1) for active lane mask on HIP
-9. __all_sync/__any_sync — these take a mask argument; verify it works with 64 lanes
+8. __activemask() → use __ballot_sync(mask, 1) for active lane mask on HIP
+9. __all_sync/__any_sync — take a mask argument matching wavefront size
 10. __match_all_sync — no direct HIP equivalent; redesign as sequential check
-11. threadIdx.x >> 5 computes warp index (32 lanes) → should be >> 6 for wavefront64
-12. Lane identification: if (lane_id < 32) → if (lane_id < 64) for wavefront boundary
-13. __shfl_sync (basic shuffle) — mask and lane count must be adjusted for wavefront64
+11. threadIdx.x / warpSize computes warp index — use this, NOT `>> 5` or `/ 32`
+12. Lane identification: lane_id % warpSize, NOT hardcoded 32 or 64
+13. __shfl_sync — mask and lane count must use warpSize, not hardcoded width
 14. CRITICAL: Keep kernel LAUNCH parameters (blockDim/gridDim, shmem_sz) CONSISTENT
-    with the kernel BODY. If you change the kernel's `lane_id = id % 32` → `% 64`,
-    the host-side `nWarps = blockSize / 32` MUST also become `blockSize / 64`, and
-    `shmem_sz = nWarps * sizeof(int)` updates automatically. Inconsistent warp-size
-    between kernel body and launch config causes shared-memory OUT OF BOUNDS.
-15. CRITICAL: Do NOT hardcode the kernel `width` argument in the launch call.
-    The `width` parameter in `shfl_scan_test<<<...>>>(data, width, sums)` controls
-    the shuffle scan group size. On AMD, `warpSize = 64`, so `width=warpSize` is
-    correct. But the host code should COMPUTE it as `warpSize` (device property),
-    not hardcode `32` or `64`. Best: pass `warpSize` at runtime, or if the kernel
-    takes a plain `int width`, keep the original host-side formula
-    `width = blockSize / (2 * warpSize)` that scales correctly.
+    with the kernel BODY. If the kernel uses `lane_id = id % warpSize`, the
+    host-side `nWarps = blockSize / prop.warpSize` MUST also match, and
+    `shmem_sz = nWarps * sizeof(int)` updates automatically.
+15. CRITICAL: Pass the correct `width` parameter in kernel launches. The `width`
+    parameter in shuffle scans controls the group size. On AMD, use `warpSize`
+    from device properties or pass it as a separate parameter. For the shuffle
+    scan second pass (over warp sums), the width is `blockDim.x / warpSize`.
 16. CAUTION: `__shfl_up(value, delta, width)` with `width=1` is invalid — the
     shuffle reads lane (lane_id - delta) = lane -1 → OUT OF BOUNDS → SIGSEGV.
-    If `blockDim.x / warpSize` could produce `1` on wavefront64 (64/64=1),
-    guard with `max(blockDim.x / WAVEFRONT_SIZE, 2u)` or check `if (width < 2)`.
-    When width=1, the shuffle is a no-op and should be skipped.
+    Guard with `max(blockDim.x / warpSize, 2u)` or skip when width < 2.
 
 OUTPUT FORMAT — STRICT JSON (no markdown fence, no extra text):
 Respond with a single JSON object. NO markdown code block (no ```json ... ```).
@@ -872,11 +865,12 @@ CRITICAL: Return ONLY the JSON object. No introductory text, no explanation befo
         # Fix missing __ on global/device
         code = re.sub(r'^global\s+void', '__global__ void', code, flags=re.MULTILINE)
         code = re.sub(r'^device\s+void', '__device__ void', code, flags=re.MULTILINE)
-        # Count how many 32-bit masks remain
-        mask_pattern = re.compile(r'(__shfl_\w+_sync\()0x[fF]{8}(,)')
-        before = len(mask_pattern.findall(code))
-        code = mask_pattern.sub(r'\g<1>0xffffffffffffffffULL\g<2>', code)
-        after = len(mask_pattern.findall(code))
+        # Convert CUDA 32-bit masks to 64-bit (works on both wave32 and wave64
+        # since excess mask bits are ignored on wave32 hardware).
+        mask_pat = re.compile(r'(__shfl_\w+_sync\()0x[fF]{8}(,)')
+        before = len(mask_pat.findall(code))
+        code = mask_pat.sub(r'\g<1>0xffffffffffffffffULL\g<2>', code)
+        after = len(mask_pat.findall(code))
         if before > 0 and after == 0:
             pass  # All masks fixed
         elif before > 0:
